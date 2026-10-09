@@ -1,0 +1,6 @@
+/bin/
+/data/
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp
+coverage.out
