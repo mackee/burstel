@@ -1,9 +1,9 @@
 {
   "name": "burstel-cloudflare",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
-  "description": "Phase 2: Cloudflare Worker + per-shot ShotDO Container + R2 freeze for burstel",
+  "description": "Phase 3: Cloudflare Worker + per-shot ShotDO + R2 freeze + remote MCP analysis for burstel",
   "scripts": {
     "typecheck": "tsc --noEmit",
     "typecheck:test": "tsc -p tsconfig.test.json",
@@ -18,5 +18,9 @@
     "@types/bun": "^1.4.2",
     "typescript": "^7.0.2",
     "wrangler": "^4.149.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "zod": "^4.6.5"
   }
 }

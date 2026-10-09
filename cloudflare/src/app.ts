@@ -1,7 +1,7 @@
 // Public HTTP surface of the Worker.
 //
 // Only this whitelist is reachable from the internet. The Go recorder's
-// `/internal/*`, artifact and query endpoints are never exposed: the Worker
+// `/internal/*`, artifact and analysis endpoints are never exposed: the Worker
 // routes them privately to the ShotDO, which talks to the container over its
 // TCP port.
 //
@@ -9,30 +9,32 @@
 //   POST /api/shots
 //   GET  /api/shots/{id}
 //   POST /api/shots/{id}/stop
+//   POST /api/shots/{id}/query
+//   POST /api/shots/{id}/analyze
+//   GET  /api/shots/{id}/schema
+//   POST /api/shots/{id}/compare
 //   POST /shots/{id}/v1/{traces,metrics,logs}
+//   POST /mcp
 
 import { authenticate } from "./auth";
+import { DO_ORIGIN } from "./env";
+import type { AppEnv, DoStubLike, ShotNamespaceLike } from "./env";
 import { badRequest, unauthorized } from "./errors";
 import { errorResponse, json, readJson } from "./http";
-import { isShotId, newShotId } from "./ids";
+import { isShotId } from "./ids";
+import { handleMcp } from "./mcp";
+import {
+  analyzeShot,
+  compareShots,
+  getShot,
+  queryShot,
+  schemaShot,
+  startShot,
+  stopShot,
+} from "./tools";
+import type { ToolContext } from "./tools";
 
-/** Structural subset of `DurableObjectStub`. */
-export interface DoStubLike {
-  fetch(request: Request): Promise<Response>;
-}
-
-/** Structural subset of `DurableObjectNamespace<ShotDO>`. */
-export interface ShotNamespaceLike {
-  getByName(name: string): DoStubLike;
-}
-
-export interface AppEnv {
-  SHOT_DO: ShotNamespaceLike;
-  BURSTEL_API_TOKEN?: string;
-  PUBLIC_BASE_URL?: string;
-}
-
-const DO_ORIGIN = "https://shot-do.internal";
+export type { AppEnv, DoStubLike, ShotNamespaceLike } from "./env";
 
 export async function handleRequest(request: Request, env: AppEnv): Promise<Response> {
   try {
@@ -47,21 +49,59 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
       throw unauthorized();
     }
 
+    if (path === "/mcp") {
+      return await handleMcp(request, env);
+    }
+
+    const ctx = toolContext(env, url);
+
     if (request.method === "POST" && path === "/api/shots") {
-      return await createShot(request, env, url);
+      const body = await readJson<{ metadata?: Record<string, unknown> }>(request);
+      return json(201, await startShot(ctx, body.metadata ?? {}));
     }
 
     const statusMatch = /^\/api\/shots\/([^/]+)$/.exec(path);
     if (statusMatch) {
       if (request.method !== "GET") throw badRequest("method not allowed");
-      return await forwardControl(env, requireShotId(statusMatch[1]!), "GET", "/internal/status", url, undefined);
+      return json(200, await getShot(ctx, requireShotId(statusMatch[1]!)));
     }
 
     const stopMatch = /^\/api\/shots\/([^/]+)\/stop$/.exec(path);
     if (stopMatch) {
       if (request.method !== "POST") throw badRequest("method not allowed");
-      const shotId = requireShotId(stopMatch[1]!);
-      return await forwardControl(env, shotId, "POST", "/internal/stop", url, JSON.stringify({ shot_id: shotId }));
+      return json(200, await stopShot(ctx, requireShotId(stopMatch[1]!)));
+    }
+
+    const queryMatch = /^\/api\/shots\/([^/]+)\/query$/.exec(path);
+    if (queryMatch) {
+      if (request.method !== "POST") throw badRequest("method not allowed");
+      const body = await readJson<{ sql?: string; max_rows?: number }>(request);
+      if (typeof body.sql !== "string") throw badRequest("sql is required");
+      return json(200, await queryShot(ctx, requireShotId(queryMatch[1]!), body.sql, body.max_rows));
+    }
+
+    const analyzeMatch = /^\/api\/shots\/([^/]+)\/analyze$/.exec(path);
+    if (analyzeMatch) {
+      if (request.method !== "POST") throw badRequest("method not allowed");
+      const body = await readJson<{ sections?: string[]; top_n?: number }>(request);
+      return json(200, await analyzeShot(ctx, requireShotId(analyzeMatch[1]!), body.sections, body.top_n));
+    }
+
+    const schemaMatch = /^\/api\/shots\/([^/]+)\/schema$/.exec(path);
+    if (schemaMatch) {
+      if (request.method !== "GET") throw badRequest("method not allowed");
+      return json(200, await schemaShot(ctx, requireShotId(schemaMatch[1]!)));
+    }
+
+    const compareMatch = /^\/api\/shots\/([^/]+)\/compare$/.exec(path);
+    if (compareMatch) {
+      if (request.method !== "POST") throw badRequest("method not allowed");
+      const body = await readJson<{ other?: string; top_n?: number }>(request);
+      if (typeof body.other !== "string") throw badRequest("other shot id is required");
+      return json(
+        200,
+        await compareShots(ctx, requireShotId(compareMatch[1]!), requireShotId(body.other), body.top_n),
+      );
     }
 
     const ingestMatch = /^\/shots\/([^/]+)\/v1\/(traces|metrics|logs)$/.exec(path);
@@ -76,40 +116,8 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
   }
 }
 
-async function createShot(request: Request, env: AppEnv, url: URL): Promise<Response> {
-  const body = await readJson<{ metadata?: Record<string, unknown> }>(request);
-  const shotId = newShotId();
-  const stub = env.SHOT_DO.getByName(shotId);
-  const resp = await stub.fetch(
-    new Request(`${DO_ORIGIN}/internal/create`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ shot_id: shotId, metadata: body.metadata ?? {} }),
-    }),
-  );
-  if (resp.status !== 201 && resp.status !== 200) return resp;
-  const info = (await resp.json()) as Record<string, unknown>;
-  return json(201, withOtlpEndpoints(info, env, url, shotId));
-}
-
-async function forwardControl(
-  env: AppEnv,
-  shotId: string,
-  method: string,
-  doPath: string,
-  url: URL,
-  body: string | undefined,
-): Promise<Response> {
-  const stub = env.SHOT_DO.getByName(shotId);
-  const init: RequestInit = { method };
-  if (body !== undefined) {
-    init.headers = { "content-type": "application/json" };
-    init.body = body;
-  }
-  const resp = await stub.fetch(new Request(`${DO_ORIGIN}${doPath}`, init));
-  if (resp.status !== 200) return resp;
-  const info = (await resp.json()) as Record<string, unknown>;
-  return json(200, withOtlpEndpoints(info, env, url, shotId));
+function toolContext(env: AppEnv, url: URL): ToolContext {
+  return { namespace: env.SHOT_DO, origin: url.origin, publicBaseUrl: env.PUBLIC_BASE_URL };
 }
 
 async function forwardIngest(
@@ -135,25 +143,6 @@ async function forwardIngest(
   const out = new Response(resp.body, resp);
   out.headers.set("x-burstel-shot-id", shotId);
   return out;
-}
-
-function withOtlpEndpoints(
-  info: Record<string, unknown>,
-  env: AppEnv,
-  url: URL,
-  shotId: string,
-): Record<string, unknown> {
-  const base = (env.PUBLIC_BASE_URL ?? url.origin).replace(/\/+$/, "");
-  const shotBase = `${base}/shots/${shotId}`;
-  return {
-    ...info,
-    otlp_base_url: shotBase,
-    otlp_endpoints: {
-      traces: `${shotBase}/v1/traces`,
-      metrics: `${shotBase}/v1/metrics`,
-      logs: `${shotBase}/v1/logs`,
-    },
-  };
 }
 
 function requireShotId(raw: string): string {

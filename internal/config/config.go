@@ -15,6 +15,7 @@ const (
 	DefaultMaxRequestBytes = 64 << 20 // 64 MiB decompressed
 	DefaultMaxInflight     = 8
 	DefaultWriteTimeout    = 30 * time.Second
+	DefaultAnalysisTimeout = 15 * time.Second
 )
 
 // Config describes a running burstel recorder.
@@ -34,6 +35,8 @@ type Config struct {
 	MaxInflight int
 	// WriteTimeout bounds a single durable write (and the DB lock wait).
 	WriteTimeout time.Duration
+	// AnalysisTimeout bounds a single read-only analysis query/restore.
+	AnalysisTimeout time.Duration
 }
 
 // Load returns configuration from the environment, falling back to defaults.
@@ -45,6 +48,7 @@ func Load() Config {
 		MaxRequestBytes: envInt64("BURSTEL_MAX_REQUEST_BYTES", DefaultMaxRequestBytes),
 		MaxInflight:     envInt("BURSTEL_MAX_INFLIGHT", DefaultMaxInflight),
 		WriteTimeout:    envDuration("BURSTEL_WRITE_TIMEOUT", DefaultWriteTimeout),
+		AnalysisTimeout: envDuration("BURSTEL_ANALYSIS_TIMEOUT", DefaultAnalysisTimeout),
 	}
 	return cfg
 }

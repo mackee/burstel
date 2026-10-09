@@ -13,6 +13,9 @@
     "src/container.ts",
     "src/artifacts.ts",
     "src/core.ts",
+    "src/env.ts",
+    "src/tools.ts",
+    "src/mcp.ts",
     "src/app.ts"
   ]
 }

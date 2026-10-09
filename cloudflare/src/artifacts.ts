@@ -38,6 +38,7 @@ export interface R2PutOptionsLike {
 export interface R2ObjectBodyLike extends R2ObjectLike {
   body: ReadableStream<Uint8Array>;
   text(): Promise<string>;
+  customMetadata?: Record<string, string>;
 }
 
 /** Structural subset of the platform `R2Bucket` type. */
@@ -67,10 +68,19 @@ export interface ArtifactResult {
   multipart: boolean;
 }
 
+/** A frozen artifact streamed out of R2. */
+export interface ArtifactObject {
+  body: ReadableStream<Uint8Array>;
+  size: number;
+  /** SHA-256 recorded in R2 custom metadata, when present. */
+  sha256?: string;
+}
+
 export interface ArtifactSink {
   putArtifact(key: string, source: ArtifactSource): Promise<ArtifactResult>;
   putJSON(key: string, value: unknown): Promise<void>;
   getJSON<T>(key: string): Promise<T | null>;
+  getArtifact(key: string): Promise<ArtifactObject | null>;
 }
 
 export interface R2SinkOptions {
@@ -156,6 +166,16 @@ export function createR2Sink(bucket: R2BucketLike, options: R2SinkOptions = {}):
       const object = await bucket.get(key);
       if (!object) return null;
       return JSON.parse(await object.text()) as T;
+    },
+
+    async getArtifact(key: string): Promise<ArtifactObject | null> {
+      const object = await bucket.get(key);
+      if (!object) return null;
+      return {
+        body: object.body,
+        size: object.size,
+        sha256: object.customMetadata?.["sha256"],
+      };
     },
   };
 }

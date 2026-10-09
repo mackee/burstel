@@ -39,6 +39,7 @@ func main() {
 
 	rec := recorder.New(cfg)
 	handler := server.New(cfg, rec)
+	defer handler.Close()
 
 	httpSrv := &http.Server{
 		Addr:              cfg.Addr,

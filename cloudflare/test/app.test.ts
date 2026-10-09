@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { handleRequest } from "../src/app";
 import type { AppEnv, DoStubLike, ShotNamespaceLike } from "../src/app";
-import { makeCore } from "./fakes";
+import { FakeArtifacts, makeCore } from "./fakes";
 import type { TestHarness } from "./fakes";
 
 const TOKEN = "test-api-token";
@@ -10,11 +10,13 @@ const TOKEN = "test-api-token";
 /** In-memory stand-in for a Durable Object namespace: name -> ShotDO. */
 class FakeNamespace implements ShotNamespaceLike {
   readonly shots = new Map<string, TestHarness>();
+  /** One shared R2-like bucket, exactly as all ShotDOs share the BUCKET binding. */
+  readonly artifacts = new FakeArtifacts();
 
   getByName(name: string): DoStubLike {
     let harness = this.shots.get(name);
     if (!harness) {
-      harness = makeCore(name);
+      harness = makeCore(name, { artifacts: this.artifacts });
       this.shots.set(name, harness);
     }
     const core = harness.core;
@@ -137,5 +139,46 @@ describe("Worker API", () => {
     expect((await handleRequest(get("/api/shots/not/a/valid/id/"), env)).status).toBe(404);
     expect((await handleRequest(post("/api/shots/short/stop", {}), env)).status).toBe(400);
     expect((await handleRequest(get("/nope"), env)).status).toBe(404);
+  });
+
+  test("analysis REST routes restore and query a frozen shot", async () => {
+    const { env } = makeEnv();
+    const { id } = await createShot(env);
+    expect((await handleRequest(post(`/api/shots/${id}/stop`, {}), env)).status).toBe(200);
+
+    const queryResp = await handleRequest(post(`/api/shots/${id}/query`, { sql: "SELECT 1" }), env);
+    expect(queryResp.status).toBe(200);
+    const queried = (await queryResp.json()) as Record<string, unknown>;
+    expect(queried.row_count).toBe(1);
+
+    const analyzeResp = await handleRequest(post(`/api/shots/${id}/analyze`, { top_n: 5 }), env);
+    expect(analyzeResp.status).toBe(200);
+    expect(((await analyzeResp.json()) as Record<string, unknown>).schema_version).toBe("1");
+
+    const schemaResp = await handleRequest(get(`/api/shots/${id}/schema`), env);
+    expect(schemaResp.status).toBe(200);
+    expect(Array.isArray(((await schemaResp.json()) as Record<string, unknown>).tables)).toBe(true);
+
+    // A second frozen shot to compare against.
+    const second = await createShot(env);
+    expect((await handleRequest(post(`/api/shots/${second.id}/stop`, {}), env)).status).toBe(200);
+    const cmpResp = await handleRequest(post(`/api/shots/${id}/compare`, { other: second.id, top_n: 5 }), env);
+    expect(cmpResp.status).toBe(200);
+    const comparison = (await cmpResp.json()) as Record<string, unknown>;
+    expect(comparison.sample_sizes).toBeDefined();
+    expect(Array.isArray(comparison.disclosure)).toBe(true);
+  });
+
+  test("compare requires a frozen counterpart and distinct ids", async () => {
+    const { env } = makeEnv();
+    const { id } = await createShot(env);
+    await handleRequest(post(`/api/shots/${id}/stop`, {}), env);
+    const recording = await createShot(env);
+
+    const notFrozen = await handleRequest(post(`/api/shots/${id}/compare`, { other: recording.id }), env);
+    expect(notFrozen.status).toBe(409);
+
+    const same = await handleRequest(post(`/api/shots/${id}/compare`, { other: id }), env);
+    expect(same.status).toBe(400);
   });
 });

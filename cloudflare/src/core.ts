@@ -65,6 +65,10 @@ export interface ShotCoreDeps {
   /** R2 key prefix; defaults to `shots`. */
   artifactPrefix?: string;
   drainTimeoutMs?: number;
+  /** Hard row cap forwarded to the analysis container; defaults to 1000. */
+  analysisMaxRows?: number;
+  /** Default top-N for analysis sections; defaults to 20. */
+  analysisTopN?: number;
 }
 
 const DEFAULT_DRAIN_TIMEOUT_MS = 60_000;
@@ -79,12 +83,16 @@ export class ShotCore {
   private readonly extraEnv: Record<string, string>;
   private readonly prefix: string;
   private readonly drainTimeoutMs: number;
+  private readonly analysisMaxRows: number;
+  private readonly analysisTopN: number;
 
   private counters: Counters = emptyCounters();
   private inFlight = 0;
   private stopRequested = false;
   private loaded = false;
   private loading?: Promise<void>;
+  /** restore id -> verified sha256 already loaded in the analysis container. */
+  private readonly analysisRestored = new Map<string, string>();
   /** Serialises lifecycle transitions (create/stop). */
   private transition: Promise<unknown> = Promise.resolve();
 
@@ -98,6 +106,8 @@ export class ShotCore {
     this.extraEnv = deps.containerEnv ?? {};
     this.prefix = deps.artifactPrefix ?? "shots";
     this.drainTimeoutMs = deps.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
+    this.analysisMaxRows = deps.analysisMaxRows ?? 1000;
+    this.analysisTopN = deps.analysisTopN ?? 20;
   }
 
   /** Creates the schema and restores persisted state. */
@@ -363,6 +373,162 @@ export class ShotCore {
     }
   }
 
+  // ------------------------------------------------------------- analysis
+
+  /**
+   * Restores the frozen R2 snapshot into a fresh read-only analysis container
+   * and runs one constrained query. The original recording container is gone;
+   * the only copy of the data lives in R2.
+   */
+  async query(sql: string, maxRows?: number): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    const freeze = this.requireFrozen();
+    await this.ensureAnalysis(freeze);
+    return this.analysisJson("/internal/query", {
+      restore_id: this.shotId,
+      sql,
+      max_rows: maxRows ?? this.analysisMaxRows,
+    });
+  }
+
+  /** Runs the SQL-backed analytical sections for this frozen shot. */
+  async analyze(req: { sections?: string[]; topN?: number } = {}): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    const freeze = this.requireFrozen();
+    await this.ensureAnalysis(freeze);
+    return this.analysisJson("/internal/analyze", {
+      restore_id: this.shotId,
+      shot_id: this.shotId,
+      sections: req.sections,
+      top_n: req.topN ?? this.analysisTopN,
+    });
+  }
+
+  /** Returns the documented queryable schema and safety policy. */
+  async schema(): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    const freeze = this.requireFrozen();
+    await this.ensureAnalysis(freeze);
+    const resp = await this.container.request("/internal/schema", { headers: this.internalHeaders() });
+    return this.parseAnalysisJson(resp, "/internal/schema");
+  }
+
+  /**
+   * Compares this frozen shot with another frozen shot. Both artifacts are
+   * streamed from R2 into the same analysis container and compared with SQL
+   * aggregates.
+   */
+  async compare(
+    other: { shot_id: string; freeze: FreezeMetadata },
+    topN?: number,
+  ): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    const freeze = this.requireFrozen();
+    await this.ensureAnalysis(freeze);
+    const otherRestoreId = `other-${other.shot_id}`;
+    await this.ensureRestored(otherRestoreId, other.freeze);
+    return this.analysisJson("/internal/compare", {
+      left_restore_id: this.shotId,
+      right_restore_id: otherRestoreId,
+      top_n: topN ?? this.analysisTopN,
+    });
+  }
+
+  /** Tears down the analysis container and forgets restored snapshots. */
+  async releaseAnalysis(): Promise<void> {
+    this.analysisRestored.clear();
+    if (this.container.running) {
+      await this.container.destroy().catch(() => undefined);
+    }
+  }
+
+  private requireFrozen(): FreezeMetadata {
+    const row = this.store.get(this.shotId);
+    if (!row) throw notFound(`unknown shot ${this.shotId}`);
+    if (row.state !== "frozen") {
+      throw new HttpError(409, "shot is not frozen", false, "not_frozen");
+    }
+    const freeze = parseFreeze(row) as FreezeMetadata | undefined;
+    if (!freeze || !freeze.artifact_key || !freeze.artifact_sha256) {
+      throw new HttpError(409, "shot has no frozen artifact metadata", false, "not_frozen");
+    }
+    return freeze;
+  }
+
+  private async ensureAnalysis(selfFreeze: FreezeMetadata): Promise<void> {
+    if (!this.container.running) {
+      this.container.start(this.analysisEnvironment());
+      await this.container.ensureReady();
+      this.analysisRestored.clear();
+    }
+    await this.ensureRestored(this.shotId, selfFreeze);
+  }
+
+  private async ensureRestored(restoreId: string, freeze: FreezeMetadata): Promise<void> {
+    if (this.analysisRestored.get(restoreId) === freeze.artifact_sha256) return;
+    const artifact = await this.artifacts.getArtifact(freeze.artifact_key);
+    if (!artifact) throw notFound(`frozen artifact ${freeze.artifact_key} is missing`);
+    const resp = await this.container.request("/internal/restore", {
+      method: "POST",
+      headers: {
+        "content-type": "application/octet-stream",
+        "x-burstel-restore-id": restoreId,
+        "x-burstel-size": String(freeze.artifact_size),
+        "x-burstel-sha256": freeze.artifact_sha256,
+      },
+      body: artifact.body,
+      duplex: "half",
+    } as RequestInit);
+    if (resp.status !== 200) {
+      const detail = await resp.text().catch(() => "");
+      throw new HttpError(
+        503,
+        `analysis restore failed: ${resp.status}${detail ? `: ${detail}` : ""}`,
+        true,
+        "restore_failed",
+      );
+    }
+    await resp.body?.cancel().catch(() => undefined);
+    this.analysisRestored.set(restoreId, freeze.artifact_sha256);
+  }
+
+  private async analysisJson(path: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const resp = await this.container.request(path, {
+      method: "POST",
+      headers: this.internalHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify(body),
+    });
+    return this.parseAnalysisJson(resp, path);
+  }
+
+  private async parseAnalysisJson(resp: Response, path: string): Promise<Record<string, unknown>> {
+    const text = await resp.text();
+    if (resp.status < 200 || resp.status >= 300) {
+      let message = `analysis ${path} failed with status ${resp.status}`;
+      let code = "analysis_error";
+      try {
+        const parsed = JSON.parse(text) as { error?: string; code?: string };
+        if (parsed.error) message = parsed.error;
+        if (parsed.code) code = parsed.code;
+      } catch {
+        // keep defaults
+      }
+      const status = resp.status === 400 || resp.status === 404 ? resp.status : 503;
+      throw new HttpError(status, message, resp.status >= 500, code);
+    }
+    try {
+      return JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      throw new HttpError(503, "invalid analysis response", true, "analysis_error");
+    }
+  }
+
+  private analysisEnvironment(): Record<string, string> {
+    const env = this.containerEnvironment();
+    env["BURSTEL_ANALYSIS"] = "1";
+    return env;
+  }
+
   // ------------------------------------------------------------- internal
 
   async handleInternal(request: Request): Promise<Response> {
@@ -380,6 +546,39 @@ export class ShotCore {
       if (path === "/internal/stop") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
         return json(200, await this.stop());
+      }
+      if (path === "/internal/analysis/query") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ sql?: string; max_rows?: number }>(request);
+        if (typeof body.sql !== "string" || body.sql.trim() === "") {
+          return json(400, { error: "sql is required", code: "bad_request" });
+        }
+        return json(200, await this.query(body.sql, body.max_rows));
+      }
+      if (path === "/internal/analysis/analyze") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ sections?: string[]; top_n?: number }>(request);
+        return json(200, await this.analyze({ sections: body.sections, topN: body.top_n }));
+      }
+      if (path === "/internal/analysis/schema") {
+        if (request.method !== "GET") return json(405, { error: "method not allowed" });
+        return json(200, await this.schema());
+      }
+      if (path === "/internal/analysis/compare") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{
+          other?: { shot_id?: string; freeze?: FreezeMetadata };
+          top_n?: number;
+        }>(request);
+        if (!body.other?.shot_id || !body.other.freeze) {
+          return json(400, { error: "other shot with freeze metadata is required", code: "bad_request" });
+        }
+        return json(200, await this.compare({ shot_id: body.other.shot_id, freeze: body.other.freeze }, body.top_n));
+      }
+      if (path === "/internal/analysis/release") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        await this.releaseAnalysis();
+        return json(200, { released: true });
       }
       const ingest = /^\/internal\/ingest\/(traces|metrics|logs)$/.exec(path);
       if (ingest) {

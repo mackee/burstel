@@ -10,6 +10,13 @@ R2 / MCP はまだ含まない。収集した DuckDB ファイルを後から SQ
 > **Phase 2** ([`cloudflare/`](./cloudflare)) は、この Phase 1 の Go 実装をそのまま
 > コンテナとして動かし、Cloudflare Worker + per-shot `ShotDO`(SQLite)+ Container +
 > R2 で shot を freeze する。詳細は [`cloudflare/README.md`](./cloudflare/README.md) を参照。
+>
+> **Phase 3** は同じ Worker に remote MCP (`shot_start` / `shot_stop` /
+> `shot_query` / `shot_analyze` / `shot_compare`) と、R2 の freeze 済み snapshot を
+> 読み取り専用 DuckDB で再解析する仕組みを追加する。記録コンテナが停止していても
+> 解析できる。`internal/analysis` が SQL allowlist / リソース上限を強制する。
+> 詳細は [`cloudflare/README.md`](./cloudflare/README.md) と
+> [`cloudflare/docs/adr-001-analysis-query-safety.md`](./cloudflare/docs/adr-001-analysis-query-safety.md)。
 
 ## できること
 
@@ -72,6 +79,17 @@ R2 / MCP はまだ含まない。収集した DuckDB ファイルを後から SQ
 | POST | `/internal/stop` | `{"shot_id": "..."}`。drain → checkpoint → freeze。冪等 |
 | GET | `/internal/artifact` | freeze 済み `telemetry.duckdb`(`Content-Length` 付き)。stop 前は `409` |
 | GET | `/internal/metadata` | shot メタデータ / カウンタ / schema version / size / checksum |
+
+freeze 済み snapshot の解析用 (Phase 3、Worker/DO 経由のみ):
+
+| Method | Path | 説明 |
+| --- | --- | --- |
+| POST | `/internal/restore` | freeze 済み `telemetry.duckdb` を stream 受信し size/SHA-256 検証して read-only で開く |
+| POST | `/internal/query` | allowlist 済み単一 SELECT を実行 (行数/時間/メモリ上限) |
+| POST | `/internal/analyze` | p50/p95/p99、slow span、error、DB op、log 相関、metric の SQL 集計 |
+| POST | `/internal/compare` | 2 shot の SQL 集計差分 (sample size / unit / disclosure 付き) |
+| GET | `/internal/schema` | 問い合わせ可能なテーブル/カラムと安全ポリシー |
+| POST | `/internal/release` | 解析セッションを破棄 |
 
 `BURSTEL_INTERNAL_TOKEN` を設定すると `/internal/*` は
 `Authorization: Bearer <token>` を要求する(OTLP パスは対象外)。
@@ -220,10 +238,12 @@ docker run --rm -p 4318:4318 -v "$PWD/data:/data" \
 | `BURSTEL_MAX_REQUEST_BYTES` | `-max-request-bytes` | `67108864` (64 MiB) |
 | `BURSTEL_MAX_INFLIGHT` | `-max-inflight` | `8` |
 | `BURSTEL_WRITE_TIMEOUT` | `-write-timeout` | `30s` |
+| `BURSTEL_ANALYSIS_TIMEOUT` | — | `15s` (read-only analysis query/restore) |
 
 ## Limitations / Non-goals (Phase 1)
 
-- Cloudflare Containers / R2 / MCP server / dashboard は未実装。
+- Phase 1 単体では Cloudflare Containers / R2 / MCP server / dashboard は未実装
+  (Phase 2 で Container/R2、Phase 3 で MCP と R2 snapshot 解析を実装)。
 - OTLP/gRPC・OTLP/JSON は未対応(HTTP protobuf のみ)。
 - profiles は対象外。
 - exact-once 配送は保証しない(上記参照)。

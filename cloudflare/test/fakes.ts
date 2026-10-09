@@ -40,6 +40,11 @@ export interface FakeContainerOptions {
   /** Awaited by every /v1/* request; lets tests hold ingests open. */
   ingestGate?: () => Promise<void>;
   metadataDelayMs?: number;
+  /** Canned analysis responses returned by the analysis endpoints. */
+  queryResult?: Record<string, unknown>;
+  analyzeResult?: Record<string, unknown>;
+  compareResult?: Record<string, unknown>;
+  schemaResult?: Record<string, unknown>;
 }
 
 export class FakeContainer implements ContainerControl {
@@ -62,7 +67,13 @@ export class FakeContainer implements ContainerControl {
   ingestGate: (() => Promise<void>) | undefined;
   metadataDelayMs: number;
 
+  queryResult: Record<string, unknown>;
+  analyzeResult: Record<string, unknown>;
+  compareResult: Record<string, unknown>;
+  schemaResult: Record<string, unknown>;
+
   readonly ingestBodies: Array<{ signal: string; bytes: number }> = [];
+  readonly restored = new Map<string, { bytes: Uint8Array; sha: string; size: number }>();
   artifactReads = 0;
 
   private artifactBytes: Uint8Array;
@@ -80,6 +91,35 @@ export class FakeContainer implements ContainerControl {
     this.readyError = options.readyError;
     this.ingestGate = options.ingestGate;
     this.metadataDelayMs = options.metadataDelayMs ?? 0;
+    this.queryResult = options.queryResult ?? {
+      columns: [{ name: "n", type: "BIGINT" }],
+      rows: [[1]],
+      row_count: 1,
+      truncated: false,
+      limit: 1000,
+      bytes: 8,
+    };
+    this.analyzeResult = options.analyzeResult ?? {
+      shot_id: "shot",
+      schema_version: "1",
+      raw_counts: { spans: 1 },
+      sections: [{ name: "overview", rows: [[1]], sample_size: 1, group_count: 1, observed: true }],
+      observed: ["overview"],
+    };
+    this.compareResult = options.compareResult ?? {
+      left: { counts: { spans: 2 } },
+      right: { counts: { spans: 2 } },
+      sample_sizes: { left: { spans: 2 }, right: { spans: 2 } },
+      latency_deltas: [],
+      error_deltas: [],
+      disclosure: ["synthetic"],
+    };
+    this.schemaResult = options.schemaResult ?? {
+      schema_version: "1",
+      tables: [{ name: "spans" }],
+      templates: [{ name: "overview" }],
+      safety: { read_only: true, max_rows: 1000 },
+    };
     void sha256Hex(this.artifactBytes).then((sha) => {
       this.artifactSha = sha;
     });
@@ -137,6 +177,59 @@ export class FakeContainer implements ContainerControl {
       return new Response(JSON.stringify({ counters: this.metadataCounters }), { status: 200 });
     }
 
+    if (path === "/internal/restore") {
+      const bytes = init?.body ? await readBody(init.body) : new Uint8Array();
+      const headers = new Headers(init?.headers);
+      const restoreId = headers.get("x-burstel-restore-id") ?? "";
+      const declaredSize = headers.get("x-burstel-size");
+      const declaredSha = (headers.get("x-burstel-sha256") ?? "").toLowerCase();
+      const sha = await sha256Hex(bytes);
+      if (declaredSize !== null && Number(declaredSize) !== bytes.byteLength) {
+        return new Response(JSON.stringify({ error: "size mismatch", code: "size_mismatch" }), { status: 400 });
+      }
+      if (declaredSha && declaredSha !== sha) {
+        return new Response(JSON.stringify({ error: "sha mismatch", code: "sha256_mismatch" }), { status: 400 });
+      }
+      this.restored.set(restoreId, { bytes, sha, size: bytes.byteLength });
+      return new Response(
+        JSON.stringify({ restore_id: restoreId, size_bytes: bytes.byteLength, sha256: sha, schema_version: "1" }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    if (path === "/internal/query") {
+      const body = init?.body ? JSON.parse(await textBody(init.body)) : {};
+      if (!this.restored.has(body.restore_id)) {
+        return new Response(JSON.stringify({ error: "not restored", code: "not_found" }), { status: 404 });
+      }
+      return new Response(JSON.stringify(this.queryResult), { status: 200, headers: { "content-type": "application/json" } });
+    }
+
+    if (path === "/internal/analyze") {
+      const body = init?.body ? JSON.parse(await textBody(init.body)) : {};
+      if (!this.restored.has(body.restore_id)) {
+        return new Response(JSON.stringify({ error: "not restored", code: "not_found" }), { status: 404 });
+      }
+      return new Response(JSON.stringify(this.analyzeResult), { status: 200, headers: { "content-type": "application/json" } });
+    }
+
+    if (path === "/internal/schema") {
+      return new Response(JSON.stringify(this.schemaResult), { status: 200, headers: { "content-type": "application/json" } });
+    }
+
+    if (path === "/internal/compare") {
+      const body = init?.body ? JSON.parse(await textBody(init.body)) : {};
+      if (!this.restored.has(body.left_restore_id) || !this.restored.has(body.right_restore_id)) {
+        return new Response(JSON.stringify({ error: "not restored", code: "not_found" }), { status: 404 });
+      }
+      return new Response(JSON.stringify(this.compareResult), { status: 200, headers: { "content-type": "application/json" } });
+    }
+
+    if (path === "/internal/release") {
+      this.restored.clear();
+      return new Response(JSON.stringify({ released: true }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+
     if (path.startsWith("/v1/")) {
       if (this.ingestGate) await this.ingestGate();
       const signal = path.slice("/v1/".length);
@@ -191,6 +284,14 @@ export class FakeArtifacts implements ArtifactSink {
   async getJSON<T>(key: string): Promise<T | null> {
     return (this.json.get(key) as T | undefined) ?? null;
   }
+
+  async getArtifact(key: string): Promise<{ body: ReadableStream<Uint8Array>; size: number; sha256?: string } | null> {
+    const bytes = this.stored.get(key);
+    if (!bytes) return null;
+    const copy = new Uint8Array(bytes.byteLength);
+    copy.set(bytes);
+    return { body: new Response(copy).body as ReadableStream<Uint8Array>, size: copy.byteLength };
+  }
 }
 
 export interface TestHarness {
@@ -241,6 +342,10 @@ async function readBody(body: unknown): Promise<Uint8Array> {
   if (typeof body === "string") return new TextEncoder().encode(body);
   if (body instanceof ArrayBuffer) return new Uint8Array(body);
   return new Uint8Array(await new Response(body as ReadableStream).arrayBuffer());
+}
+
+async function textBody(body: unknown): Promise<string> {
+  return new TextDecoder().decode(await readBody(body));
 }
 
 function sleep(ms: number): Promise<void> {
