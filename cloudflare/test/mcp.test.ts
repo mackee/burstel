@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { AppEnv, DoStubLike, ShotNamespaceLike } from "../src/env";
 import { handleMcp } from "../src/mcp";
-import { FakeArtifacts, makeCore } from "./fakes";
+import { FakeArtifacts, FakeIngestNamespace, makeCore, makeIngest } from "./fakes";
 import type { TestHarness } from "./fakes";
 
 const TOKEN = "mcp-api-token";
@@ -24,7 +24,12 @@ class FakeNamespace implements ShotNamespaceLike {
 }
 
 function makeEnv(): AppEnv {
-  return { SHOT_DO: new FakeNamespace(), BURSTEL_API_TOKEN: TOKEN, PUBLIC_BASE_URL: "https://burstel.example" };
+  return {
+    SHOT_DO: new FakeNamespace(),
+    INGEST_DO: new FakeIngestNamespace(makeIngest().core),
+    BURSTEL_API_TOKEN: TOKEN,
+    PUBLIC_BASE_URL: "https://burstel.example",
+  };
 }
 
 async function mcp(env: AppEnv, body: unknown, token: string | null = TOKEN): Promise<Response> {
@@ -101,7 +106,7 @@ describe("MCP server", () => {
     const started = await callTool(env, "shot_start", { metadata: { commit: "abc123", scenario: "bench" } });
     const shotId = String(started["shot_id"]);
     expect(shotId).toMatch(/^[A-Za-z0-9_-]{16,64}$/);
-    expect((started["otlp_endpoints"] as Record<string, string>)["traces"]).toContain(`/shots/${shotId}/v1/traces`);
+    expect((started["otlp_endpoints"] as Record<string, string>)["traces"]).toContain("/ingest/v1/traces");
 
     const stopped = await callTool(env, "shot_stop", { shot_id: shotId });
     expect(stopped["state"]).toBe("frozen");

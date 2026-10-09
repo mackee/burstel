@@ -1,6 +1,7 @@
 {
   // burstel Phase 2: Worker + one ShotDO (SQLite-backed) + one Container per shot,
-  // freezing the DuckDB artifact into R2.
+  // freezing the DuckDB artifact into R2. A singleton SQLite-backed IngestDO
+  // coordinates the push-only /ingest token and the active shot mapping.
   //
   // The Container uses the well-supported `default` scheduling policy: the image
   // and instance size live here in Wrangler configuration, and the ShotDO starts
@@ -34,12 +35,20 @@
       {
         "name": "SHOT_DO",
         "class_name": "ShotDO"
+      },
+      {
+        "name": "INGEST_DO",
+        "class_name": "IngestDO"
       }
     ]
   },
 
   "exports": {
     "ShotDO": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "IngestDO": {
       "type": "durable-object",
       "storage": "sqlite"
     }

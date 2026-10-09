@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 
 import { handleRequest } from "../src/app";
 import type { AppEnv, DoStubLike, ShotNamespaceLike } from "../src/app";
-import { FakeArtifacts, makeCore } from "./fakes";
+import type { IngestCore } from "../src/ingest-core";
+import { FakeArtifacts, FakeIngestNamespace, makeCore, makeIngest } from "./fakes";
 import type { TestHarness } from "./fakes";
 
 const TOKEN = "test-api-token";
@@ -24,10 +25,21 @@ class FakeNamespace implements ShotNamespaceLike {
   }
 }
 
-function makeEnv(namespace = new FakeNamespace()): { env: AppEnv; namespace: FakeNamespace } {
+function makeEnv(namespace = new FakeNamespace()): {
+  env: AppEnv;
+  namespace: FakeNamespace;
+  ingest: IngestCore;
+} {
+  const ingest = makeIngest();
   return {
-    env: { SHOT_DO: namespace, BURSTEL_API_TOKEN: TOKEN, PUBLIC_BASE_URL: "https://burstel.example" },
+    env: {
+      SHOT_DO: namespace,
+      INGEST_DO: new FakeIngestNamespace(ingest.core),
+      BURSTEL_API_TOKEN: TOKEN,
+      PUBLIC_BASE_URL: "https://burstel.example",
+    },
     namespace,
+    ingest: ingest.core,
   };
 }
 
@@ -70,29 +82,36 @@ describe("Worker API", () => {
     expect((await handleRequest(post("/shots/unknown/v1/traces", {}, null), env)).status).toBe(401);
   });
 
-  test("creating a shot returns an unguessable id and per-shot OTLP endpoints", async () => {
+  test("creating a shot returns an unguessable id and the stable /ingest endpoints", async () => {
     const { env, namespace } = makeEnv();
     const { id, body } = await createShot(env);
 
     expect(id).toMatch(/^[A-Za-z0-9_-]{16,64}$/);
     expect(body.state).toBe("recording");
-    expect(body.otlp_base_url).toBe(`https://burstel.example/shots/${id}`);
+    expect(body.otlp_base_url).toBe("https://burstel.example/ingest");
     expect(body.otlp_endpoints).toEqual({
-      traces: `https://burstel.example/shots/${id}/v1/traces`,
-      metrics: `https://burstel.example/shots/${id}/v1/metrics`,
-      logs: `https://burstel.example/shots/${id}/v1/logs`,
+      traces: "https://burstel.example/ingest/v1/traces",
+      metrics: "https://burstel.example/ingest/v1/metrics",
+      logs: "https://burstel.example/ingest/v1/logs",
     });
+    // The deprecated per-shot path is still advertised for compatibility, but
+    // the stable URL is identical for every shot.
+    expect(body.legacy_otlp_base_url).toBe(`https://burstel.example/shots/${id}`);
     expect(namespace.shots.has(id)).toBe(true);
   });
 
-  test("two shots map to two independent DO identities", async () => {
+  test("two sequential shots map to two independent DO identities", async () => {
     const { env, namespace } = makeEnv();
     const a = await createShot(env);
+    // Only one shot may record at a time: stop the first before starting the next.
+    expect((await handleRequest(post(`/api/shots/${a.id}/stop`, {}), env)).status).toBe(200);
     const b = await createShot(env);
 
     expect(a.id).not.toBe(b.id);
     expect(namespace.shots.size).toBe(2);
     expect(namespace.shots.get(a.id)).not.toBe(namespace.shots.get(b.id));
+    // Both shots advertise the same stable URL.
+    expect(a.body.otlp_base_url).toBe(b.body.otlp_base_url);
   });
 
   test("status and stop operate on the addressed shot", async () => {

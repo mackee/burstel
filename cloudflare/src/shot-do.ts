@@ -25,6 +25,12 @@ export interface Env extends Cloudflare.Env {
   CONTAINER_PORT?: string;
   /** R2 key prefix; defaults to `shots`. */
   ARTIFACT_PREFIX?: string;
+  /**
+   * Trusted local-development escape hatch. When set to `1`/`true`, admin
+   * endpoints accept requests even when `BURSTEL_API_TOKEN` is unset. Never set
+   * this in production.
+   */
+  BURSTEL_DEV_INSECURE_AUTH?: string;
 }
 
 const DEFAULT_CONTAINER_PORT = 8080;

@@ -10,6 +10,8 @@ import type { ArtifactResult, ArtifactSink, ArtifactSource } from "../src/artifa
 import type { ContainerControl } from "../src/container";
 import type { ShotCoreDeps } from "../src/core";
 import { ShotCore } from "../src/core";
+import type { DoStubLike, IngestNamespaceLike } from "../src/env";
+import { IngestCore } from "../src/ingest-core";
 import type { SqlCursor, SqlRow, SqlValue, SyncSql } from "../src/store";
 
 /** `SyncSql` over an in-process bun:sqlite database (same schema as DO SQLite). */
@@ -299,6 +301,29 @@ export interface TestHarness {
   sql: BunSql;
   container: FakeContainer;
   artifacts: FakeArtifacts;
+}
+
+export interface IngestHarness {
+  core: IngestCore;
+  sql: BunSql;
+}
+
+/** Builds an {@link IngestCore} over real in-process SQLite with a fake clock. */
+export function makeIngest(
+  options: { now?: () => number; generateToken?: () => string; sql?: BunSql } = {},
+): IngestHarness {
+  const sql = options.sql ?? new BunSql();
+  const core = new IngestCore({ sql, now: options.now, generateToken: options.generateToken });
+  return { core, sql };
+}
+
+/** Namespace stand-in for the singleton IngestDO binding. */
+export class FakeIngestNamespace implements IngestNamespaceLike {
+  constructor(readonly core: IngestCore) {}
+
+  getByName(): DoStubLike {
+    return { fetch: (request: Request) => this.core.handleInternal(request) };
+  }
 }
 
 export function makeCore(

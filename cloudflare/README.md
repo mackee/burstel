@@ -1,14 +1,15 @@
-# burstel Phase 2 — Cloudflare Worker + ShotDO + R2
+# burstel Cloudflare layer — Worker + ShotDO + SQLite IngestDO + R2
 
 This directory contains the Phase 2 Cloudflare layer for **burstel**. It builds
 on the Phase 1 Go recorder (`../cmd/burstel`, `../Dockerfile`); it does **not**
 replace it.
 
 ```
-                 public HTTPS                     Worker            per-shot DO
- exporter ──► POST /shots/{id}/v1/traces ──► auth + route ──► ShotDO ──► Container port
- rec client ─► POST /api/shots            ──► auth + route ──► ShotDO      (Go recorder)
- rec client ─► POST /api/shots/{id}/stop  ──► auth + route ──► ShotDO ──► GET /internal/stop
+                 public HTTPS                       Worker           coordinator / per-shot DO
+ exporter ──► POST /ingest/v1/{traces,metrics,logs} ─► push auth ─► IngestDO ─► active ShotDO ─► Container
+ rec client ─► POST /api/shots            ──► admin auth ──────► IngestDO + ShotDO
+ rec client ─► POST /api/ingest-token     ──► admin auth ──────► IngestDO (digest + expiry)
+ rec client ─► POST /api/shots/{id}/stop  ──► admin auth ──────► ShotDO ─► GET /internal/stop
                                                                     │        GET /internal/artifact
                                                                     ▼
                                                           R2Bucket.put (streaming)
@@ -17,9 +18,11 @@ replace it.
 ```
 
 * `src/index.ts` — Worker entrypoint.
-* `src/app.ts` — public HTTP routes + bearer auth (whitelist only).
+* `src/app.ts` — public HTTP routes + admin/push auth (whitelist only).
 * `src/shot-do.ts` — `ShotDO extends DurableObject`, wires `ctx.storage.sql`,
   `ctx.container` and the `BUCKET` R2 binding into the core.
+* `src/ingest-do.ts` / `src/ingest-core.ts` — singleton SQLite `IngestDO`: push
+  token digest/expiry and active-shot mapping (pure core, fully unit tested).
 * `src/core.ts` — race-safe lifecycle state machine (pure; fully unit tested).
 * `src/store.ts` — SQLite-backed state store over a `SyncSql` seam.
 * `src/artifacts.ts` — streaming single-PUT / bounded multipart R2 freeze.
@@ -27,40 +30,108 @@ replace it.
 
 ## Public HTTP API
 
-All control and ingest routes require `Authorization: Bearer <BURSTEL_API_TOKEN>`
-(or `X-Burstel-Token`). `GET /healthz` is unauthenticated.
+Two scopes exist after Phase 5 (spec 006):
 
-| Method | Path | Description |
-| --- | --- | --- |
-| `GET` | `/healthz` | Worker reachability |
-| `POST` | `/api/shots` | Create a shot (random unguessable id). Body: `{"metadata":{...}}` |
-| `GET` | `/api/shots/{id}` | Lifecycle / metadata / counters |
-| `POST` | `/api/shots/{id}/stop` | Idempotent freeze flow |
-| `POST` | `/api/shots/{id}/query` | Constrained read-only SQL against the frozen snapshot |
-| `POST` | `/api/shots/{id}/analyze` | SQL-backed analytical summaries |
-| `GET` | `/api/shots/{id}/schema` | Documented queryable schema + safety policy |
-| `POST` | `/api/shots/{id}/compare` | SQL-derived diff with another frozen shot (`{"other":"<id>"}`) |
-| `POST` | `/mcp` | Remote MCP (Streamable HTTP) endpoint |
-| `POST` | `/shots/{id}/v1/traces` | Authenticated OTLP/HTTP ingest (streamed) |
-| `POST` | `/shots/{id}/v1/metrics` | Authenticated OTLP/HTTP ingest (streamed) |
-| `POST` | `/shots/{id}/v1/logs` | Authenticated OTLP/HTTP ingest (streamed) |
+* **Admin scope** — `Authorization: Bearer <BURSTEL_API_TOKEN>` (or
+  `X-Burstel-Token`): all `/api/*` control and analysis routes, `/mcp`, and the
+  legacy per-shot ingest path.
+* **Push scope** — a random, admin-issued push-only token (valid exactly 24h):
+  `POST /ingest/v1/{traces,metrics,logs}` only. It is never accepted anywhere
+  else and the admin token is never accepted for `/ingest`.
 
-`POST /api/shots` and `GET /api/shots/{id}` return `otlp_base_url` plus explicit
-`otlp_endpoints` for the three signals, e.g.
-`https://<host>/shots/<id>/v1/traces`.
+`GET /healthz` is unauthenticated.
+
+| Method | Path | Scope | Description |
+| --- | --- | --- | --- |
+| `GET` | `/healthz` | public | Worker reachability |
+| `POST` | `/api/ingest-token` | admin | Issue/replace the push token. Returns the raw secret **once** plus `issued_at`/`expires_at` (exact 24h). `Cache-Control: no-store`. |
+| `GET` | `/api/ingest-token` | admin | Token status. Never returns the secret or digest. |
+| `DELETE` | `/api/ingest-token` | admin | Revoke the active push token. |
+| `POST` | `/api/shots` | admin | Create a shot and activate it for stable ingest. |
+| `GET` | `/api/shots/{id}` | admin | Lifecycle / metadata / counters |
+| `POST` | `/api/shots/{id}/stop` | admin | Idempotent freeze flow; detaches stable ingest |
+| `POST` | `/api/shots/{id}/query` | admin | Constrained read-only SQL against the frozen snapshot |
+| `POST` | `/api/shots/{id}/analyze` | admin | SQL-backed analytical summaries |
+| `GET` | `/api/shots/{id}/schema` | admin | Documented queryable schema + safety policy |
+| `POST` | `/api/shots/{id}/compare` | admin | SQL-derived diff with another frozen shot (`{"other":"<id>"}`) |
+| `POST` | `/mcp` | admin | Remote MCP (Streamable HTTP) endpoint |
+| `POST` | `/ingest/v1/traces` | push | Stable OTLP/HTTP ingest (streamed to the active shot) |
+| `POST` | `/ingest/v1/metrics` | push | Stable OTLP/HTTP ingest (streamed to the active shot) |
+| `POST` | `/ingest/v1/logs` | push | Stable OTLP/HTTP ingest (streamed to the active shot) |
+| `POST` | `/shots/{id}/v1/{traces,metrics,logs}` | admin | **Deprecated** legacy per-shot path, kept for compatibility |
+
+`POST /api/shots` and `GET /api/shots/{id}` return the stable `otlp_base_url`
+plus explicit `otlp_endpoints` for the three signals, e.g.
+`https://<host>/ingest/v1/traces`. The same URL is returned for every shot so a
+collector is configured **once per day**, not once per shot. The deprecated
+per-shot paths are still advertised as `legacy_otlp_base_url` /
+`legacy_otlp_endpoints` and continue to work with the admin token.
 
 The Go recorder's `/internal/*`, artifact and query endpoints are **never**
-exposed. The Worker only forwards the whitelisted paths above to the ShotDO,
-which reaches the container over its private TCP port.
+exposed. The Worker only forwards the whitelisted paths above to a Durable
+Object, which reaches the container over its private TCP port.
 
 ### Authentication notes
 
-* The token is read from `Authorization: Bearer …` first, then
+* Tokens are read from `Authorization: Bearer …` first, then
   `X-Burstel-Token`. OTLP exporters can set either via
   `OTEL_EXPORTER_OTLP_HEADERS`.
-* The token is compared in constant time, never logged, and never forwarded to
+* Tokens are compared in constant time, never logged, and never forwarded to
   the container. The container separately receives `BURSTEL_INTERNAL_TOKEN`
   (defaults to the API token) so its `/internal/*` endpoints are also gated.
+* Admin authentication **fails closed** when `BURSTEL_API_TOKEN` is unset. The
+  only bypass is the explicit local-development flag
+  `BURSTEL_DEV_INSECURE_AUTH=1` (or `true`/`yes`), which must never be set in
+  production. There are no hardcoded credential defaults.
+
+## Stable ingest and the 24h push token (spec 006)
+
+Standard OTel HTTP exporters are configured **once** for a day:
+
+```
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+OTEL_EXPORTER_OTLP_ENDPOINT=https://<host>/ingest
+OTEL_EXPORTER_OTLP_HEADERS=X-Burstel-Token=<day's push token>
+```
+
+The admin issues that token explicitly, at most as often as needed:
+
+```bash
+curl -fsS -X POST https://<host>/api/ingest-token \
+  -H "Authorization: Bearer $BURSTEL_API_TOKEN"
+# -> {"token":"<secret shown once>","issued_at":"...","expires_at":"...","ttl_seconds":86400}
+```
+
+* The raw secret is returned **exactly once**, is at least 256 bits of CSPRNG
+  and is persisted only as a one-way SHA-256 digest in the SQLite-backed
+  `IngestDO`. It is never written to logs, specs, git history or R2.
+* The token is accepted iff `now < expires_at` where
+  `expires_at = issued_at + 86_400s`. At `expires_at` and later the server
+  replies `401` and proxies nothing. Expiry survives Worker/DO eviction because
+  it is persisted, and is never extended by shot start/stop, queries or ingest.
+* Issuing a replacement atomically revokes the prior token. Rotation is
+  **refused while a shot is recording** so a benchmark cannot be abruptly cut
+  off; stop the shot first, then rotate.
+* `POST /api/shots` activates the new shot as the stable-ingest target once it
+  is recording. A shot that is already recording is **not** silently displaced:
+  a second `shot_start` returns `409`. `shot_stop` detaches the target, drains
+  in-flight requests and freezes the correct shot, so late signals are never
+  attributed to the next shot.
+* Between shots the exporter may still send background data. The server replies
+  a valid OTLP/HTTP `200` (empty proto message / `{}`) and consciously discards
+  it, labelled `X-Burstel-Disposition: ignored-no-active-shot`; discarded
+  requests are counted in management status. Nothing is stored while no shot is
+  active.
+* **Expiry is about the token, not the shot.** A shot recording when the token
+  expires keeps recording until the admin stops it; frozen shots and their R2
+  artifacts never expire. `GET /api/ingest-token` exposes `expires_at`,
+  `remaining_seconds` and a sub-hour warning so the operator can rotate
+  proactively.
+* Scope separation: the push token cannot call `/api/*`, `/mcp`, `/shots/*` or
+  the legacy per-shot path; the admin token cannot call `/ingest`. Failed
+  authorization is distinguished (missing/invalid/expired/revoked) in safe
+  structured counters on the token status response.
+
 
 ## Phase 3 — MCP analysis and comparison
 
@@ -177,10 +248,14 @@ building the container image.
 bun install
 bun run typecheck          # tsc for src (Worker/DO + MCP)
 bun run typecheck:test     # tsc for the pure core + tests
-bun test                   # lifecycle, auth, R2, container, analysis, MCP
+bun test                   # lifecycle, ingest token, auth, R2, container, analysis, MCP
 bun run dev                # wrangler dev (needs a local Docker/container engine)
 bun run deploy:dry-run     # bundling dry-run, skips the container image build
 ```
+
+For trusted local development only, `wrangler dev` can run without an admin
+token by exporting `BURSTEL_DEV_INSECURE_AUTH=1` before `bun run dev`. This
+bypass is disabled by default and must never be set in production.
 
 ### End-to-end quickstart (OTLP exporter -> start/stop/query/compare)
 
@@ -200,21 +275,26 @@ SQL-derived deltas. It also proves the raw OTLP bytes are unchanged.
 Against a real `wrangler dev` (needs a container engine), the same flow is:
 
 ```bash
-# 1. Start a shot and point an OTLP exporter at it.
-curl -s -H "Authorization: Bearer $TOKEN" -X POST \
-  -d '{"metadata":{"commit":"abc123","scenario":"bench"}}' \
-  https://<host>/api/shots
-# -> {"shot_id":"...","otlp_endpoints":{"traces":".../shots/<id>/v1/traces", ...}}
+# 1. Issue the day's push-only token (once per day, admin auth).
+PUSH=$(curl -fsS -X POST https://<host>/api/ingest-token \
+  -H "Authorization: Bearer $TOKEN" | jq -r .token)
 
+# 2. Configure the exporter ONCE for the day, then keep it fixed.
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-export OTEL_EXPORTER_OTLP_ENDPOINT=https://<host>/shots/<id>
-export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer $TOKEN"
-# ... run the benchmark so the exporter sends traces/metrics/logs ...
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://<host>/ingest
+export OTEL_EXPORTER_OTLP_HEADERS="X-Burstel-Token=$PUSH"
 
-# 2. Stop and freeze.
-curl -s -H "Authorization: Bearer $TOKEN" -X POST https://<host>/api/shots/<id>/stop
+# 3. For each benchmark shot, just start/stop; the URL and token never change.
+for i in 1 2 3; do
+  curl -s -H "Authorization: Bearer $TOKEN" -X POST \
+    -d '{"metadata":{"commit":"abc123","scenario":"bench"}}' \
+    https://<host>/api/shots
+  # -> {"shot_id":"...","otlp_base_url":"https://<host>/ingest", ...}
+  # ... run the benchmark so the exporter sends traces/metrics/logs ...
+  curl -s -H "Authorization: Bearer $TOKEN" -X POST https://<host>/api/shots/<id>/stop
+done
 
-# 3. Query and analyze the frozen snapshot (no recording container is running).
+# 4. Query and analyze any frozen snapshot (no recording container is running).
 curl -s -H "Authorization: Bearer $TOKEN" -X POST \
   -d '{"sql":"SELECT service_name, count(*) AS n FROM spans GROUP BY 1 ORDER BY n DESC"}' \
   https://<host>/api/shots/<id>/query
@@ -222,7 +302,7 @@ curl -s -H "Authorization: Bearer $TOKEN" -X POST \
 curl -s -H "Authorization: Bearer $TOKEN" -X POST -d '{"top_n":10}' \
   https://<host>/api/shots/<id>/analyze
 
-# 4. Compare two shots.
+# 5. Compare two shots.
 curl -s -H "Authorization: Bearer $TOKEN" -X POST -d '{"other":"<id2>","top_n":10}' \
   https://<host>/api/shots/<id>/compare
 ```
@@ -237,6 +317,17 @@ token against `https://<host>/mcp`; call `initialize`, then `tools/list`, then
   failure injection (R2 write failure cannot produce `frozen`), artifact length
   validation, and rehydration across a simulated DO restart — over real SQLite
   (`bun:sqlite`) and fakes.
+* The stable `/ingest` push-token flow with a **fake clock**: issue is exactly
+  24h, `issue+23h59m59s` is accepted, `issue+24h` is `401`; revocation and
+  replacement invalidate the prior token; missing/wrong tokens are counted; the
+  push token is denied on admin/REST/MCP and the admin token is denied on
+  `/ingest`; missing admin config fails closed and the explicit dev bypass works.
+* IngestDO durability across a simulated DO restart (expiry, revoked state,
+  active mapping and counters survive), and that only a SHA-256 digest — never
+  the raw secret — is persisted.
+* Stable URL across two sequential shots with distinct backend ShotDO ids, all
+  three signals, the no-active-shot `200` discard (with disposition header) and
+  late-data-after-stop non-attribution.
 * Auth rejection, shot isolation, OTLP proxy response semantics, and route
   validation through the real Worker request handler.
 * Single-PUT and multipart R2 streaming code paths against a fake R2 bucket.
@@ -248,7 +339,8 @@ token against `https://<host>/mcp`; call `initialize`, then `tools/list`, then
   and non-frozen/missing-artifact cases fail closed.
 * MCP `initialize` / `tools/list` / `tools/call` envelopes and the full
   start/stop/query/analyze/compare tool flow through the official SDK.
-* TypeScript typecheck and `wrangler deploy --dry-run` bundling.
+* TypeScript typecheck and `wrangler deploy --dry-run` bundling (which lists
+  both `ShotDO` and `IngestDO` bindings).
 
 `wrangler deploy --dry-run` (without `--containers-rollout=none`) additionally
 requires the Docker CLI because Wrangler must build the container image even for

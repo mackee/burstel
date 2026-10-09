@@ -17,6 +17,13 @@ R2 / MCP はまだ含まない。収集した DuckDB ファイルを後から SQ
 > 解析できる。`internal/analysis` が SQL allowlist / リソース上限を強制する。
 > 詳細は [`cloudflare/README.md`](./cloudflare/README.md) と
 > [`cloudflare/docs/adr-001-analysis-query-safety.md`](./cloudflare/docs/adr-001-analysis-query-safety.md)。
+>
+> **Stable ingest (spec 006)** は、shot ごとに exporter を再設定する従来フローを
+> やめ、固定の `https://<host>/ingest` と、管理者が 24 時間だけ発行する
+> push 専用トークン (`POST /api/ingest-token`) で複数 shot を連続収集する。
+> 24 時間の期限は **トークン** のもので shot ではない。SQLite バックエンドの
+> `IngestDO` が token の digest と有効期限、アクティブ shot を管理する。詳細は
+> [`cloudflare/README.md`](./cloudflare/README.md)。
 
 ## できること
 

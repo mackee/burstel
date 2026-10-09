@@ -10,7 +10,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 
-import { authenticate } from "./auth";
+import { adminAuthenticate } from "./auth";
 import type { AppEnv } from "./env";
 import { unauthorized } from "./errors";
 import { errorMessage } from "./errors";
@@ -43,14 +43,19 @@ function fail(error: unknown): ToolOutput {
 
 function buildServer(env: AppEnv, origin: string): McpServer {
   const server = new McpServer({ name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION });
-  const tools = createTools({ namespace: env.SHOT_DO, origin, publicBaseUrl: env.PUBLIC_BASE_URL });
+  const tools = createTools({
+    namespace: env.SHOT_DO,
+    ingest: env.INGEST_DO,
+    origin,
+    publicBaseUrl: env.PUBLIC_BASE_URL,
+  });
 
   server.registerTool(
     "shot_start",
     {
       title: "Start a shot",
       description:
-        "Create a new recording shot and return its id plus OTLP/HTTP ingest endpoints. metadata may carry the commit SHA, benchmark/scenario and a note.",
+        "Create a new recording shot and return its id plus the stable OTLP/HTTP ingest URL. metadata may carry the commit SHA, benchmark/scenario and a note. The push token is issued separately from POST /api/ingest-token and is never returned here.",
       inputSchema: { metadata: z.record(z.string(), z.any()).optional() },
     },
     async ({ metadata }) => {
@@ -180,7 +185,7 @@ function buildServer(env: AppEnv, origin: string): McpServer {
 
 /** Handles a single MCP HTTP request after authentication. */
 export async function handleMcp(request: Request, env: AppEnv): Promise<Response> {
-  if (!authenticate(request, env.BURSTEL_API_TOKEN)) {
+  if (!adminAuthenticate(request, env)) {
     return errorResponse(unauthorized());
   }
   const origin = new URL(request.url).origin;
