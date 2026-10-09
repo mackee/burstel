@@ -12,3 +12,7 @@ coverage.out
 /cloudflare/node_modules/
 /cloudflare/.wrangler/
 /cloudflare/dist/
+
+# Wrangler local dev secrets. NEVER commit real tokens.
+.dev.vars
+**/.dev.vars

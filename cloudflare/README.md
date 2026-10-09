@@ -361,6 +361,32 @@ a dry-run. This sandbox has no Docker daemon, so the dry-run used here is
 `wrangler deploy --dry-run --containers-rollout=none`, which validates the
 Wrangler configuration and bundles the Worker.
 
+### Phase 9 — image build validation, preflight and smoke
+
+The authoring sandbox has no Docker daemon, so the real `linux/amd64` image
+build is validated by [`.github/workflows/container-image.yml`](../.github/workflows/container-image.yml)
+on an Ubuntu Docker runner: `docker buildx build --platform linux/amd64 --load`
+followed by [`scripts/container-smoke.sh`](../scripts/container-smoke.sh) (real
+OTLP traces/metrics/logs, freeze size/SHA-256, DuckDB persistence across a
+restart, nonroot uid 10001, libstdc++/cgo link). It uses no Cloudflare
+credentials and deploys nothing.
+
+Deployment is gated by a strictly read-only preflight and documented in
+[`docs/cloudflare-deploy.md`](../docs/cloudflare-deploy.md):
+
+```bash
+scripts/cloudflare-preflight.sh --config-only   # config invariants, no credentials
+scripts/cloudflare-preflight.sh                 # full read-only preflight (auth needed)
+```
+
+`cloudflare/src/preflight.ts` + `cloudflare/scripts/preflight.mjs` validate the
+`wrangler.jsonc` invariants (ShotDO container, `standard-1`, bounded
+`max_instances`, SQLite `ShotDO`/`IngestDO` exports, `BUCKET -> burstel-shots`,
+no anonymous admin) and parse read-only `wrangler whoami --json`,
+`wrangler secret list` (names only) and R2 bucket listings. The live
+[`scripts/cloudflare-smoke.sh`](../scripts/cloudflare-smoke.sh) is a bounded E2E
+(two short shots) that never exposes a secret in argv/files/logs.
+
 ### Not verified here (needs a distinct authorized deployment job)
 
 * Real Cloudflare Container scheduling/readiness and `ctx.container` behavior.

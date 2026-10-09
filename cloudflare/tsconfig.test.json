@@ -15,6 +15,7 @@
     "src/core.ts",
     "src/env.ts",
     "src/ingest-core.ts",
+    "src/preflight.ts",
     "src/tools.ts",
     "src/mcp.ts",
     "src/app.ts"

@@ -1,5 +1,7 @@
 .git
 .gitignore
+.dev.vars
+**/.dev.vars
 bin/
 data/
 *.duckdb

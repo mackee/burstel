@@ -1,7 +1,8 @@
 GO ?= go
 BUN ?= bun
+IMAGE ?= burstel:deploy
 
-.PHONY: build test vet fmt tidy run docker clean cf-typecheck cf-test trial trial-smoke
+.PHONY: build test vet fmt tidy run docker clean cf-typecheck cf-test cf-preflight cf-preflight-config cf-smoke container-smoke trial trial-smoke
 
 build:
 	$(GO) build -o bin/burstel ./cmd/burstel
@@ -33,6 +34,20 @@ cf-typecheck:
 
 cf-test:
 	cd cloudflare && $(BUN) test
+
+# Phase 9: read-only deploy preflight and live smoke (see docs/cloudflare-deploy.md)
+cf-preflight:
+	scripts/cloudflare-preflight.sh
+
+cf-preflight-config:
+	scripts/cloudflare-preflight.sh --config-only
+
+cf-smoke:
+	scripts/cloudflare-smoke.sh
+
+# Real linux/amd64 container smoke against an already-built image
+container-smoke:
+	scripts/container-smoke.sh $(IMAGE)
 
 # Standalone field trial (Phase 4); see docs/standalone-field-trial.md
 trial:

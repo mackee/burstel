@@ -1,9 +1,17 @@
-// Command otlpsend is a tiny local demo client: it starts a shot, sends the
-// three built-in OTLP protobuf fixtures (metrics gzipped) and stops the shot.
+// Command otlpsend is a tiny local demo/smoke client. By default it starts a
+// shot, sends the three built-in OTLP protobuf fixtures (metrics gzipped) and
+// stops the shot:
 //
 //	otlpsend -url http://localhost:4318 -shot demo-1 -token "$BURSTEL_INTERNAL_TOKEN"
 //
-// It exists so the README quickstart does not require a full OTel SDK.
+// With -ingest it instead targets the Worker's stable ingest endpoint, sending
+// the same three real fixtures to <ingest>/ingest/v1/{traces,metrics,logs} with
+// a push-only token and no start/stop (the admin controls lifecycle over REST):
+//
+//	BURSTEL_PUSH_TOKEN=... otlpsend -ingest https://<host>
+//
+// The token is deliberately taken from the BURSTEL_PUSH_TOKEN environment
+// variable when the flag is omitted so a secret never has to appear in argv.
 package main
 
 import (
@@ -15,6 +23,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -26,9 +35,29 @@ func main() {
 	baseURL := flag.String("url", "http://localhost:4318", "burstel base URL")
 	shotID := flag.String("shot", "demo-1", "shot id")
 	token := flag.String("token", os.Getenv("BURSTEL_INTERNAL_TOKEN"), "internal bearer token")
+	ingestURL := flag.String("ingest", "", "stable ingest base URL (Worker); when set, only send the three fixtures to <ingest>/ingest/v1/* and exit")
+	pushToken := flag.String("push-token", os.Getenv("BURSTEL_PUSH_TOKEN"), "push-only token for -ingest (prefer the BURSTEL_PUSH_TOKEN env var)")
 	flag.Parse()
 
 	client := &http.Client{Timeout: 30 * time.Second}
+
+	if *ingestURL != "" {
+		if *pushToken == "" {
+			fail(fmt.Errorf("-ingest requires a push token via -push-token or BURSTEL_PUSH_TOKEN"))
+		}
+		base := strings.TrimRight(*ingestURL, "/")
+		for _, sig := range []string{"traces", "metrics", "logs"} {
+			body, encoding, err := fixture(sig)
+			if err != nil {
+				fail(err)
+			}
+			if err := send(client, base+"/ingest/v1/"+sig, body, encoding, *pushToken); err != nil {
+				fail(err)
+			}
+			fmt.Printf("sent %s (%d bytes, encoding=%q)\n", sig, len(body), encoding)
+		}
+		return
+	}
 
 	if err := start(client, *baseURL, *token, *shotID); err != nil {
 		fail(err)
@@ -38,7 +67,7 @@ func main() {
 		if err != nil {
 			fail(err)
 		}
-		if err := send(client, *baseURL+"/v1/"+sig, body, encoding); err != nil {
+		if err := send(client, *baseURL+"/v1/"+sig, body, encoding, ""); err != nil {
 			fail(err)
 		}
 		fmt.Printf("sent %s (%d bytes, encoding=%q)\n", sig, len(body), encoding)
@@ -100,7 +129,7 @@ func stop(client *http.Client, base, token, shotID string) (map[string]any, erro
 	return out, nil
 }
 
-func send(client *http.Client, url string, body []byte, encoding string) error {
+func send(client *http.Client, url string, body []byte, encoding, pushToken string) error {
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return err
@@ -108,6 +137,9 @@ func send(client *http.Client, url string, body []byte, encoding string) error {
 	req.Header.Set("Content-Type", "application/x-protobuf")
 	if encoding != "" {
 		req.Header.Set("Content-Encoding", encoding)
+	}
+	if pushToken != "" {
+		req.Header.Set("X-Burstel-Token", pushToken)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
