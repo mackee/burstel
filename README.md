@@ -7,6 +7,10 @@ OTLP/HTTP で全量収集し、DuckDB に保存して停止時に freeze する 
 R2 / MCP はまだ含まない。収集した DuckDB ファイルを後から SQL で分析するための
 土台を提供する。
 
+> **Phase 2** ([`cloudflare/`](./cloudflare)) は、この Phase 1 の Go 実装をそのまま
+> コンテナとして動かし、Cloudflare Worker + per-shot `ShotDO`(SQLite)+ Container +
+> R2 で shot を freeze する。詳細は [`cloudflare/README.md`](./cloudflare/README.md) を参照。
+
 ## できること
 
 - OTLP/HTTP protobuf (`application/x-protobuf`, 任意の gzip) の 3 シグナルを受信

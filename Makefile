@@ -1,6 +1,7 @@
 GO ?= go
+BUN ?= bun
 
-.PHONY: build test vet fmt tidy run docker clean
+.PHONY: build test vet fmt tidy run docker clean cf-typecheck cf-test
 
 build:
 	$(GO) build -o bin/burstel ./cmd/burstel
@@ -22,6 +23,13 @@ run:
 
 docker:
 	docker build -t burstel:dev .
+
+# Phase 2 Cloudflare Worker (see cloudflare/README.md)
+cf-typecheck:
+	cd cloudflare && $(BUN) run typecheck && $(BUN) run typecheck:test
+
+cf-test:
+	cd cloudflare && $(BUN) test
 
 clean:
 	rm -rf bin

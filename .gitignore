@@ -4,3 +4,8 @@
 *.duckdb.wal
 *.duckdb.tmp
 coverage.out
+
+# Cloudflare Worker (Phase 2)
+/cloudflare/node_modules/
+/cloudflare/.wrangler/
+/cloudflare/dist/

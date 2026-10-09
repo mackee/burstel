@@ -6,3 +6,6 @@ data/
 *.duckdb.wal
 coverage.out
 README.md
+cloudflare/node_modules
+cloudflare/.wrangler
+cloudflare/dist

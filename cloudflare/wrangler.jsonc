@@ -1,0 +1,61 @@
+{
+  // burstel Phase 2: Worker + one ShotDO (SQLite-backed) + one Container per shot,
+  // freezing the DuckDB artifact into R2.
+  //
+  // The Container uses the well-supported `default` scheduling policy: the image
+  // and instance size live here in Wrangler configuration, and the ShotDO starts
+  // the container process at runtime through the Durable Object Container API
+  // (`this.ctx.container`).
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "burstel",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-08",
+  // Required so `request.signal` reaches a Durable Object `fetch` handler; used
+  // to stop forwarding ingest bodies when the client disconnects.
+  "compatibility_flags": ["enable_request_signal"],
+
+  "containers": [
+    {
+      "class_name": "ShotDO",
+      "scheduling_policy": "default",
+      // Build the existing Phase 1 Go recorder image. The build context is the
+      // repository root so the Dockerfile can `COPY` the Go sources.
+      "image": "../Dockerfile",
+      "image_build_context": "..",
+      "instance_type": "standard-1",
+      // A limited number of concurrent Container instances; exceeding this is
+      // surfaced to clients as a retryable capacity error.
+      "max_instances": 10
+    }
+  ],
+
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "SHOT_DO",
+        "class_name": "ShotDO"
+      }
+    ]
+  },
+
+  "exports": {
+    "ShotDO": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      // Created by a distinct, authorized deployment job. This repo never
+      // creates buckets or writes account credentials.
+      "bucket_name": "burstel-shots"
+    }
+  ],
+
+  "workers_dev": true,
+  "observability": {
+    "enabled": true
+  }
+}
