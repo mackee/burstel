@@ -132,6 +132,23 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 Burstel はパス別エンドポイント(`/v1/traces` など)を提供するため、
 OTel SDK の標準 HTTP exporter がそのまま利用できる。
 
+### Standalone field trial (Phase 4)
+
+実 OTel Go SDK で traces / metrics / 相関 logs を OTLP/HTTP で送る
+ISUCON 風ワークロード(`cmd/burstel-trial`)と、freeze 済み DuckDB を
+独立プロセスで restore → query/analyze/compare する CLI
+(`cmd/burstel-inspect`)を使い、Cloudflare 無しで recorder + analyzer を
+実測検証できる。
+
+```bash
+scripts/local-trial.sh --smoke        # 10s + 20s の短縮スモーク
+scripts/local-trial.sh                # 60s baseline + 180s regressed
+```
+
+計測値・限界・判定は [`docs/standalone-field-trial.md`](./docs/standalone-field-trial.md)
+を参照。すべて loopback + 一時ディレクトリで動作し、Cloudflare/R2/Docker/root を
+必要としない。
+
 ## DuckDB スキーマ (schema_version = 1)
 
 `internal/storage/schema.go` が正。主なテーブル:

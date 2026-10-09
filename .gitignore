@@ -5,6 +5,9 @@
 *.duckdb.tmp
 coverage.out
 
+# Local field trial scratch (scripts/local-trial.sh)
+/.trial/
+
 # Cloudflare Worker (Phase 2)
 /cloudflare/node_modules/
 /cloudflare/.wrangler/
