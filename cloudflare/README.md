@@ -364,8 +364,10 @@ Wrangler configuration and bundles the Worker.
 ### Phase 9 — image build validation, preflight and smoke
 
 The authoring sandbox has no Docker daemon, so the real `linux/amd64` image
-build is validated by [`.github/workflows/container-image.yml`](../.github/workflows/container-image.yml)
-on an Ubuntu Docker runner: `docker buildx build --platform linux/amd64 --load`
+build is validated by [`ci/github-actions/container-image.yml`](../ci/github-actions/container-image.yml)
+(installed to `.github/workflows/` with `scripts/install-github-workflow.sh`; the managed
+push App lacks the `workflows` permission) on an Ubuntu Docker runner:
+`docker buildx build --platform linux/amd64 --load`
 followed by [`scripts/container-smoke.sh`](../scripts/container-smoke.sh) (real
 OTLP traces/metrics/logs, freeze size/SHA-256, DuckDB persistence across a
 restart, nonroot uid 10001, libstdc++/cgo link). It uses no Cloudflare

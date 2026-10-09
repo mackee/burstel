@@ -1,0 +1,80 @@
+# Real linux/amd64 image build + container smoke for burstel.
+#
+# INSTALL: this repository's managed push pipeline (a GitHub App without the
+# `workflows` permission) cannot create files under `.github/workflows/`. Install
+# this workflow with an account/app that has the `workflows` permission:
+#
+#   scripts/install-github-workflow.sh
+#
+# which copies this file to `.github/workflows/container-image.yml`. Once
+# installed, GitHub Actions runs it on the matching push/PR paths.
+#
+# The build-host sandbox has no Docker daemon, so this workflow is the
+# reproducible way to prove the existing multistage Debian/cgo Dockerfile
+# actually builds and runs: it builds the image with buildx (real cgo DuckDB
+# linking) on a standard Ubuntu Docker runner and then exercises it with
+# scripts/container-smoke.sh.
+#
+# It intentionally uses NO Cloudflare credentials and does NOT deploy anything.
+# The only secret-like value is an ephemeral, locally generated internal token
+# confined to the job's process environment; no secret is uploaded as an
+# artifact and no `.dev.vars` is created.
+name: container-image
+
+on:
+  push:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "go.mod"
+      - "go.sum"
+      - "cmd/**"
+      - "internal/**"
+      - "scripts/container-smoke.sh"
+      - ".github/workflows/container-image.yml"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".dockerignore"
+      - "go.mod"
+      - "go.sum"
+      - "cmd/**"
+      - "internal/**"
+      - "scripts/container-smoke.sh"
+      - ".github/workflows/container-image.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke:
+    name: build linux/amd64 image and smoke it
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Set up Go (for the cmd/otlpsend smoke client)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+
+      - name: Build linux/amd64 image (real cgo DuckDB link)
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --tag burstel:ci \
+            .
+
+      - name: Prove the built image is linux/amd64
+        run: docker image inspect burstel:ci --format '{{.Os}}/{{.Architecture}}'
+
+      - name: Container smoke (OTLP, freeze, checksum, persistence, nonroot)
+        run: scripts/container-smoke.sh burstel:ci

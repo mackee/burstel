@@ -57,7 +57,10 @@ scripts/container-smoke.sh burstel:deploy
 ```
 
 In CI (used by this repo, because the authoring sandbox has no Docker daemon),
-`.github/workflows/container-image.yml` does the same on an Ubuntu Docker runner:
+`ci/github-actions/container-image.yml` does the same on an Ubuntu Docker runner
+(install it to `.github/workflows/` with `scripts/install-github-workflow.sh`;
+the managed push App lacks the GitHub App `workflows` permission, so this
+pipeline cannot push the workflow file itself):
 real `docker buildx build --platform linux/amd64`, then
 `scripts/container-smoke.sh`, which exercises `/healthz`, `/readyz`, real OTLP
 traces/metrics/logs, `stop` → freeze size/SHA-256, on-disk DuckDB persistence

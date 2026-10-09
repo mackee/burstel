@@ -256,9 +256,10 @@ docker run --rm -p 4318:4318 -v "$PWD/data:/data" \
 `Dockerfile` は `golang:1.26-bookworm` で cgo ビルドし、`debian:bookworm-slim`
 ランタイムに配置する(linux/amd64 想定)。cgo のため g++ が必要。
 
-実 image の build と smoke は CI (`.github/workflows/container-image.yml`) が
+実 image の build と smoke は CI ([`ci/github-actions/container-image.yml`](./ci/github-actions/container-image.yml)) が
 Ubuntu Docker ランナーで検証する(`docker buildx build --platform linux/amd64`
-→ `scripts/container-smoke.sh`)。Cloudflare へのデプロイ手順・read-only
+→ `scripts/container-smoke.sh`)。`.github/workflows/` への install は
+`scripts/install-github-workflow.sh`(workflows 権限が必要)を参照。Cloudflare へのデプロイ手順・read-only
 preflight・bounded E2E は [`docs/cloudflare-deploy.md`](./docs/cloudflare-deploy.md)
 を参照。
 
