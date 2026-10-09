@@ -42,6 +42,45 @@ export interface AdminAuthEnv {
   BURSTEL_DEV_INSECURE_AUTH?: string;
 }
 
+export interface InternalAuthEnv extends AdminAuthEnv {
+  BURSTEL_INTERNAL_TOKEN?: string;
+}
+
+/**
+ * Outcome of resolving the container's internal bearer token.
+ *
+ * Production requires a *distinct*, nonempty `BURSTEL_INTERNAL_TOKEN`. It is
+ * never the admin token and never the random push-only token. When it is absent
+ * or equal to the admin token the DO fails closed rather than booting an
+ * unguarded container or leaking the admin secret.
+ */
+export type InternalTokenResolution =
+  | { ok: true; token: string; insecure: boolean }
+  | { ok: false; reason: "missing" | "not_distinct" };
+
+/**
+ * Resolves the container internal token from Worker/DO bindings.
+ *
+ * The legacy `BURSTEL_API_TOKEN` fallback is deliberately gone: an admin token
+ * must never be forwarded into a container. The only way to run without an
+ * internal token is the explicit local-development flag
+ * `BURSTEL_DEV_INSECURE_AUTH`, which is disabled by default.
+ */
+export function resolveInternalToken(env: InternalAuthEnv): InternalTokenResolution {
+  const internal = (env.BURSTEL_INTERNAL_TOKEN ?? "").trim();
+  if (isInsecureDevAuth(env)) {
+    // Explicit local opt-in. Never promote the admin token; an empty token
+    // means the container's internal routes are intentionally ungated in dev.
+    return { ok: true, token: internal, insecure: true };
+  }
+  if (internal.length === 0) return { ok: false, reason: "missing" };
+  const admin = env.BURSTEL_API_TOKEN;
+  if (typeof admin === "string" && admin.length > 0 && constantTimeEqual(internal, admin)) {
+    return { ok: false, reason: "not_distinct" };
+  }
+  return { ok: true, token: internal, insecure: false };
+}
+
 /** True only for the trusted, explicit local-development bypass. */
 export function isInsecureDevAuth(env: AdminAuthEnv): boolean {
   const value = env.BURSTEL_DEV_INSECURE_AUTH?.trim().toLowerCase();

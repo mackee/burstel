@@ -128,8 +128,16 @@ describe("ShotCore lifecycle", () => {
 
     const stopPromise = h.core.stop();
 
-    // New ingestion after stop has been requested must be refused, not lost.
-    await expect(h.core.ingest("logs", otlpRequest())).rejects.toThrow(/stopping/);
+    // New ingestion after stop has been requested is a definite, machine
+    // readable pre-commit rejection: nothing was written, so the stable
+    // `/ingest` forwarder may safely discard it.
+    await expect(h.core.ingest("logs", otlpRequest())).rejects.toMatchObject({
+      status: 409,
+      code: "shot_stopping",
+      definitelyUnaccepted: true,
+    });
+    // It must not have reached the recorder.
+    expect(container.ingestBodies).toHaveLength(0);
 
     release();
     const settled = await Promise.all(writers);
@@ -139,6 +147,89 @@ describe("ShotCore lifecycle", () => {
     expect(result.state).toBe("frozen");
     expect(container.ingestBodies).toHaveLength(8);
     expect(result.counters.batches.traces).toBe(8);
+  });
+
+  test("the ShotDO marks a definite stop-race rejection for discard", async () => {
+    const h = makeCore("shot-marker");
+    await h.core.create({});
+    await h.core.stop();
+
+    // After a stop the shot is no longer accepting: the DO boundary returns a
+    // machine-readable `shot_stopping` (or `not_recording`) with the discard
+    // marker the Worker uses, not a 503 that would trigger exporter retries.
+    const resp = await h.core.handleInternal(
+      new Request("https://shot-do.internal/internal/ingest/traces", {
+        method: "POST",
+        headers: { "content-type": "application/x-protobuf" },
+        body: new Uint8Array([0x0a, 0x00]),
+      }),
+    );
+    expect(resp.status).toBe(409);
+    expect(resp.headers.get("x-burstel-disposition")).toBe("ignored-no-active-shot");
+    expect(((await resp.json()) as { code: string }).code).toBe("shot_stopping");
+  });
+
+  test("a genuine downstream 503 is propagated, never converted to a discard", async () => {
+    // The recorder rejected the write (storage/lock failure): the outcome may
+    // be ambiguous, so the error must stay a retryable 503 and must not carry
+    // the pre-commit disposition marker.
+    const container = new FakeContainer({ otlpStatus: 503, otlpBody: new Uint8Array(0) });
+    const h = makeCore("shot-503", { container });
+    await h.core.create({});
+
+    const resp = await h.core.ingest("traces", otlpRequest());
+    expect(resp.status).toBe(503);
+    expect(resp.headers.get("x-burstel-disposition")).toBeNull();
+  });
+
+  test("an unavailable container stays a retryable 503", async () => {
+    const h = makeCore("shot-down");
+    await h.core.create({});
+    h.container.runningFlag = false;
+
+    await expect(h.core.ingest("traces", otlpRequest())).rejects.toMatchObject({
+      status: 503,
+      code: "unavailable",
+      retryable: true,
+      definitelyUnaccepted: false,
+    });
+  });
+
+  test("a missing or non-distinct internal token fails closed", async () => {
+    const missing = makeCore("shot-noconfig", {
+      internals: { token: undefined, ready: false, error: "missing" },
+    });
+    await expect(missing.core.create({})).rejects.toMatchObject({
+      status: 500,
+      code: "internal_token_missing",
+    });
+    expect(missing.container.started).toBe(false);
+    expect(missing.container.startEnv).toBeUndefined();
+
+    const equal = makeCore("shot-equal", {
+      internals: { token: "admin-token", ready: false, error: "not_distinct" },
+    });
+    await expect(equal.core.create({})).rejects.toMatchObject({
+      status: 500,
+      code: "internal_token_not_distinct",
+    });
+    expect(equal.container.started).toBe(false);
+  });
+
+  test("the container never receives the admin token in env or requests", async () => {
+    const h = makeCore("shot-secret", { internals: { token: "internal-only" } });
+    await h.core.create({});
+    await h.core.ingest("traces", otlpRequest());
+
+    expect(h.container.startEnv?.["BURSTEL_INTERNAL_TOKEN"]).toBe("internal-only");
+    const seen = JSON.stringify(h.container.startEnv) + JSON.stringify(h.container.requests);
+    expect(seen).not.toContain("admin-token");
+    // The recorder is called with the internal token, never the admin token.
+    const authorized = h.container.requests.filter((r) => r.headers["authorization"]);
+    expect(authorized.length).toBeGreaterThan(0);
+    for (const req of authorized) {
+      expect(req.headers["authorization"]).toBe("Bearer internal-only");
+    }
   });
 
   test("persisted lifecycle metadata survives a DO restart", async () => {

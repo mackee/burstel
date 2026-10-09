@@ -77,8 +77,12 @@ Object, which reaches the container over its private TCP port.
   `X-Burstel-Token`. OTLP exporters can set either via
   `OTEL_EXPORTER_OTLP_HEADERS`.
 * Tokens are compared in constant time, never logged, and never forwarded to
-  the container. The container separately receives `BURSTEL_INTERNAL_TOKEN`
-  (defaults to the API token) so its `/internal/*` endpoints are also gated.
+  the container. The container separately receives a **distinct**
+  `BURSTEL_INTERNAL_TOKEN` so its `/internal/*` endpoints are also gated. The
+  admin token is **never** used as the internal token: production requires a
+  distinct, non-empty `BURSTEL_INTERNAL_TOKEN` and the DO fails closed
+  (`500 internal_token_missing` / `internal_token_not_distinct`) rather than
+  booting an unguarded container.
 * Admin authentication **fails closed** when `BURSTEL_API_TOKEN` is unset. The
   only bypass is the explicit local-development flag
   `BURSTEL_DEV_INSECURE_AUTH=1` (or `true`/`yes`), which must never be set in
@@ -254,8 +258,17 @@ bun run deploy:dry-run     # bundling dry-run, skips the container image build
 ```
 
 For trusted local development only, `wrangler dev` can run without an admin
-token by exporting `BURSTEL_DEV_INSECURE_AUTH=1` before `bun run dev`. This
-bypass is disabled by default and must never be set in production.
+token by exporting `BURSTEL_DEV_INSECURE_AUTH=1` before `bun run dev`. In that
+mode the DO also passes the same explicit opt-in to the container (never the
+admin token) so the recorder's `/internal/*` routes are intentionally ungated.
+This bypass is disabled by default and must never be set in production. See
+[`docs/predeploy-auth-checklist.md`](./docs/predeploy-auth-checklist.md) for the
+production secret requirements.
+
+> **Docker/Container not verified here.** `wrangler deploy --dry-run` validates
+> the Wrangler config and bundles the Worker, but this sandbox has no Docker
+> daemon, so real Container scheduling, the injected `BURSTEL_INTERNAL_TOKEN`
+> env and `/internal/*` gating are not exercised live.
 
 ### End-to-end quickstart (OTLP exporter -> start/stop/query/compare)
 

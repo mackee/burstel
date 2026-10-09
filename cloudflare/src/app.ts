@@ -175,16 +175,33 @@ async function handleIngest(
   }
   const stub = env.SHOT_DO.getByName(shotId);
   const resp = await forwardIngest(stub, signal, request);
-  if (resp.status === 409) {
-    // The active shot is no longer recording (stop won the race, or the
-    // coordinator was stale after a restart). Reconcile and consciously
-    // discard rather than attributing the data to a different shot.
+  if (isDefinitelyUnaccepted(resp)) {
+    // The ShotDO rejected the request *before* forwarding any bytes to the
+    // recorder (stop won the race, or the shot is no longer recording). That is
+    // provably uncommitted, so acknowledge with a valid OTLP ExportResponse and
+    // consciously discard; never attribute it to a different shot. A genuine
+    // 503 (storage failure, a down container, a write timeout) carries no
+    // marker and is propagated below so the exporter retries.
+    await resp.body?.cancel().catch(() => undefined);
     await ingestJson(ingest, "/internal/detach", "POST", { shot_id: shotId, late: true }).catch(() => undefined);
     return discardResponse(request, "ignored-no-active-shot");
   }
   const out = new Response(resp.body, resp);
   out.headers.set("x-burstel-shot-id", shotId);
   return out;
+}
+
+/**
+ * True only for a definite, pre-commit rejection from the ShotDO boundary: it
+ * carries the disposition marker, or is a 409 (every 409 the boundary emits for
+ * ingest is produced before any recorder write). Genuine downstream failures —
+ * notably a 503 storage/container error — must never be mistaken for this.
+ */
+function isDefinitelyUnaccepted(resp: Response): boolean {
+  return (
+    resp.headers.get("x-burstel-disposition") === "ignored-no-active-shot" ||
+    resp.status === 409
+  );
 }
 
 /** A valid OTLP/HTTP 200 that deliberately discards data with no active shot. */

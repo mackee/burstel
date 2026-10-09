@@ -5,6 +5,7 @@ package server
 
 import (
 	"crypto/subtle"
+	"errors"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -70,17 +71,31 @@ func (s *Server) Close() error {
 	return s.analysis.Close()
 }
 
-// internal applies defense-in-depth bearer auth to internal endpoints. When
-// no token is configured the routes are open, which is only appropriate behind
-// a trusted routing boundary (e.g. a Cloudflare Worker/DO or a private net).
+// internal applies defense-in-depth bearer auth to internal endpoints.
+//
+// Production requires a non-empty BURSTEL_INTERNAL_TOKEN: when it is absent the
+// routes fail closed so an unguarded recorder can never be reached through the
+// Worker/DO routing boundary or a misconfigured deployment. The only way to run
+// the internal routes without a token is the explicit local-development opt-in
+// BURSTEL_DEV_INSECURE_AUTH (see config.DevInsecureAuth).
 func (s *Server) internal(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.InternalToken != "" {
-			got := bearerToken(r)
-			if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.InternalToken)) != 1 {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
+		if s.cfg.InternalToken == "" {
+			if !s.cfg.DevInsecureAuth {
+				writeError(
+					w,
+					http.StatusServiceUnavailable,
+					errors.New("internal API disabled: BURSTEL_INTERNAL_TOKEN is not configured"),
+				)
 				return
 			}
+			next(w, r)
+			return
+		}
+		got := bearerToken(r)
+		if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.InternalToken)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
 		}
 		next(w, r)
 	}

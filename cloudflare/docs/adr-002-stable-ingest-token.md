@@ -53,9 +53,13 @@ There is no transactional atomicity across DOs. The coordinator provides
   revoked token.
 * **Start vs. stop races.** `ingest_active` is set to `recording` on activation
   and cleared on detach. If a stop wins the race, in-flight requests already
-  admitted to the old shot are drained/frozen with it; new requests observe no
-  active shot (discard) or a `409 not_recording`, which the Worker converts to a
-  discard and detaches.
+  admitted to the old shot are drained/frozen with it. New requests observe no
+  active shot (discard), or a definite pre-commit rejection from the ShotDO
+  (`shot_stopping`, or `not_recording` when the shot already left `recording`).
+  The Worker converts *only* these pre-commit rejections into an OTLP discard
+  (`X-Burstel-Disposition: ignored-no-active-shot`) and detaches; a genuine
+  downstream `503` (storage failure, down container, write timeout) is propagated
+  so the exporter retries. See spec 008.
 * **DO restart / stale mapping.** `shot_start` reconciles a persisted active
   mapping whose shot is no longer recording (for example a crash between freeze
   and detach) by detaching it before activating the new shot. Ingest likewise

@@ -76,6 +76,8 @@ export class FakeContainer implements ContainerControl {
 
   readonly ingestBodies: Array<{ signal: string; bytes: number }> = [];
   readonly restored = new Map<string, { bytes: Uint8Array; sha: string; size: number }>();
+  /** Every proxied request, with its headers, for auth-leak assertions. */
+  readonly requests: Array<{ path: string; method: string; headers: Record<string, string> }> = [];
   artifactReads = 0;
 
   private artifactBytes: Uint8Array;
@@ -143,6 +145,12 @@ export class FakeContainer implements ContainerControl {
   }
 
   async request(path: string, init?: RequestInit): Promise<Response> {
+    const headers: Record<string, string> = {};
+    new Headers(init?.headers as Record<string, string> | undefined).forEach((value, key) => {
+      headers[key.toLowerCase()] = value;
+    });
+    this.requests.push({ path, method: init?.method ?? "GET", headers });
+
     if (path === "/readyz") return new Response("ready\n", { status: 200 });
 
     if (path === "/internal/start") {
@@ -334,6 +342,8 @@ export function makeCore(
     sql?: BunSql;
     now?: () => number;
     drainTimeoutMs?: number;
+    /** Override the resolved internal-token state (defaults to a valid one). */
+    internals?: { token?: string; ready?: boolean; error?: "missing" | "not_distinct" };
   } = {},
 ): TestHarness {
   const sql = options.sql ?? new BunSql();
@@ -341,13 +351,16 @@ export function makeCore(
   const artifacts = options.artifacts ?? new FakeArtifacts();
   let tick = 0;
   const now = options.now ?? (() => 1_700_000_000_000 + tick++);
+  const internals = options.internals;
   const deps: ShotCoreDeps = {
     shotId,
     sql,
     container,
     artifacts,
     now,
-    internalToken: "internal-secret",
+    internalToken: internals ? internals.token : "internal-secret",
+    internalTokenReady: internals?.ready ?? true,
+    internalTokenError: internals?.error,
     containerEnv: { BURSTEL_ADDR: ":8080", BURSTEL_DATA_DIR: "/data" },
     drainTimeoutMs: options.drainTimeoutMs ?? 2000,
   };

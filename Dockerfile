@@ -34,6 +34,9 @@ RUN chown burstel:burstel /data
 USER burstel
 
 EXPOSE 4318
+# BURSTEL_INTERNAL_TOKEN is injected per-instance by the Durable Object at
+# runtime; it must be distinct from the admin token. Without it the recorder's
+# /internal/* routes fail closed (503) so the image is never left unguarded.
 ENV BURSTEL_ADDR=:4318 \
     BURSTEL_DATA_DIR=/data
 

@@ -99,7 +99,11 @@ freeze 済み snapshot の解析用 (Phase 3、Worker/DO 経由のみ):
 | POST | `/internal/release` | 解析セッションを破棄 |
 
 `BURSTEL_INTERNAL_TOKEN` を設定すると `/internal/*` は
-`Authorization: Bearer <token>` を要求する(OTLP パスは対象外)。
+`Authorization: Bearer <token>` を要求する(OTLP パスは対象外)。本番では
+**必ず非空で、管理者トークンとは別の値**を設定すること。未設定の場合
+`/internal/*` は fail closed (503) となる。信頼できるローカル開発に限り
+`BURSTEL_DEV_INSECURE_AUTH=1` (または `-dev-insecure-auth`) を明示すると
+トークン無しで実行できる。既定では無効。
 
 ## クイックスタート
 
@@ -258,7 +262,8 @@ docker run --rm -p 4318:4318 -v "$PWD/data:/data" \
 | --- | --- | --- |
 | `BURSTEL_ADDR` | `-addr` | `:4318` |
 | `BURSTEL_DATA_DIR` | `-data-dir` | `./data` |
-| `BURSTEL_INTERNAL_TOKEN` | `-internal-token` | (空 = 認証なし) |
+| `BURSTEL_INTERNAL_TOKEN` | `-internal-token` | (空 = `/internal/*` は 503 で fail closed) |
+| `BURSTEL_DEV_INSECURE_AUTH` | `-dev-insecure-auth` | `false` (明示時のみトークン無しを許可) |
 | `BURSTEL_MAX_REQUEST_BYTES` | `-max-request-bytes` | `67108864` (64 MiB) |
 | `BURSTEL_MAX_INFLIGHT` | `-max-inflight` | `8` |
 | `BURSTEL_WRITE_TIMEOUT` | `-write-timeout` | `30s` |

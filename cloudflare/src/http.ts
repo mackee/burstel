@@ -16,7 +16,18 @@ export function json(status: number, body: unknown, extraHeaders?: Record<string
 /** Converts a thrown error into a JSON error response. */
 export function errorResponse(error: unknown): Response {
   if (error instanceof HttpError) {
-    return json(error.status, { error: error.message, code: error.code, retryable: error.retryable });
+    // A definite, pre-commit rejection is marked for the caller. The stable
+    // `/ingest` forwarder converts only this marker (or a 409) into a valid
+    // OTLP discard; every other error, including a genuine 503, is propagated
+    // unchanged so the exporter retries.
+    const headers = error.definitelyUnaccepted
+      ? { "x-burstel-disposition": "ignored-no-active-shot" }
+      : undefined;
+    return json(
+      error.status,
+      { error: error.message, code: error.code, retryable: error.retryable },
+      headers,
+    );
   }
   if (isCapacityError(error)) {
     return json(503, {

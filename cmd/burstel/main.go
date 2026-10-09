@@ -29,7 +29,8 @@ func main() {
 
 	flag.StringVar(&cfg.Addr, "addr", cfg.Addr, "HTTP listen address")
 	flag.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "directory for per-shot DuckDB files")
-	flag.StringVar(&cfg.InternalToken, "internal-token", cfg.InternalToken, "bearer token required on /internal/* (empty disables auth)")
+	flag.StringVar(&cfg.InternalToken, "internal-token", cfg.InternalToken, "bearer token required on /internal/* (required unless -dev-insecure-auth)")
+	flag.BoolVar(&cfg.DevInsecureAuth, "dev-insecure-auth", cfg.DevInsecureAuth, "trusted local development: allow /internal/* without a token (never in production)")
 	flag.Int64Var(&cfg.MaxRequestBytes, "max-request-bytes", cfg.MaxRequestBytes, "max decompressed OTLP request size in bytes")
 	flag.IntVar(&cfg.MaxInflight, "max-inflight", cfg.MaxInflight, "max concurrent durable writes")
 	flag.DurationVar(&cfg.WriteTimeout, "write-timeout", cfg.WriteTimeout, "timeout for a single durable write")

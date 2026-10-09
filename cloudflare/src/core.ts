@@ -16,7 +16,16 @@ import type { ArtifactSink } from "./artifacts";
 import type { ContainerControl } from "./container";
 import { emptyCounters, ShotStore, SIGNALS } from "./store";
 import type { Counters, FreezeMetadata, ShotState, Signal, StateRow, SyncSql } from "./store";
-import { conflict, errorMessage, HttpError, notFound, unavailable } from "./errors";
+import {
+  conflict,
+  errorMessage,
+  HttpError,
+  internalTokenUnconfigured,
+  notFound,
+  notRecording,
+  shotStopping,
+  unavailable,
+} from "./errors";
 import { errorResponse, json, readJson } from "./http";
 
 export const ARTIFACT_NAME = "telemetry.duckdb";
@@ -60,6 +69,14 @@ export interface ShotCoreDeps {
   now?: () => number;
   /** Bearer token for the container's `/internal/*` endpoints. */
   internalToken?: string;
+  /**
+   * Whether a usable, distinct internal token (or explicit local insecure dev)
+   * is configured. When false the core fails closed on every operation that
+   * would boot or talk to the container.
+   */
+  internalTokenReady?: boolean;
+  /** Why the internal token is unusable, for a stable failure code. */
+  internalTokenError?: "missing" | "not_distinct";
   /** Extra environment for the container process. */
   containerEnv?: Record<string, string>;
   /** R2 key prefix; defaults to `shots`. */
@@ -80,6 +97,8 @@ export class ShotCore {
   private readonly artifacts: ArtifactSink;
   private readonly now: () => number;
   private readonly internalToken?: string;
+  private readonly internalTokenReady: boolean;
+  private readonly internalTokenError: "missing" | "not_distinct";
   private readonly extraEnv: Record<string, string>;
   private readonly prefix: string;
   private readonly drainTimeoutMs: number;
@@ -103,6 +122,8 @@ export class ShotCore {
     this.artifacts = deps.artifacts;
     this.now = deps.now ?? (() => Date.now());
     this.internalToken = deps.internalToken;
+    this.internalTokenReady = deps.internalTokenReady ?? true;
+    this.internalTokenError = deps.internalTokenError ?? "missing";
     this.extraEnv = deps.containerEnv ?? {};
     this.prefix = deps.artifactPrefix ?? "shots";
     this.drainTimeoutMs = deps.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
@@ -127,6 +148,7 @@ export class ShotCore {
 
   async create(metadata: Record<string, unknown> = {}): Promise<ShotInfo> {
     await this.ensureLoaded();
+    this.requireInternalAuth();
     return this.exclusive(async () => {
       const metadataJSON = stableStringify(metadata);
       let row = this.store.get(this.shotId);
@@ -218,12 +240,19 @@ export class ShotCore {
 
   async ingest(signal: Signal, request: Request): Promise<Response> {
     await this.ensureLoaded();
-    if (this.stopRequested) throw unavailable("shot is stopping");
+    this.requireInternalAuth();
+    // Both rejections below happen before anything is forwarded to the
+    // recorder, so they are *provably* uncommitted. They carry a machine
+    // readable code and a disposition marker so the stable `/ingest` forwarder
+    // can answer with a valid OTLP ExportResponse and discard the payload.
+    if (this.stopRequested) throw shotStopping();
     const row = this.store.get(this.shotId);
     if (!row || row.state !== "recording") {
-      throw new HttpError(409, "shot is not recording", false, "not_recording");
+      throw notRecording();
     }
     if (!this.container.running) {
+      // The container may still hold in-flight/committed data or be mid-crash;
+      // the outcome is not knowable here, so this must stay a retryable 503.
       throw unavailable("container is not running");
     }
 
@@ -276,6 +305,7 @@ export class ShotCore {
   }
 
   private async doStop(): Promise<ShotResult> {
+    this.requireInternalAuth();
     const artifactKey = `${this.prefix}/${this.shotId}/${ARTIFACT_NAME}`;
     const metadataKey = `${this.prefix}/${this.shotId}/${METADATA_NAME}`;
     try {
@@ -456,6 +486,7 @@ export class ShotCore {
   }
 
   private async ensureAnalysis(selfFreeze: FreezeMetadata): Promise<void> {
+    this.requireInternalAuth();
     if (!this.container.running) {
       this.container.start(this.analysisEnvironment());
       await this.container.ensureReady();
@@ -618,6 +649,15 @@ export class ShotCore {
     next.logRecords = Number(c.log_records ?? 0);
     next.metricPoints = Number(c.metric_points ?? 0);
     this.counters = next;
+  }
+
+  /**
+   * Fails closed when the container would be reachable without a distinct
+   * internal bearer token. The admin token is never an acceptable substitute.
+   */
+  private requireInternalAuth(): void {
+    if (this.internalTokenReady) return;
+    throw internalTokenUnconfigured(this.internalTokenError);
   }
 
   private internalHeaders(extra?: Record<string, string>): Record<string, string> {

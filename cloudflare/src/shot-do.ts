@@ -9,6 +9,7 @@ import { DurableObject } from "cloudflare:workers";
 
 import { createR2Sink } from "./artifacts";
 import type { R2BucketLike } from "./artifacts";
+import { resolveInternalToken } from "./auth";
 import { createContainerControl } from "./container";
 import type { ContainerLike } from "./container";
 import { ShotCore } from "./core";
@@ -47,16 +48,29 @@ export class ShotDO extends DurableObject<Env> {
     const container = createContainerControl(requireContainer(ctx), { port });
     const artifacts = createR2Sink(env.BUCKET as unknown as R2BucketLike);
 
+    // The container's internal bearer token must be distinct from the admin
+    // token and is never derived from it. In production a missing/equal token
+    // fails closed; only the explicit local-development opt-in runs without it.
+    const internal = resolveInternalToken(env);
+    const containerEnv: Record<string, string> = {
+      BURSTEL_ADDR: `:${port}`,
+      BURSTEL_DATA_DIR: "/data",
+    };
+    if (internal.ok && internal.insecure) {
+      // Forward the explicit opt-in so the recorder's `/internal/*` routes are
+      // intentionally ungated too, without ever sending the admin token.
+      containerEnv["BURSTEL_DEV_INSECURE_AUTH"] = "1";
+    }
+
     this.core = new ShotCore({
       shotId,
       sql,
       container,
       artifacts,
-      internalToken: env.BURSTEL_INTERNAL_TOKEN ?? env.BURSTEL_API_TOKEN,
-      containerEnv: {
-        BURSTEL_ADDR: `:${port}`,
-        BURSTEL_DATA_DIR: "/data",
-      },
+      internalToken: internal.ok && internal.token.length > 0 ? internal.token : undefined,
+      internalTokenReady: internal.ok,
+      internalTokenError: internal.ok ? undefined : internal.reason,
+      containerEnv,
       artifactPrefix: env.ARTIFACT_PREFIX,
     });
 
