@@ -594,6 +594,113 @@ export class ShotCore {
     }
   }
 
+  // ------------------------------------------------------- window analysis
+
+  /**
+   * Boots (or reuses) the read-only analysis container for logical windows.
+   * Unlike {@link ensureAnalysis} there is no frozen artifact to restore: the
+   * Worker streams verified segment bytes into a window session instead.
+   */
+  private async ensureAnalysisOnly(): Promise<void> {
+    this.requireInternalAuth();
+    if (!this.container.running) {
+      this.container.start(this.analysisEnvironment());
+      await this.container.ensureReady();
+      await this.container.keepAlive(ANALYSIS_KEEPALIVE_MS).catch(() => undefined);
+      this.analysisRestored.clear();
+    }
+  }
+
+  /** Opens a logical-window session and returns the justified segment selection. */
+  async windowOpen(
+    sessionId: string,
+    window: Record<string, unknown>,
+    catalog: Array<Record<string, unknown>>,
+  ): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    await this.ensureAnalysisOnly();
+    return this.analysisJson("/internal/window/open", { session_id: sessionId, window, catalog });
+  }
+
+  /** Streams one verified segment object into a window session. */
+  async windowAddSegment(
+    sessionId: string,
+    ref: { key: string; instance: string; size: number; sha256: string },
+    body: ReadableStream<Uint8Array> | ArrayBuffer | Uint8Array,
+  ): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    await this.ensureAnalysisOnly();
+    const resp = await this.container.request("/internal/window/segment", {
+      method: "POST",
+      headers: this.internalHeaders({
+        "content-type": "application/octet-stream",
+        "x-burstel-session-id": sessionId,
+        "x-burstel-segment-key": ref.key,
+        "x-burstel-segment-instance": ref.instance,
+        "x-burstel-size": String(ref.size),
+        "x-burstel-sha256": ref.sha256,
+      }),
+      body,
+      duplex: "half",
+    } as RequestInit);
+    return this.parseAnalysisJson(resp, "/internal/window/segment");
+  }
+
+  /** Commits a window session and returns its coverage diagnostics. */
+  async windowCommit(sessionId: string): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    return this.analysisJson("/internal/window/commit", { session_id: sessionId });
+  }
+
+  /** Runs a bounded, shot-scoped query against a committed window session. */
+  async windowQuery(sessionId: string, sql: string, maxRows?: number): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    return this.analysisJson("/internal/window/query", {
+      session_id: sessionId,
+      sql,
+      max_rows: maxRows ?? this.analysisMaxRows,
+    });
+  }
+
+  /** Runs the analysis sections against a committed window session. */
+  async windowAnalyze(
+    sessionId: string,
+    shotId: string,
+    req: { sections?: string[]; topN?: number } = {},
+  ): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    return this.analysisJson("/internal/window/analyze", {
+      session_id: sessionId,
+      shot_id: shotId,
+      sections: req.sections,
+      top_n: req.topN ?? this.analysisTopN,
+    });
+  }
+
+  /** Compares two committed window sessions hosted by this container. */
+  async windowCompare(leftSessionId: string, rightSessionId: string, topN?: number): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    return this.analysisJson("/internal/window/compare", {
+      left_session_id: leftSessionId,
+      right_session_id: rightSessionId,
+      top_n: topN ?? this.analysisTopN,
+    });
+  }
+
+  /** Releases a window session. */
+  async windowRelease(sessionId: string): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    return this.analysisJson("/internal/window/release", { session_id: sessionId });
+  }
+
+  /** Returns the documented queryable schema for window analysis. */
+  async windowSchema(): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    await this.ensureAnalysisOnly();
+    const resp = await this.container.request("/internal/schema", { headers: this.internalHeaders() });
+    return this.parseAnalysisJson(resp, "/internal/schema");
+  }
+
   private requireFrozen(): FreezeMetadata {
     const row = this.store.get(this.shotId);
     if (!row) throw notFound(`unknown shot ${this.shotId}`);
@@ -735,6 +842,82 @@ export class ShotCore {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
         await this.releaseAnalysis();
         return json(200, { released: true });
+      }
+      if (path === "/internal/window/open") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{
+          session_id?: string;
+          window?: Record<string, unknown>;
+          catalog?: Array<Record<string, unknown>>;
+        }>(request);
+        if (!body.session_id || !body.window) {
+          return json(400, { error: "session_id and window are required", code: "bad_request" });
+        }
+        return json(200, await this.windowOpen(body.session_id, body.window, body.catalog ?? []));
+      }
+      if (path === "/internal/window/segment") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const sessionId = request.headers.get("x-burstel-session-id") ?? "";
+        const key = request.headers.get("x-burstel-segment-key") ?? "";
+        const instance = request.headers.get("x-burstel-segment-instance") ?? "";
+        const sha = request.headers.get("x-burstel-sha256") ?? "";
+        const sizeRaw = request.headers.get("x-burstel-size");
+        const size = sizeRaw ? Number.parseInt(sizeRaw, 10) : 0;
+        if (!sessionId || !key) {
+          return json(400, { error: "session and segment key are required", code: "bad_request" });
+        }
+        return json(
+          200,
+          await this.windowAddSegment(
+            sessionId,
+            { key, instance, size: Number.isFinite(size) ? size : 0, sha256: sha },
+            request.body ?? new Uint8Array(),
+          ),
+        );
+      }
+      if (path === "/internal/window/commit") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ session_id?: string }>(request);
+        if (!body.session_id) return json(400, { error: "session_id is required", code: "bad_request" });
+        return json(200, await this.windowCommit(body.session_id));
+      }
+      if (path === "/internal/window/query") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ session_id?: string; sql?: string; max_rows?: number }>(request);
+        if (!body.session_id || typeof body.sql !== "string" || body.sql.trim() === "") {
+          return json(400, { error: "session_id and sql are required", code: "bad_request" });
+        }
+        return json(200, await this.windowQuery(body.session_id, body.sql, body.max_rows));
+      }
+      if (path === "/internal/window/analyze") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ session_id?: string; shot_id?: string; sections?: string[]; top_n?: number }>(request);
+        if (!body.session_id) return json(400, { error: "session_id is required", code: "bad_request" });
+        return json(
+          200,
+          await this.windowAnalyze(body.session_id, body.shot_id ?? body.session_id, {
+            sections: body.sections,
+            topN: body.top_n,
+          }),
+        );
+      }
+      if (path === "/internal/window/compare") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ left_session_id?: string; right_session_id?: string; top_n?: number }>(request);
+        if (!body.left_session_id || !body.right_session_id) {
+          return json(400, { error: "left_session_id and right_session_id are required", code: "bad_request" });
+        }
+        return json(200, await this.windowCompare(body.left_session_id, body.right_session_id, body.top_n));
+      }
+      if (path === "/internal/window/release") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ session_id?: string }>(request);
+        if (!body.session_id) return json(400, { error: "session_id is required", code: "bad_request" });
+        return json(200, await this.windowRelease(body.session_id));
+      }
+      if (path === "/internal/window/schema") {
+        if (request.method !== "GET") return json(405, { error: "method not allowed" });
+        return json(200, await this.windowSchema());
       }
       const ingest = /^\/internal\/ingest\/(traces|metrics|logs)$/.exec(path);
       if (ingest) {

@@ -17,7 +17,8 @@ import (
 // maxSafeJSONInt is the largest integer an IEEE-754 double represents exactly.
 const maxSafeJSONInt = int64(1)<<53 - 1
 
-// Engine is a read-only DuckDB connection to one restored frozen shot.
+// Engine is a read-only DuckDB connection to one restored frozen shot or one
+// materialized logical window snapshot.
 type Engine struct {
 	db         *sql.DB
 	path       string
@@ -25,6 +26,18 @@ type Engine struct {
 	configNote []string
 	mu         sync.Mutex
 	closed     bool
+	// scoped marks an engine built by BuildScopedEngine for a logical window.
+	scoped        bool
+	windowStartNS int64
+	windowEndNS   int64
+}
+
+// Scoped reports whether the engine backs a logical window snapshot.
+func (e *Engine) Scoped() bool { return e.scoped }
+
+// WindowBoundsNS returns the half-open window bounds for a scoped engine.
+func (e *Engine) WindowBoundsNS() (startNS, endNS int64, ok bool) {
+	return e.windowStartNS, e.windowEndNS, e.scoped
 }
 
 // OpenOptions configures a read-only engine.

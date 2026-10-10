@@ -39,14 +39,16 @@ import type { AppEnv, DoStubLike, ShotNamespaceLike } from "./env";
 import { badRequest, forbidden, notFound, unauthorized } from "./errors";
 import { errorResponse, json, readJson } from "./http";
 import { handleInstanceIngest } from "./intake";
-import { isShotId } from "./ids";
+import { isShotId, newShotId } from "./ids";
 import { handleMcp } from "./mcp";
 import type { Signal } from "./store";
 import {
   analyzeShot,
   compareShots,
   createInstance,
-  getShot,
+  createWindowShot,
+  dispatchGet,
+  dispatchStop,
   issueInstanceToken,
   listInstanceTokens,
   listInstances,
@@ -58,7 +60,6 @@ import {
   revokeToken,
   schemaShot,
   startShot,
-  stopShot,
 } from "./tools";
 import type { ToolContext } from "./tools";
 
@@ -71,6 +72,16 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
 
     if (request.method === "GET" && path === "/healthz") {
       return json(200, { status: "ok", service: "burstel" });
+    }
+
+    // Spec 016: the per-shot ingest-token endpoint is retired with actionable
+    // migration guidance (checked before auth so the message is stable).
+    if (path === "/api/ingest-token" || /^\/api\/shots\/[^/]+\/ingest-token$/.test(path)) {
+      return json(410, {
+        error:
+          "per-shot ingest tokens were removed; configure one named instance token for POST /ingest/v1/{traces,metrics,logs} via POST /api/instances/{name}/tokens",
+        code: "gone",
+      });
     }
 
     // Stable OTLP ingest: authenticated by a push-only instance token, never by
@@ -184,11 +195,61 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
         return json(200, await listShots(ctx, { owner, limit, offset }));
       }
       if (request.method === "POST") {
-        const body = await readJson<{ metadata?: Record<string, unknown>; owner?: unknown }>(request);
+        const body = await readJson<{
+          metadata?: Record<string, unknown>;
+          owner?: unknown;
+          mode?: unknown;
+          name?: unknown;
+          instances?: unknown;
+        }>(request);
         const owner = typeof body.owner === "string" ? body.owner : undefined;
+        const mode = typeof body.mode === "string" ? body.mode : undefined;
+        if (mode === "window") {
+          return json(
+            201,
+            await startShot(ctx, body.metadata ?? {}, owner, {
+              mode,
+              name: typeof body.name === "string" ? body.name : undefined,
+              instances: Array.isArray(body.instances) ? body.instances.map(String) : undefined,
+            }),
+          );
+        }
         return json(201, await startShot(ctx, body.metadata ?? {}, owner));
       }
       throw badRequest("method not allowed");
+    }
+
+    // Spec 016: externally marked, backdated complete window.
+    if (path === "/api/shots/window") {
+      if (request.method !== "POST") throw badRequest("method not allowed");
+      const body = await readJson<{
+        name?: unknown;
+        started_at?: unknown;
+        ended_at?: unknown;
+        instances?: unknown;
+        metadata?: Record<string, unknown>;
+        owner?: unknown;
+      }>(request);
+      if (typeof body.started_at !== "string" || typeof body.ended_at !== "string") {
+        throw badRequest("started_at and ended_at are required ISO-8601 timestamps");
+      }
+      const started = Date.parse(body.started_at);
+      const ended = Date.parse(body.ended_at);
+      if (!Number.isFinite(started) || !Number.isFinite(ended)) {
+        throw badRequest("started_at and ended_at must be ISO-8601 timestamps");
+      }
+      return json(
+        201,
+        await createWindowShot(ctx, {
+          shot_id: newShotId(),
+          owner: typeof body.owner === "string" ? body.owner : undefined,
+          name: typeof body.name === "string" ? body.name : undefined,
+          started_at_ms: started,
+          ended_at_ms: ended,
+          instances: Array.isArray(body.instances) ? body.instances.map(String) : undefined,
+          metadata: body.metadata ?? {},
+        }),
+      );
     }
 
     // Superseded per-shot ingest token (spec 013) — explicit 410 Gone.
@@ -204,13 +265,18 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
     const statusMatch = /^\/api\/shots\/([^/]+)$/.exec(path);
     if (statusMatch) {
       if (request.method !== "GET") throw badRequest("method not allowed");
-      return json(200, await getShot(ctx, requireShotId(statusMatch[1]!)));
+      return json(200, await dispatchGet(ctx, requireShotId(statusMatch[1]!)));
     }
 
     const stopMatch = /^\/api\/shots\/([^/]+)\/stop$/.exec(path);
     if (stopMatch) {
       if (request.method !== "POST") throw badRequest("method not allowed");
-      return json(200, await stopShot(ctx, requireShotId(stopMatch[1]!)));
+      const body = await readJson<{ ended_at?: unknown }>(request);
+      const endedMs = typeof body.ended_at === "string" ? Date.parse(body.ended_at) : undefined;
+      if (typeof body.ended_at === "string" && !Number.isFinite(endedMs)) {
+        throw badRequest("ended_at must be an ISO-8601 timestamp");
+      }
+      return json(200, await dispatchStop(ctx, requireShotId(stopMatch[1]!), endedMs));
     }
 
     const queryMatch = /^\/api\/shots\/([^/]+)\/query$/.exec(path);
@@ -271,6 +337,7 @@ function toolContext(env: AppEnv, url: URL): ToolContext {
     auth: env.AUTH_DO,
     origin: url.origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
+    bucket: env.BUCKET,
   };
 }
 

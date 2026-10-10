@@ -23,6 +23,7 @@ type Server struct {
 	sem      chan struct{}
 	mux      *http.ServeMux
 	analysis *analysis.Store
+	window   *analysis.WindowStore
 }
 
 // New builds the router. MaxInflight bounds concurrent durable writes.
@@ -33,6 +34,7 @@ func New(cfg config.Config, rec *recorder.Recorder) *Server {
 		sem: make(chan struct{}, cfg.MaxInflight),
 	}
 	s.analysis = analysis.NewStore(filepath.Join(cfg.DataDir, "analysis"), analysis.StoreOptions{})
+	s.window = analysis.NewWindowStore(filepath.Join(cfg.DataDir, "windows"), analysis.WindowStoreOptions{})
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", s.handleHealth)
@@ -52,6 +54,17 @@ func New(cfg config.Config, rec *recorder.Recorder) *Server {
 	mux.HandleFunc("POST /internal/release", s.internal(s.handleRelease))
 	mux.HandleFunc("GET /internal/schema", s.internal(s.handleAnalysisSchema))
 
+	// Logical-window analysis (spec 016). A window session is built from
+	// verified segment bytes streamed by the Durable Object; user SQL only runs
+	// against the resulting shot-scoped snapshot.
+	mux.HandleFunc("POST /internal/window/open", s.internal(s.handleWindowOpen))
+	mux.HandleFunc("POST /internal/window/segment", s.internal(s.handleWindowSegment))
+	mux.HandleFunc("POST /internal/window/commit", s.internal(s.handleWindowCommit))
+	mux.HandleFunc("POST /internal/window/query", s.internal(s.handleWindowQuery))
+	mux.HandleFunc("POST /internal/window/analyze", s.internal(s.handleWindowAnalyze))
+	mux.HandleFunc("POST /internal/window/compare", s.internal(s.handleWindowCompare))
+	mux.HandleFunc("POST /internal/window/release", s.internal(s.handleWindowRelease))
+
 	mux.HandleFunc("POST /v1/traces", s.otlpHandler(otlp.Traces))
 	mux.HandleFunc("POST /v1/metrics", s.otlpHandler(otlp.Metrics))
 	mux.HandleFunc("POST /v1/logs", s.otlpHandler(otlp.Logs))
@@ -65,10 +78,13 @@ func (s *Server) Handler() http.Handler { return s.mux }
 
 // Close releases the analysis restore store.
 func (s *Server) Close() error {
-	if s.analysis == nil {
-		return nil
+	if s.analysis != nil {
+		_ = s.analysis.Close()
 	}
-	return s.analysis.Close()
+	if s.window != nil {
+		_ = s.window.Close()
+	}
+	return nil
 }
 
 // internal applies defense-in-depth bearer auth to internal endpoints.

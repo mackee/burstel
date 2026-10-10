@@ -137,11 +137,16 @@ func (s *Server) handleAnalysisSchema(w http.ResponseWriter, _ *http.Request) {
 
 func writeAnalysisError(w http.ResponseWriter, err error) {
 	var policyErr *analysis.PolicyError
+	var windowErr *analysis.WindowValidationError
 	switch {
 	case errors.As(err, &policyErr):
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": policyErr.Message, "code": policyErr.Code})
+	case errors.As(err, &windowErr):
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": windowErr.Message, "code": windowErr.Code})
 	case errors.Is(err, analysis.ErrRestoreNotFound):
 		writeError(w, http.StatusNotFound, errors.New("frozen shot has not been restored"))
 	case errors.Is(err, context.DeadlineExceeded):

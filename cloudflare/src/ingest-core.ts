@@ -24,6 +24,17 @@ import { badRequest } from "./errors";
 import { errorResponse, json, readJson } from "./http";
 import { InstanceCore, newInstanceToken } from "./instance-core";
 import type { InstanceCoreDeps } from "./instance-core";
+import {
+  DEFAULT_WINDOW_BOUNDS,
+  externalWindow,
+  normalizeInstances,
+  serverWindow,
+  validateWindow,
+  windowFromJSON,
+  windowToJSON,
+} from "./shot-window";
+import type { ShotWindow, WindowBounds, WindowSegmentMeta, SegmentSelection } from "./shot-window";
+import { selectSegments } from "./shot-window";
 import { SIGNALS } from "./store";
 import type { Signal, SqlRow, SqlValue, SyncSql } from "./store";
 
@@ -41,6 +52,47 @@ export interface RegisteredShot {
   stopped_at: number | null;
   size_bytes: number | null;
   sha256: string | null;
+}
+
+/** One registered logical-window shot (spec 016). */
+export interface WindowShotRecord extends RegisteredShot {
+  kind: "window" | "recording";
+  name: string | null;
+  window: ShotWindow | null;
+  query_watermark_ms: number | null;
+  coverage: WindowCoverage | null;
+}
+
+/** Completeness of a window shot. Missing data is always disclosed. */
+export interface WindowCoverage {
+  expected_segments: number;
+  available_segments: number;
+  missing_segments: string[];
+  instances: string[];
+  late_arrivals?: number;
+  log_observed_fallbacks?: number;
+  complete: boolean;
+}
+
+/** Input for an externally supplied, backdated complete window. */
+export interface CreateWindowShotInput {
+  shot_id: string;
+  owner?: string;
+  name?: string;
+  started_at_ms: number;
+  ended_at_ms: number;
+  instances?: unknown;
+  metadata?: Record<string, unknown>;
+  coverage?: WindowCoverage;
+}
+
+/** Input for a server-clock window marker. */
+export interface StartWindowShotInput {
+  shot_id: string;
+  owner?: string;
+  name?: string;
+  metadata?: Record<string, unknown>;
+  instances?: unknown;
 }
 
 /** One acknowledged OTLP export in the durable raw-journal ledger. */
@@ -143,7 +195,12 @@ const SCHEMA_STATEMENTS: string[] = [
      state      TEXT NOT NULL DEFAULT 'recording',
      stopped_at INTEGER,
      size_bytes INTEGER,
-     sha256     TEXT
+     sha256     TEXT,
+     kind             TEXT NOT NULL DEFAULT 'recording',
+     name             TEXT,
+     window_json      TEXT,
+     query_watermark_ms INTEGER,
+     coverage_json    TEXT
    )`,
   `CREATE INDEX IF NOT EXISTS shot_registry_created ON shot_registry (created_at)`,
   // Durable raw-journal index: one row per acknowledged OTLP export. The raw
@@ -222,6 +279,20 @@ export class IngestCore {
 
   async load(): Promise<void> {
     for (const stmt of SCHEMA_STATEMENTS) this.sql.exec(stmt);
+    // Additive migrations for pre-existing shot_registry tables (spec 016).
+    for (const stmt of [
+      `ALTER TABLE shot_registry ADD COLUMN kind TEXT NOT NULL DEFAULT 'recording'`,
+      `ALTER TABLE shot_registry ADD COLUMN name TEXT`,
+      `ALTER TABLE shot_registry ADD COLUMN window_json TEXT`,
+      `ALTER TABLE shot_registry ADD COLUMN query_watermark_ms INTEGER`,
+      `ALTER TABLE shot_registry ADD COLUMN coverage_json TEXT`,
+    ]) {
+      try {
+        this.sql.exec(stmt);
+      } catch {
+        // Column already exists.
+      }
+    }
     await this.instances.load();
     this.loaded = true;
   }
@@ -308,7 +379,7 @@ export class IngestCore {
 
   /** Registered shots, newest first, optionally filtered by owner. */
   async listShots(opts: { owner?: string; limit: number; offset: number }): Promise<{
-    shots: RegisteredShot[];
+    shots: WindowShotRecord[];
     total: number;
   }> {
     await this.ensureLoaded();
@@ -318,7 +389,8 @@ export class IngestCore {
     const total = Number(totalRows[0]?.n ?? 0);
     const rows = this.sql
       .exec(
-        `SELECT shot_id, owner, created_at, state, stopped_at, size_bytes, sha256
+        `SELECT shot_id, owner, created_at, state, stopped_at, size_bytes, sha256,
+                kind, name, window_json, query_watermark_ms, coverage_json
            FROM shot_registry ${where}
           ORDER BY created_at DESC, shot_id DESC
           LIMIT ? OFFSET ?`,
@@ -328,6 +400,154 @@ export class IngestCore {
       )
       .toArray();
     return { shots: rows.map(registeredRow), total };
+  }
+
+  // -------------------------------------------------------- window shots
+
+  /**
+   * Creates an externally supplied, backdated complete window. The timestamps
+   * are validated (ordered, bounded, retained) and retained as untrusted
+   * client-clock values.
+   */
+  async createWindowShot(input: CreateWindowShotInput, bounds: WindowBounds = DEFAULT_WINDOW_BOUNDS): Promise<WindowShotRecord> {
+    await this.ensureLoaded();
+    const window = externalWindow(input.started_at_ms, input.ended_at_ms, input.instances, input.name);
+    const valid = validateWindow(window, this.now(), bounds);
+    if (!valid.ok) throw badRequest(`${valid.code}: ${valid.error}`);
+    const coverage = normalizeCoverage(input.coverage, window.instances);
+    const state = coverage.complete ? "ready" : "incomplete";
+    this.upsertWindowRow(input.shot_id, input.owner, window, state, coverage, input.metadata);
+    const row = this.getShotRecord(input.shot_id);
+    if (!row) throw new Error("failed to persist window shot");
+    return row;
+  }
+
+  /** Opens a server-clock window marker. */
+  async startWindowShot(input: StartWindowShotInput, nowMs?: number): Promise<WindowShotRecord> {
+    await this.ensureLoaded();
+    const start = nowMs ?? this.now();
+    // The end is provisional until stop; keep a 1ms placeholder so the stored
+    // window is always ordered. It is replaced on stop.
+    const window = serverWindow(start, start + 1, input.instances, input.name);
+    const coverage: WindowCoverage = {
+      expected_segments: 0,
+      available_segments: 0,
+      missing_segments: [],
+      instances: window.instances,
+      complete: false,
+    };
+    this.upsertWindowRow(input.shot_id, input.owner, window, "open", coverage, input.metadata);
+    const row = this.getShotRecord(input.shot_id);
+    if (!row) throw new Error("failed to persist window shot");
+    return row;
+  }
+
+  /**
+   * Stops and finalizes a server-clock window. `ended_at_ms` may be supplied to
+   * backdate the end (still validated as an ordered, bounded instant). The stop
+   * is idempotent. Coverage defaults to complete for a server window unless a
+   * later analysis marks it incomplete.
+   */
+  async stopWindowShot(
+    shotId: string,
+    endedAtMs?: number,
+    bounds: WindowBounds = DEFAULT_WINDOW_BOUNDS,
+  ): Promise<WindowShotRecord> {
+    await this.ensureLoaded();
+    const row = this.getShotRecord(shotId);
+    if (!row) throw badRequest("unknown window shot");
+    if (!row.window) throw badRequest("shot is not a window shot");
+    if (row.state === "ready" || row.state === "incomplete") return row;
+    const now = this.now();
+    const candidate = typeof endedAtMs === "number" && Number.isFinite(endedAtMs) ? Math.floor(endedAtMs) : now;
+    // A window is always half-open and ordered; a stop in the same millisecond
+    // as the start still produces a valid, non-empty interval.
+    const end = Math.max(candidate, row.window.start_ms + 1);
+    const window: ShotWindow = { ...row.window, end_ms: end };
+    const valid = validateWindow(window, now, bounds);
+    if (!valid.ok) throw badRequest(`${valid.code}: ${valid.error}`);
+    const prior = row.coverage;
+    const coverage: WindowCoverage =
+      prior && prior.missing_segments.length > 0
+        ? prior
+        : {
+            expected_segments: prior?.expected_segments ?? 0,
+            available_segments: prior?.available_segments ?? 0,
+            missing_segments: [],
+            instances: window.instances,
+            complete: true,
+          };
+    const state = coverage.complete ? "ready" : "incomplete";
+    this.sql.exec(
+      `UPDATE shot_registry SET state = ?, stopped_at = ?, window_json = ?, query_watermark_ms = ?, coverage_json = ?
+        WHERE shot_id = ?`,
+      state,
+      end,
+      windowToJSON(window),
+      now,
+      JSON.stringify(coverage),
+      shotId,
+    );
+    const updated = this.getShotRecord(shotId);
+    if (!updated) throw new Error("failed to persist stopped window shot");
+    return updated;
+  }
+
+  /** Records the coverage/completeness computed by an analysis pass. */
+  async setWindowCoverage(shotId: string, coverage: WindowCoverage): Promise<WindowShotRecord> {
+    await this.ensureLoaded();
+    const row = this.getShotRecord(shotId);
+    if (!row) throw badRequest("unknown window shot");
+    const normalized = normalizeCoverage(coverage, row.window?.instances ?? []);
+    const state = normalized.complete ? "ready" : "incomplete";
+    this.sql.exec(
+      `UPDATE shot_registry SET coverage_json = ?, state = ? WHERE shot_id = ?`,
+      JSON.stringify(normalized),
+      state,
+      shotId,
+    );
+    const updated = this.getShotRecord(shotId);
+    if (!updated) throw new Error("failed to persist coverage");
+    return updated;
+  }
+
+  /** One registry row (window or legacy), or null. */
+  getShotRecord(shotId: string): WindowShotRecord | null {
+    const rows = this.sql
+      .exec(
+        `SELECT shot_id, owner, created_at, state, stopped_at, size_bytes, sha256,
+                kind, name, window_json, query_watermark_ms, coverage_json
+           FROM shot_registry WHERE shot_id = ?`,
+        shotId,
+      )
+      .toArray();
+    return rows.length === 0 ? null : registeredRow(rows[0]!);
+  }
+
+  private upsertWindowRow(
+    shotId: string,
+    owner: string | undefined,
+    window: ShotWindow,
+    state: string,
+    coverage: WindowCoverage,
+    metadata: Record<string, unknown> | undefined,
+  ): void {
+    this.sql.exec(
+      `INSERT INTO shot_registry
+         (shot_id, owner, created_at, state, kind, name, window_json, coverage_json)
+       VALUES (?, ?, ?, ?, 'window', ?, ?, ?)
+       ON CONFLICT (shot_id) DO UPDATE SET
+         owner = excluded.owner, state = excluded.state, kind = 'window',
+         name = excluded.name, window_json = excluded.window_json, coverage_json = excluded.coverage_json`,
+      shotId,
+      owner && owner.trim() !== "" ? owner.trim() : "legacy",
+      this.now(),
+      state,
+      window.name ?? null,
+      windowToJSON(window),
+      JSON.stringify(coverage),
+    );
+    void metadata;
   }
 
   // ------------------------------------------------------------- journal
@@ -629,6 +849,60 @@ export class IngestCore {
           }),
         );
       }
+      if (path === "/internal/shot/window/create") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<CreateWindowShotInput>(request);
+        return json(201, await this.createWindowShot(body));
+      }
+      if (path === "/internal/shot/window/start") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<StartWindowShotInput>(request);
+        return json(201, await this.startWindowShot(body));
+      }
+      if (path === "/internal/shot/window/stop") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ shot_id?: string; ended_at_ms?: number }>(request);
+        if (typeof body.shot_id !== "string" || body.shot_id === "") {
+          return json(400, { error: "shot_id is required", code: "bad_request" });
+        }
+        return json(200, await this.stopWindowShot(body.shot_id, body.ended_at_ms));
+      }
+      if (path === "/internal/shot/window/coverage") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ shot_id?: string; coverage?: WindowCoverage }>(request);
+        if (typeof body.shot_id !== "string" || body.shot_id === "") {
+          return json(400, { error: "shot_id is required", code: "bad_request" });
+        }
+        return json(200, await this.setWindowCoverage(body.shot_id, body.coverage ?? ({} as WindowCoverage)));
+      }
+      if (path === "/internal/shot/get") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ shot_id?: string }>(request);
+        if (typeof body.shot_id !== "string" || body.shot_id === "") {
+          return json(400, { error: "shot_id is required", code: "bad_request" });
+        }
+        const row = this.getShotRecord(body.shot_id);
+        if (!row) return json(404, { error: "unknown shot", code: "not_found" });
+        return json(200, row);
+      }
+      if (path === "/internal/shot/select-segments") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ window?: ShotWindow; instance_id?: string; limit?: number }>(request);
+        if (!body.window) return json(400, { error: "window is required", code: "bad_request" });
+        const catalog = await this.listSegments({ instance_id: body.instance_id, limit: 1000, offset: 0 });
+        const metas: WindowSegmentMeta[] = catalog.segments.map((s) => ({
+          segment_key: s.segment_key,
+          instance_id: s.instance_id,
+          instance: "",
+          first_received_at: s.first_received_at,
+          last_received_at: s.last_received_at,
+          event_min_ns: s.event_min_ns,
+          event_max_ns: s.event_max_ns,
+          status: s.status,
+        }));
+        const selection: SegmentSelection = selectSegments(body.window, metas);
+        return json(200, selection);
+      }
       if (path === "/internal/shots/recording") {
         if (request.method !== "GET") return json(405, { error: "method not allowed" });
         return json(200, await this.listRecording());
@@ -695,7 +969,16 @@ export class IngestCore {
   }
 }
 
-function registeredRow(row: SqlRow): RegisteredShot {
+function registeredRow(row: SqlRow): WindowShotRecord {
+  const window = windowFromJSON(row.window_json == null ? null : String(row.window_json));
+  let coverage: WindowCoverage | null = null;
+  if (row.coverage_json != null && String(row.coverage_json) !== "") {
+    try {
+      coverage = JSON.parse(String(row.coverage_json)) as WindowCoverage;
+    } catch {
+      coverage = null;
+    }
+  }
   return {
     shot_id: String(row.shot_id),
     owner: row.owner == null ? "legacy" : String(row.owner),
@@ -704,7 +987,31 @@ function registeredRow(row: SqlRow): RegisteredShot {
     stopped_at: row.stopped_at == null ? null : Number(row.stopped_at),
     size_bytes: row.size_bytes == null ? null : Number(row.size_bytes),
     sha256: row.sha256 == null ? null : String(row.sha256),
+    kind: row.kind === "window" || window !== null ? "window" : "recording",
+    name: row.name == null ? null : String(row.name),
+    window,
+    query_watermark_ms: row.query_watermark_ms == null ? null : Number(row.query_watermark_ms),
+    coverage,
   };
+}
+
+/** Normalizes a coverage summary; a missing list is never silently complete. */
+export function normalizeCoverage(input: WindowCoverage | undefined, instances: string[]): WindowCoverage {
+  const missing = Array.isArray(input?.missing_segments) ? input!.missing_segments.map(String) : [];
+  const coverage: WindowCoverage = {
+    expected_segments: numOr(input?.expected_segments, 0),
+    available_segments: numOr(input?.available_segments, 0),
+    missing_segments: missing,
+    instances: normalizeInstances(instances.length > 0 ? instances : input?.instances),
+    late_arrivals: numOr(input?.late_arrivals, 0),
+    log_observed_fallbacks: numOr(input?.log_observed_fallbacks, 0),
+    complete: input?.complete === true && missing.length === 0,
+  };
+  return coverage;
+}
+
+function numOr(v: unknown, fallback: number): number {
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : fallback;
 }
 
 function journalRow(row: SqlRow): JournalEntry {

@@ -286,6 +286,25 @@ analysis layer (where DuckDB actually runs) before execution:
 See [`docs/adr-001-analysis-query-safety.md`](./docs/adr-001-analysis-query-safety.md)
 for the full decision record.
 
+## Logical window shots (spec 016)
+
+Since spec 016 a *shot* is an immutable, half-open `[start,end)` logical time
+window over the continuous instance streams — not an ingest target. Window
+shots carry no per-shot ingest token and no recording container; `shot_start`
+opens a server-clock marker, `shot_stop` finalizes it, and `shot_create` records
+an externally supplied (untrusted client-clock) window. `stop` is idempotent.
+
+Analysis is segment-backed and read-only: candidate segments are selected from
+the durable manifest by receive-time overlap (widened by the ingest lag) or by
+event-time overlap, streamed from R2 into a throwaway analysis container, then
+materialized into a shot-scoped read-only DuckDB snapshot. User SQL runs only
+against the shot-scoped logical tables under the same read-only policy as
+frozen-shot analysis; a private pre-window baseline supports cumulative-counter
+deltas without ever exposing pre-window rows. Coverage, late arrivals and
+crossing spans are always disclosed. Legacy frozen shots remain readable.
+
+See [`docs/adr-005-logical-window-shots.md`](./docs/adr-005-logical-window-shots.md).
+
 ## Lifecycle
 
 ```

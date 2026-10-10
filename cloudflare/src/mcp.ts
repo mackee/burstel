@@ -19,9 +19,10 @@ import { z } from "zod";
 import type { AuthPrincipal } from "./auth-core";
 import { resolvePrincipal, isRegistryAdmin } from "./authz";
 import type { AppEnv } from "./env";
-import { forbidden, unauthorized } from "./errors";
+import { forbidden, badRequest, unauthorized } from "./errors";
 import { errorMessage } from "./errors";
 import { errorResponse } from "./http";
+import { newShotId } from "./ids";
 import { createTools } from "./tools";
 
 export const MCP_SERVER_NAME = "burstel";
@@ -61,6 +62,7 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
     auth: env.AUTH_DO,
     origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
+    bucket: env.BUCKET,
   });
   const isAdmin = isRegistryAdmin(principal);
 
@@ -90,15 +92,57 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
     {
       title: "Start a shot",
       description:
-        "Create a new recording shot and return its id plus the stable OTLP/HTTP ingest URL. Configure one named instance token for /ingest; ingestion is continuous and independent of shots. metadata may carry the commit SHA, benchmark/scenario and a note; owner is an optional attribution label.",
+        "Create a new recording shot and return its id plus the stable OTLP/HTTP ingest URL (legacy mode). With mode=window, open a server-clock logical time window [start,end) marker instead; ingestion stays continuous and no per-shot token is issued. metadata may carry the commit SHA, benchmark/scenario and a note; owner is an optional attribution label.",
       inputSchema: {
         metadata: z.record(z.string(), z.any()).optional(),
         owner: z.string().optional().describe("Attribution-only owner label; never an authorization boundary"),
+        mode: z.enum(["recording", "window"]).optional().describe("recording (default) or window"),
+        name: z.string().optional().describe("Window marker label (mode=window)"),
+        instances: z.array(z.string()).optional().describe("Instance subset (mode=window); default all"),
       },
     },
-    async ({ metadata, owner }) => {
+    async ({ metadata, owner, mode, name, instances }) => {
       try {
-        return ok(await tools.start((metadata ?? {}) as Record<string, unknown>, owner));
+        return ok(await tools.start((metadata ?? {}) as Record<string, unknown>, owner, { mode, name, instances }));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "shot_create",
+    {
+      title: "Create an externally marked window",
+      description:
+        "Create a backdated, externally supplied complete window shot with half-open [started_at, ended_at) UTC instants. Timestamps are validated (ordered, bounded, retained) and retained as untrusted client-clock values. Returns duration and coverage.",
+      inputSchema: {
+        name: z.string().optional(),
+        started_at: z.string().describe("ISO-8601 inclusive start (UTC)"),
+        ended_at: z.string().describe("ISO-8601 exclusive end (UTC)"),
+        instances: z.array(z.string()).optional(),
+        metadata: z.record(z.string(), z.any()).optional(),
+      },
+    },
+    async ({ name, started_at, ended_at, instances, metadata }) => {
+      try {
+        const started = Date.parse(started_at);
+        const ended = Date.parse(ended_at);
+        if (!Number.isFinite(started) || !Number.isFinite(ended)) {
+          throw badRequest("started_at and ended_at must be ISO-8601 timestamps");
+        }
+        const owner = undefined;
+        const shotId = newShotId();
+        const record = await tools.createWindow({
+          shot_id: shotId,
+          owner,
+          name,
+          started_at_ms: started,
+          ended_at_ms: ended,
+          instances,
+          metadata: (metadata ?? {}) as Record<string, unknown>,
+        });
+        return ok(record);
       } catch (error) {
         return fail(error);
       }
@@ -132,6 +176,43 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
     async () => {
       try {
         return ok(await tools.listInstances());
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "instances_list",
+    {
+      title: "List instances (spec 016 alias)",
+      description: "List named instances with metadata and token counts (never secrets). admin|member.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        return ok(await tools.listInstances());
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "instance_token_mint",
+    {
+      title: "Issue or rotate an instance token",
+      description:
+        "Issue a 256-bit push-only OTLP instance token valid for exactly 24h (disclosed once). With rotate, the previous token for this instance is revoked after a bounded overlap; other instances are untouched. admin|member.",
+      inputSchema: {
+        name: z.string().describe("Instance name"),
+        rotate: z.boolean().optional().describe("Revoke the previous active token(s) with a bounded overlap"),
+        overlap_seconds: z.number().int().positive().optional().describe("Rotation overlap seconds (bounded)"),
+      },
+    },
+    async ({ name, rotate, overlap_seconds }) => {
+      try {
+        return ok(await tools.issueInstanceToken(name, { rotate, overlap_seconds }));
       } catch (error) {
         return fail(error);
       }
@@ -194,14 +275,19 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
   server.registerTool(
     "shot_stop",
     {
-      title: "Stop and freeze a shot",
+      title: "Stop and finalize a shot",
       description:
-        "Stop a recording shot, freeze its DuckDB artifact to R2 and return the state, size and SHA-256.",
-      inputSchema: { shot_id: z.string().describe("Shot id returned by shot_start") },
+        "Stop a shot. A recording shot is frozen to R2 (state, size, SHA-256). A logical window marker is finalized with half-open [start,end) semantics; ended_at may backdate the end.",
+      inputSchema: {
+        shot_id: z.string().describe("Shot id returned by shot_start or shot_create"),
+        ended_at: z.string().optional().describe("ISO-8601 exclusive end for a window marker"),
+      },
     },
-    async ({ shot_id }) => {
+    async ({ shot_id, ended_at }) => {
       try {
-        return ok(await tools.stop(shot_id));
+        const endedMs = ended_at ? Date.parse(ended_at) : undefined;
+        if (ended_at && !Number.isFinite(endedMs)) throw badRequest("ended_at must be an ISO-8601 timestamp");
+        return ok(await tools.stop(shot_id, endedMs));
       } catch (error) {
         return fail(error);
       }
@@ -212,7 +298,8 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
     "shot_get",
     {
       title: "Get shot status",
-      description: "Return lifecycle state, metadata, counters and freeze/artifact info for one shot.",
+      description:
+        "Return one shot. A recording shot returns lifecycle state, metadata, counters and freeze info; a logical window shot returns its half-open window, provenance, coverage and query watermark.",
       inputSchema: { shot_id: z.string() },
     },
     async ({ shot_id }) => {

@@ -23,10 +23,12 @@
 //	token mint --scope admin|member [--owner NAME] [--ttl-seconds N] [--out FILE]
 //	token list [--out FILE]             list per-person tokens (metadata only)
 //	token revoke <token-id>             revoke a per-person token immediately
-//	shot start [--owner NAME] [--metadata k=v ...]
+//	shot start [--owner NAME] [--metadata k=v ...] [--window] [--name N] [--instances a,b]
+//	shot window [--name N] [--instances a,b] [--owner NAME] [--metadata k=v ...]
+//	shot create --started-at ISO --ended-at ISO [--name N] [--instances a,b]
 //	shot list [--owner NAME] [--limit N] [--offset N]
 //	shot get <shot-id>
-//	shot stop <shot-id>
+//	shot stop <shot-id> [--ended-at ISO]
 //	shot query <shot-id> --sql "SELECT ..." [--max-rows N]
 //	shot analyze <shot-id> [--sections a,b] [--top-n N]
 //	shot schema <shot-id>
@@ -483,7 +485,7 @@ func (c *client) shotCommand(args []string) error {
 	action, rest := args[0], args[1:]
 	switch action {
 	case "start":
-		pos, opts, err := parseOpts(rest, map[string]bool{"metadata": true, "owner": true})
+		pos, opts, err := parseOpts(rest, map[string]bool{"metadata": true, "owner": true, "name": true, "instances": true})
 		if err != nil {
 			return err
 		}
@@ -502,7 +504,76 @@ func (c *client) shotCommand(args []string) error {
 		if owner := last(opts, "owner"); owner != "" {
 			body["owner"] = owner
 		}
+		if _, ok := opts["window"]; ok {
+			body["mode"] = "window"
+		}
+		if name := last(opts, "name"); name != "" {
+			body["name"] = name
+		}
+		if inst := last(opts, "instances"); inst != "" {
+			body["instances"] = splitList(inst)
+		}
 		return c.postJSON(http.MethodPost, "/api/shots", body)
+	case "window":
+		// A server-clock logical window marker (open now; stop later).
+		pos, opts, err := parseOpts(rest, map[string]bool{"metadata": true, "owner": true, "name": true, "instances": true})
+		if err != nil {
+			return err
+		}
+		if len(pos) != 0 {
+			return fmt.Errorf("shot window: unexpected argument %q", pos[0])
+		}
+		meta := map[string]string{}
+		for _, kv := range opts["metadata"] {
+			key, val, ok := strings.Cut(kv, "=")
+			if !ok || key == "" {
+				return fmt.Errorf("--metadata must be key=value, got %q", kv)
+			}
+			meta[key] = val
+		}
+		body := map[string]any{"mode": "window", "metadata": meta}
+		if owner := last(opts, "owner"); owner != "" {
+			body["owner"] = owner
+		}
+		if name := last(opts, "name"); name != "" {
+			body["name"] = name
+		}
+		if inst := last(opts, "instances"); inst != "" {
+			body["instances"] = splitList(inst)
+		}
+		return c.postJSON(http.MethodPost, "/api/shots", body)
+	case "create":
+		// An externally supplied, backdated complete window.
+		pos, opts, err := parseOpts(rest, map[string]bool{"started-at": true, "ended-at": true, "name": true, "instances": true, "metadata": true})
+		if err != nil {
+			return err
+		}
+		if len(pos) != 0 {
+			return fmt.Errorf("shot create: unexpected argument %q", pos[0])
+		}
+		started, ended := last(opts, "started-at"), last(opts, "ended-at")
+		if started == "" || ended == "" {
+			return errors.New("shot create: --started-at and --ended-at ISO-8601 timestamps are required")
+		}
+		body := map[string]any{"started_at": started, "ended_at": ended}
+		if name := last(opts, "name"); name != "" {
+			body["name"] = name
+		}
+		if inst := last(opts, "instances"); inst != "" {
+			body["instances"] = splitList(inst)
+		}
+		meta := map[string]string{}
+		for _, kv := range opts["metadata"] {
+			key, val, ok := strings.Cut(kv, "=")
+			if !ok || key == "" {
+				return fmt.Errorf("--metadata must be key=value, got %q", kv)
+			}
+			meta[key] = val
+		}
+		if len(meta) > 0 {
+			body["metadata"] = meta
+		}
+		return c.postJSON(http.MethodPost, "/api/shots/window", body)
 	case "list":
 		pos, opts, err := parseOpts(rest, map[string]bool{"owner": true, "limit": true, "offset": true})
 		if err != nil {
@@ -530,7 +601,7 @@ func (c *client) shotCommand(args []string) error {
 			path += "?" + enc
 		}
 		return c.getJSON(path)
-	case "get", "stop", "schema":
+	case "get", "schema":
 		pos, _, err := parseOpts(rest, nil)
 		if err != nil {
 			return err
@@ -539,14 +610,24 @@ func (c *client) shotCommand(args []string) error {
 		if err != nil {
 			return err
 		}
-		switch action {
-		case "stop":
-			return c.postJSON(http.MethodPost, "/api/shots/"+id+"/stop", nil)
-		case "schema":
+		if action == "schema" {
 			return c.getJSON("/api/shots/" + id + "/schema")
-		default: // get
-			return c.getJSON("/api/shots/" + id)
 		}
+		return c.getJSON("/api/shots/" + id)
+	case "stop":
+		pos, opts, err := parseOpts(rest, map[string]bool{"ended-at": true})
+		if err != nil {
+			return err
+		}
+		id, err := oneShotID(pos)
+		if err != nil {
+			return err
+		}
+		body := map[string]any{}
+		if ended := last(opts, "ended-at"); ended != "" {
+			body["ended_at"] = ended
+		}
+		return c.postJSON(http.MethodPost, "/api/shots/"+id+"/stop", body)
 	case "query":
 		pos, opts, err := parseOpts(rest, map[string]bool{"sql": true, "max-rows": true})
 		if err != nil {
@@ -618,6 +699,18 @@ func oneShotID(pos []string) (string, error) {
 	return pos[0], nil
 }
 
+// splitList splits a comma-separated flag value into trimmed non-empty items.
+func splitList(v string) []string {
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
 func writeSecretFile(path, value string) error {
 	if err := os.WriteFile(path, []byte(value+"\n"), 0o600); err != nil {
 		return err
@@ -649,10 +742,12 @@ Commands:
                                       mint a per-person token (prints the token once)
   token list                          list per-person token metadata (never values)
   token revoke <token-id>             revoke a per-person token immediately
-  shot start [--owner NAME] [--metadata k=v ...]
+  shot start [--owner NAME] [--metadata k=v ...] [--window] [--name N] [--instances a,b]
+  shot window [--name N] [--instances a,b] [--owner NAME] [--metadata k=v ...]
+  shot create --started-at ISO --ended-at ISO [--name N] [--instances a,b] [--metadata k=v ...]
   shot list [--owner NAME] [--limit N] [--offset N]
   shot get <shot-id>
-  shot stop <shot-id>
+  shot stop <shot-id> [--ended-at ISO]
   shot query <shot-id> --sql "SELECT ..." [--max-rows N]
   shot analyze <shot-id> [--sections a,b] [--top-n N]
   shot schema <shot-id>
@@ -661,13 +756,17 @@ Commands:
 Examples:
   export BURSTEL_BASE_URL=https://burstel.example.workers.dev
   burstel-cli instance create web-1
-  PUSH=$(burstel-cli instance token issue web-1)
-  burstel-cli shot start --owner alice --metadata source=isucon
-  burstel-cli shot list --owner alice
-  burstel-cli token mint --scope member --owner alice --out .secrets/member-alice
-  burstel-cli token list
-  burstel-cli token revoke <token-id>
+  burstel-cli instance create db-1
+  PUSH_WEB=$(burstel-cli instance token issue web-1 --out .secrets/web-1)
+  PUSH_DB=$(burstel-cli instance token issue db-1 --out .secrets/db-1)
+  # exporters send continuously; no exporter change between shots
+  burstel-cli shot window --name before --instances web-1,db-1   # server-clock marker
   burstel-cli shot stop <shot-id>
-  burstel-cli shot query <shot-id> --sql "SELECT span_name, count(*) c FROM spans GROUP BY 1 ORDER BY c DESC" --max-rows 10
+  burstel-cli shot create --name load --instances web-1,db-1 \
+    --started-at 2026-01-01T12:00:00Z --ended-at 2026-01-01T12:03:00Z
+  burstel-cli shot analyze <shot-id> --sections latency,metric_cumulative_delta
+  burstel-cli shot compare <shot-id> --other <other-shot-id>
+  burstel-cli token mint --scope member --owner alice --out .secrets/member-alice
+  burstel-cli shot query <shot-id> --sql "SELECT service_name, count(*) c FROM spans GROUP BY 1 ORDER BY c DESC" --max-rows 10
 `)
 }

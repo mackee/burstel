@@ -222,6 +222,17 @@ func (e *Engine) Analyze(ctx context.Context, policy Policy, shotID string, req 
 		if !ok {
 			return nil, policyErr("unknown_section", "unknown analysis section "+name)
 		}
+		if def.name == "metric_cumulative_delta" {
+			sec, err := e.cumulativeSection(ctx, topN, policy)
+			if err != nil {
+				return nil, err
+			}
+			if sec.Observed {
+				result.Observed = append(result.Observed, name)
+			}
+			result.Sections = append(result.Sections, sec)
+			continue
+		}
 		section := Section{
 			Name:        def.name,
 			Description: def.description,

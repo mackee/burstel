@@ -95,6 +95,9 @@ export class FakeContainer implements ContainerControl {
 
   readonly ingestBodies: Array<{ signal: string; bytes: number }> = [];
   readonly restored = new Map<string, { bytes: Uint8Array; sha: string; size: number }>();
+  /** Window analysis sessions and the segment bytes streamed into them. */
+  readonly windowSessions = new Set<string>();
+  readonly windowSegments: Array<{ session: string; key: string; bytes: number }> = [];
   /** Every proxied request, with its headers, for auth-leak assertions. */
   readonly requests: Array<{ path: string; method: string; headers: Record<string, string> }> = [];
   artifactReads = 0;
@@ -263,6 +266,65 @@ export class FakeContainer implements ContainerControl {
     if (path === "/internal/release") {
       this.restored.clear();
       return new Response(JSON.stringify({ released: true }), { status: 200, headers: { "content-type": "application/json" } });
+    }
+
+    if (path === "/internal/window/open") {
+      const body = init?.body ? JSON.parse(await textBody(init.body)) : {};
+      this.windowSessions.add(String(body.session_id));
+      return new Response(
+        JSON.stringify({ session_id: body.session_id, window: body.window, selection: { selected: [], missing: [], expected: 0, justification: "fake" } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    if (path === "/internal/window/segment") {
+      const headers = new Headers(init?.headers as Record<string, string> | undefined);
+      const session = headers.get("x-burstel-session-id") ?? "";
+      const key = headers.get("x-burstel-segment-key") ?? "";
+      const bytes = init?.body ? (await readBody(init.body)).byteLength : 0;
+      this.windowSegments.push({ session, key, bytes });
+      return new Response(JSON.stringify({ accepted: true, segment_key: key }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+
+    if (path === "/internal/window/commit") {
+      return new Response(
+        JSON.stringify({
+          expected_segments: this.windowSegments.length,
+          available_segments: this.windowSegments.length,
+          missing_segments: [],
+          instances: [],
+          complete: true,
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    if (path === "/internal/window/query") {
+      return new Response(JSON.stringify(this.queryResult), { status: 200, headers: { "content-type": "application/json" } });
+    }
+
+    if (path === "/internal/window/analyze") {
+      return new Response(JSON.stringify(this.analyzeResult), { status: 200, headers: { "content-type": "application/json" } });
+    }
+
+    if (path === "/internal/window/compare") {
+      return new Response(JSON.stringify(this.compareResult), { status: 200, headers: { "content-type": "application/json" } });
+    }
+
+    if (path === "/internal/window/schema") {
+      return new Response(JSON.stringify(this.schemaResult), { status: 200, headers: { "content-type": "application/json" } });
+    }
+
+    if (path === "/internal/window/release") {
+      const body = init?.body ? JSON.parse(await textBody(init.body)) : {};
+      this.windowSessions.delete(String(body.session_id));
+      return new Response(JSON.stringify({ released: true, session_id: body.session_id }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     }
 
     if (path.startsWith("/v1/")) {
