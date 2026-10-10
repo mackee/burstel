@@ -30,7 +30,7 @@
 //	BURSTEL_API_TOKEN  admin token (prefer --token-file or the env over argv)
 //
 // The admin token is resolved in order: --token, $BURSTEL_API_TOKEN,
-// --token-file, then ./.secrets/BURSTEL_API_TOKEN if it exists.
+// --token-file, ./.secrets/BURSTEL_API_TOKEN, then ~/.config/burstel/token.
 package main
 
 import (
@@ -41,6 +41,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -187,8 +188,11 @@ func newClient(base, token, tokenFile string) (*client, error) {
 	if token == "" {
 		path := tokenFile
 		if path == "" {
-			if _, err := os.Stat(defaultTokenFile); err == nil {
-				path = defaultTokenFile
+			for _, cand := range defaultTokenPaths() {
+				if _, err := os.Stat(cand); err == nil {
+					path = cand
+					break
+				}
 			}
 		}
 		if path != "" {
@@ -203,6 +207,17 @@ func newClient(base, token, tokenFile string) (*client, error) {
 		return nil, fmt.Errorf("no admin token: set --token, $BURSTEL_API_TOKEN or --token-file")
 	}
 	return &client{base: base, token: token, http: &http.Client{Timeout: 120 * time.Second}}, nil
+}
+
+// defaultTokenPaths returns the token files tried when no explicit token is
+// given: the repository-local .secrets/ file first, then a per-user
+// ~/.config/burstel/token so an installed binary works from any directory.
+func defaultTokenPaths() []string {
+	paths := []string{defaultTokenFile}
+	if home, err := os.UserHomeDir(); err == nil {
+		paths = append(paths, filepath.Join(home, ".config", "burstel", "token"))
+	}
+	return paths
 }
 
 // do performs an admin request. If out is non-nil the JSON body is decoded into
@@ -432,7 +447,7 @@ Usage:
 Global flags (may appear anywhere):
   --base-url URL     base URL (default $BURSTEL_BASE_URL, else `+defaultBaseURL+`)
   --token TOKEN      admin token (default $BURSTEL_API_TOKEN)
-  --token-file PATH  read the admin token from PATH (default .secrets/BURSTEL_API_TOKEN if present)
+  --token-file PATH  read the admin token from PATH (default .secrets/BURSTEL_API_TOKEN, else ~/.config/burstel/token)
 
 Commands:
   health
