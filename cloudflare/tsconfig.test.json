@@ -6,6 +6,8 @@
   "include": [
     "test/**/*.ts",
     "src/auth.ts",
+    "src/auth-core.ts",
+    "src/authz.ts",
     "src/errors.ts",
     "src/http.ts",
     "src/ids.ts",

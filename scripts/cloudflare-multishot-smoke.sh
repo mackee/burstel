@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # cloudflare-multishot-smoke.sh - bounded live two-shot isolation E2E against a
-# deployed burstel Worker + Containers + R2 deployment (spec 013, Part A).
+# deployed burstel Worker + Containers + R2 deployment (spec 013, Parts A+B).
 #
 # It proves that two shots recording at the same time, each addressed by its own
 # per-shot ingest token on the stable /ingest endpoint, keep strictly isolated
@@ -13,7 +13,9 @@
 #   4. push with token B and assert both advanced;
 #   5. freeze both and assert independent frozen artifacts;
 #   6. assert scope separation (/ingest rejects the admin token; /api/*
-#      rejects a per-shot token).
+#      rejects a per-shot token);
+#   7. (Part B) mint two `member` tokens, cross-operate on each other's shots,
+#      deny the registry with 403, revoke one immediately, and list MCP tools.
 #
 # Secret confidentiality: tokens are read from the environment, passed to curl
 # via `--config` process substitution (never argv) and to otlpsend via
@@ -54,11 +56,12 @@ BODY_FILE="$WORK/body"
 die() { printf 'cloudflare-multishot-smoke: %s\n' "$*" >&2; exit 1; }
 
 req() {
-  local method="$1" path="$2" body="${3:-}" auth="${4:-}"
+  local method="$1" path="$2" body="${3:-}" auth="${4:-}" extra="${5:-}"
   local cfg
   cfg="$( {
     printf 'silent\nshow-error\nmax-time = 30\nrequest = "%s"\n' "$method"
     if [ -n "$auth" ]; then printf 'header = "%s"\n' "$auth"; fi
+    if [ -n "$extra" ]; then printf 'header = "%s"\n' "$extra"; fi
     if [ -n "$body" ]; then printf 'header = "Content-Type: application/json"\ndata-binary = "@-"\n'; fi
   } )"
   if [ -n "$body" ]; then
@@ -165,7 +168,55 @@ echo "== retired installation-wide token endpoint ==" >&2
 req POST /api/ingest-token "" "$ADMIN"
 expect_code 410 "retired ingest-token endpoint"
 
+echo "== shared multi-user tokens (spec 013, Part B) ==" >&2
+req POST /api/tokens "{\"scope\":\"member\",\"owner\":\"e2e-alice\"}" "$ADMIN"
+expect_code 201 "mint member alice"
+MEMBER_A="$(printf '%s' "$BODY" | jget "['token']")"
+MEMBER_A_ID="$(printf '%s' "$BODY" | jget "['id']")"
+[ -n "$MEMBER_A" ] || die "no member A token"
+
+req POST /api/tokens "{\"scope\":\"member\",\"owner\":\"e2e-bob\"}" "$ADMIN"
+expect_code 201 "mint member bob"
+MEMBER_B="$(printf '%s' "$BODY" | jget "['token']")"
+[ -n "$MEMBER_B" ] || die "no member B token"
+[ "$MEMBER_A" != "$MEMBER_B" ] || die "member tokens are identical"
+
+# Member A creates a shot; member B operates on it (no ownership restriction).
+req POST /api/shots "{\"owner\":\"e2e-alice\"}" "Authorization: Bearer $MEMBER_A"
+expect_code 201 "member A creates shot"
+SHOT_M="$(printf '%s' "$BODY" | jget "['shot_id']")"
+req GET "/api/shots/$SHOT_M" "" "Authorization: Bearer $MEMBER_B"
+expect_code 200 "member B reads member A's shot"
+req POST "/api/shots/$SHOT_M/ingest-token" "" "Authorization: Bearer $MEMBER_B"
+expect_code 201 "member B mints a token for member A's shot"
+req POST "/api/shots/$SHOT_M/stop" "" "Authorization: Bearer $MEMBER_B"
+expect_code 200 "member B stops member A's shot"
+
+# A member token may not manage the registry.
+req GET /api/tokens "" "Authorization: Bearer $MEMBER_A"
+expect_code 403 "member denied token list"
+req POST /api/tokens "{\"scope\":\"member\"}" "Authorization: Bearer $MEMBER_A"
+expect_code 403 "member denied token mint"
+
+# The MCP surface is available to a member (operational tools list).
+req POST /mcp '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
+  "Authorization: Bearer $MEMBER_B" "Accept: application/json, text/event-stream"
+expect_code 200 "member MCP tools/list"
+printf '%s' "$BODY" | grep -q '"shot_start"' || die "MCP tools/list missing shot_start"
+
+# Revoking one member cuts that person off immediately without rotating others.
+req DELETE "/api/tokens/$MEMBER_A_ID" "" "$ADMIN"
+expect_code 200 "revoke member A"
+req GET /api/shots "" "Authorization: Bearer $MEMBER_A"
+expect_code 401 "revoked member A rejected"
+req GET /api/shots "" "Authorization: Bearer $MEMBER_B"
+expect_code 200 "member B still works after member A is revoked"
+
+# A member token is not a push token.
+req POST /ingest/v1/logs '{}' "Authorization: Bearer $MEMBER_B"
+expect_code 401 "member token rejected on /ingest"
+
 cat <<JSON
-{"base_url":"$BASE","shot_a":"$SHOT_A","shot_b":"$SHOT_B","isolation":"ok","concurrent_recording":"ok","frozen_sha256_a":"$SHA_A","frozen_sha256_b":"$SHA_B","owner_filter":"ok","scope_separation":"ok","installation_token_retired":true}
+{"base_url":"$BASE","shot_a":"$SHOT_A","shot_b":"$SHOT_B","isolation":"ok","concurrent_recording":"ok","frozen_sha256_a":"$SHA_A","frozen_sha256_b":"$SHA_B","owner_filter":"ok","scope_separation":"ok","installation_token_retired":true,"multi_user":"ok","member_cross_shot":"ok","member_registry_denied":true,"revocation":"ok","mcp_member":"ok"}
 JSON
 echo "== cloudflare multishot smoke passed (no secret was printed) ==" >&2

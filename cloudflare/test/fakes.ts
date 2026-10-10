@@ -7,10 +7,11 @@
 import { Database } from "bun:sqlite";
 
 import type { ArtifactResult, ArtifactSink, ArtifactSource } from "../src/artifacts";
+import { AuthCore } from "../src/auth-core";
 import type { ContainerControl } from "../src/container";
 import type { HeartbeatScheduler, ShotCoreDeps } from "../src/core";
 import { ShotCore } from "../src/core";
-import type { DoStubLike, IngestNamespaceLike } from "../src/env";
+import type { AuthNamespaceLike, DoStubLike, IngestNamespaceLike } from "../src/env";
 import { IngestCore } from "../src/ingest-core";
 import type { SqlCursor, SqlRow, SqlValue, SyncSql } from "../src/store";
 
@@ -23,9 +24,15 @@ export class BunSql implements SyncSql {
   }
 
   exec(query: string, ...bindings: SqlValue[]): SqlCursor {
-    const rows = this.db.query(query).all(...(bindings as unknown as never[])) as SqlRow[];
-    const changes = (this.db as unknown as { changes?: number }).changes ?? 0;
-    return { toArray: () => rows, rowsWritten: changes };
+    // bun:sqlite exposes the affected-row count only from `run()`, and `all()`
+    // only returns rows. Route reads through `all()` and writes through `run()`
+    // so `rowsWritten` matches the real Durable Object SQLite semantics.
+    if (/^\s*(select|with|pragma|explain|values)\b/i.test(query)) {
+      const rows = this.db.query(query).all(...(bindings as unknown as never[])) as SqlRow[];
+      return { toArray: () => rows, rowsWritten: 0 };
+    }
+    const result = this.db.query(query).run(...(bindings as unknown as never[]));
+    return { toArray: () => [], rowsWritten: result.changes ?? 0 };
   }
 }
 
@@ -350,6 +357,29 @@ export function makeIngest(
 /** Namespace stand-in for the singleton IngestDO binding. */
 export class FakeIngestNamespace implements IngestNamespaceLike {
   constructor(readonly core: IngestCore) {}
+
+  getByName(): DoStubLike {
+    return { fetch: (request: Request) => this.core.handleInternal(request) };
+  }
+}
+
+export interface AuthHarness {
+  core: AuthCore;
+  sql: BunSql;
+}
+
+/** Builds an {@link AuthCore} over real in-process SQLite with a fake clock. */
+export function makeAuth(
+  options: { now?: () => number; generateToken?: () => string; generateId?: () => string; sql?: BunSql } = {},
+): AuthHarness {
+  const sql = options.sql ?? new BunSql();
+  const core = new AuthCore({ sql, now: options.now, generateToken: options.generateToken, generateId: options.generateId });
+  return { core, sql };
+}
+
+/** Namespace stand-in for the singleton AuthDO binding. */
+export class FakeAuthNamespace implements AuthNamespaceLike {
+  constructor(readonly core: AuthCore) {}
 
   getByName(): DoStubLike {
     return { fetch: (request: Request) => this.core.handleInternal(request) };

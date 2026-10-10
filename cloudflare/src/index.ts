@@ -11,6 +11,7 @@ import type { Env } from "./shot-do";
 
 export { ShotDO } from "./shot-do";
 export { IngestDO } from "./ingest-do";
+export { AuthDO } from "./auth-do";
 export type { Env } from "./shot-do";
 
 export default {

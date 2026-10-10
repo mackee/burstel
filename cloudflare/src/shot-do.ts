@@ -22,8 +22,6 @@ export interface Env extends Cloudflare.Env {
   BURSTEL_INTERNAL_TOKEN?: string;
   /** Public origin used to advertise per-shot OTLP endpoints. */
   PUBLIC_BASE_URL?: string;
-  /** Maximum number of shots that may record concurrently; default 10. */
-  MAX_CONCURRENT_RECORDING?: string;
   /** Container listen port; defaults to 8080. */
   CONTAINER_PORT?: string;
   /** R2 key prefix; defaults to `shots`. */

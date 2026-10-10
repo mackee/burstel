@@ -11,6 +11,7 @@ change that introduced it.
 | `BURSTEL_API_TOKEN` | admin: `/api/*`, `/mcp`, legacy per-shot `/shots/{id}` | Worker secret | sent to a container, logged, committed |
 | `BURSTEL_INTERNAL_TOKEN` | recorder `/internal/*` only (defense in depth) | Worker secret **and** injected into the container env by the DO | reused as the admin token, logged, committed |
 | per-shot push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its shot | minted by `POST /api/shots` (or `POST /api/shots/{id}/ingest-token`), returned once | stored raw, logged, used for admin routes |
+| per-person token (`admin`/`member`) | `/api/*` and `/mcp`; `member` is full operational but never registry; `admin` may manage the registry | minted by `POST /api/tokens` (admin only), returned once | stored raw (only its digest lives in `AuthDO`), logged, used as a push/internal token |
 
 Requirements, all **fail closed** when violated:
 
@@ -40,6 +41,11 @@ wrangler secret put BURSTEL_INTERNAL_TOKEN
   recorder or the image.
 * Tokens are compared in constant time and never logged. The DO stores only the
   push token's one-way SHA-256 digest.
+* Per-person registry tokens (spec 013, Part B) store only a SHA-256 digest in
+  `AuthDO`; `GET /api/tokens` never returns a value, and a revoked/expired token
+  fails immediately (`401`). Token issuance is the trust boundary: hand out one
+  `member` token per person and revoke individually rather than sharing the
+  admin secret.
 
 ## Legacy admin per-shot endpoint
 

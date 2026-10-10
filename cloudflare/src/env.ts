@@ -15,9 +15,20 @@ export interface IngestNamespaceLike {
   getByName(name: string): DoStubLike;
 }
 
+/** Structural subset of `DurableObjectNamespace<AuthDO>`. */
+export interface AuthNamespaceLike {
+  getByName(name: string): DoStubLike;
+}
+
 export interface AppEnv {
   SHOT_DO: ShotNamespaceLike;
   INGEST_DO: IngestNamespaceLike;
+  /**
+   * Multi-user token registry (spec 013, Part B). Optional so pure unit tests
+   * that only exercise the env admin credential can omit it; when absent, any
+   * non-admin bearer token fails closed (`401`).
+   */
+  AUTH_DO?: AuthNamespaceLike;
   BURSTEL_API_TOKEN?: string;
   /**
    * Trusted local-development escape hatch. When set to `1`/`true`, admin

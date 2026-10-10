@@ -253,6 +253,12 @@ export function validateWranglerConfig(
     true,
     "INGEST_DO -> IngestDO durable object binding",
   );
+  add(
+    "do_binding_authdo",
+    bindings.some((b) => b.name === "AUTH_DO" && b.class_name === "AuthDO"),
+    true,
+    "AUTH_DO -> AuthDO durable object binding (spec 013, Part B)",
+  );
 
   const exports = cfg.exports ?? {};
   add(
@@ -266,6 +272,12 @@ export function validateWranglerConfig(
     exports["IngestDO"]?.type === "durable-object" && exports["IngestDO"]?.storage === "sqlite",
     true,
     `exports.IngestDO=${JSON.stringify(exports["IngestDO"] ?? null)}`,
+  );
+  add(
+    "export_authdo_sqlite",
+    exports["AuthDO"]?.type === "durable-object" && exports["AuthDO"]?.storage === "sqlite",
+    true,
+    `exports.AuthDO=${JSON.stringify(exports["AuthDO"] ?? null)}`,
   );
 
   const r2 = cfg.r2_buckets ?? [];

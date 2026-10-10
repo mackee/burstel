@@ -33,6 +33,7 @@ runs as the nonroot user `burstel` (uid 10001).
 | `BURSTEL_API_TOKEN` | admin: `/api/*`, `/mcp`, legacy per-shot path | Worker secret |
 | `BURSTEL_INTERNAL_TOKEN` | recorder `/internal/*` defense-in-depth | Worker secret, injected into the container by the `ShotDO` |
 | per-shot push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its shot | minted at runtime by `POST /api/shots` (or `POST /api/shots/{id}/ingest-token`), shown **once** |
+| per-person token | `/api/*` + `/mcp` as `admin` or `member` (member = full operational, no registry) | minted at runtime by `POST /api/tokens` (admin only), shown **once**; only its digest is stored in `AuthDO` |
 
 Rules (all fail closed): the internal token must be non-empty and **different**
 from the admin token; the admin token is never forwarded to the container; the
@@ -110,8 +111,9 @@ The full preflight checks, without mutating anything:
   are never read or printed);
 * `docker`/`buildx`/`linux/amd64` compatibility;
 * the `wrangler.jsonc` invariants: `ShotDO` container on `standard-1`, bounded
-  `max_instances`, SQLite `ShotDO`/`IngestDO` exports, `BUCKET -> burstel-shots`,
-  no `BURSTEL_DEV_INSECURE_AUTH`, no plaintext tokens in `vars`.
+  `max_instances`, SQLite `ShotDO`/`IngestDO`/`AuthDO` exports,
+  `BUCKET -> burstel-shots`, no `BURSTEL_DEV_INSECURE_AUTH`, no plaintext tokens
+  in `vars`.
 
 It exits non-zero and prints `BLOCKED` if anything required fails — including
 "no image-build mechanism". It never runs `wrangler deploy`.
@@ -148,7 +150,9 @@ traces/metrics/logs through the fixed `/ingest` endpoint, freezes, then runs RES
 query/analyze/schema/compare and MCP `tools/list`/`tools/call`, verifies
 admin/push scope separation, and asserts the retired `/api/ingest-token` endpoint
 returns `410`. `scripts/cloudflare-multishot-smoke.sh` additionally runs two
-**concurrent** shots with distinct tokens and proves per-shot data isolation.
+**concurrent** shots with distinct tokens, proves per-shot data isolation, and
+(spec 013, Part B) mints two `member` tokens, cross-operates on each other's
+shots, denies the registry, revokes one immediately and lists MCP tools.
 Tokens are read from the environment, passed to curl through `--config` process
 substitution (never argv) and to `cmd/otlpsend` through `BURSTEL_PUSH_TOKEN`;
 they are never echoed, written to the repo, logged, put in URLs or CI artifacts.

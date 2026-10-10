@@ -5,21 +5,28 @@
 // between isolates. Tools are thin wrappers over the same per-shot ShotDO
 // boundary the REST API uses, so MCP callers are authenticated and scoped the
 // same way.
+//
+// Spec 013, Part B: `/mcp` accepts the env admin credential and any registered
+// per-person token. `admin` and `member` both get the full *operational* tool
+// set on every shot; only `admin` may call the registry tools
+// (`token_mint`/`token_list`/`token_revoke`), and `member` is denied before any
+// DO work.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 
-import { adminAuthenticate } from "./auth";
+import type { AuthPrincipal } from "./auth-core";
+import { resolvePrincipal, isRegistryAdmin } from "./authz";
 import { maxConcurrentRecording } from "./env";
 import type { AppEnv } from "./env";
-import { unauthorized } from "./errors";
+import { forbidden, unauthorized } from "./errors";
 import { errorMessage } from "./errors";
 import { errorResponse } from "./http";
 import { createTools } from "./tools";
 
 export const MCP_SERVER_NAME = "burstel";
-export const MCP_SERVER_VERSION = "0.3.0";
+export const MCP_SERVER_VERSION = "0.4.0";
 
 interface ToolOutput {
   [key: string]: unknown;
@@ -28,10 +35,10 @@ interface ToolOutput {
   isError?: boolean;
 }
 
-function ok(data: Record<string, unknown>): ToolOutput {
+function ok(data: object): ToolOutput {
   return {
     content: [{ type: "text", text: JSON.stringify(data) }],
-    structuredContent: data,
+    structuredContent: data as Record<string, unknown>,
   };
 }
 
@@ -42,15 +49,43 @@ function fail(error: unknown): ToolOutput {
   };
 }
 
-function buildServer(env: AppEnv, origin: string): McpServer {
+/** A stable, machine-readable 403 tool error for a denied registry call. */
+function failForbidden(): ToolOutput {
+  return { content: [{ type: "text", text: `403 ${forbidden().message}` }], isError: true };
+}
+
+function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): McpServer {
   const server = new McpServer({ name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION });
   const tools = createTools({
     namespace: env.SHOT_DO,
     ingest: env.INGEST_DO,
+    auth: env.AUTH_DO,
     origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
     maxConcurrentRecording: maxConcurrentRecording(env),
   });
+  const isAdmin = isRegistryAdmin(principal);
+
+  server.registerTool(
+    "shots_list",
+    {
+      title: "List shots",
+      description:
+        "List recordings (newest first) with state, attribution-only owner, timestamps, size/SHA-256 and counters. Optional owner filter and limit/offset pagination.",
+      inputSchema: {
+        owner: z.string().optional().describe("Attribution-only filter; never an authorization boundary"),
+        limit: z.number().int().positive().max(200).optional(),
+        offset: z.number().int().nonnegative().optional(),
+      },
+    },
+    async ({ owner, limit, offset }) => {
+      try {
+        return ok(await tools.list({ owner, limit, offset }));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
 
   server.registerTool(
     "shot_start",
@@ -66,6 +101,23 @@ function buildServer(env: AppEnv, origin: string): McpServer {
     async ({ metadata, owner }) => {
       try {
         return ok(await tools.start((metadata ?? {}) as Record<string, unknown>, owner));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "shot_ingest_token",
+    {
+      title: "Mint a per-shot ingest token",
+      description:
+        "Mint (or rotate) the push-only OTLP ingest token for a shot and return it once. The token routes /ingest to this shot only.",
+      inputSchema: { shot_id: z.string().describe("Shot id returned by shot_start") },
+    },
+    async ({ shot_id }) => {
+      try {
+        return ok(await tools.issueIngestToken(shot_id));
       } catch (error) {
         return fail(error);
       }
@@ -185,16 +237,83 @@ function buildServer(env: AppEnv, origin: string): McpServer {
     },
   );
 
+  // ------------------------------------------------------- registry tools
+  // Admin only. A member token is denied here before any DO work.
+
+  server.registerTool(
+    "token_mint",
+    {
+      title: "Mint a per-person token",
+      description:
+        "Admin only. Mint a scoped per-person token (scope admin|member, attribution-only owner); the value is disclosed exactly once.",
+      inputSchema: {
+        scope: z.enum(["admin", "member"]),
+        owner: z.string().optional().describe("Attribution/audit label"),
+        expires_at: z.string().optional().describe("Absolute ISO-8601 expiry"),
+        ttl_seconds: z.number().int().positive().optional().describe("Relative expiry in seconds"),
+      },
+    },
+    async ({ scope, owner, expires_at, ttl_seconds }) => {
+      if (!isAdmin) return failForbidden();
+      try {
+        return ok(await tools.mintToken({ scope, owner, expires_at, ttl_seconds }));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "token_list",
+    {
+      title: "List registry tokens",
+      description: "Admin only. List token metadata (id, scope, owner, timestamps, revoked). Values are never returned.",
+      inputSchema: {},
+    },
+    async () => {
+      if (!isAdmin) return failForbidden();
+      try {
+        return ok(await tools.listTokens());
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "token_revoke",
+    {
+      title: "Revoke a token",
+      description: "Admin only. Revoke a registered token immediately so that person is cut off without rotating everyone.",
+      inputSchema: { id: z.string().describe("Token id from token_list") },
+    },
+    async ({ id }) => {
+      if (!isAdmin) return failForbidden();
+      try {
+        return ok(await tools.revokeToken(id));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
   return server;
 }
 
-/** Handles a single MCP HTTP request after authentication. */
-export async function handleMcp(request: Request, env: AppEnv): Promise<Response> {
-  if (!adminAuthenticate(request, env)) {
-    return errorResponse(unauthorized());
+/** Handles a single MCP HTTP request. Resolves the principal when not supplied. */
+export async function handleMcp(
+  request: Request,
+  env: AppEnv,
+  principal?: AuthPrincipal,
+): Promise<Response> {
+  let caller = principal;
+  if (!caller) {
+    const auth = await resolvePrincipal(request, env);
+    if (!auth.ok) return errorResponse(unauthorized());
+    caller = auth.principal;
   }
   const origin = new URL(request.url).origin;
-  const server = buildServer(env, origin);
+  const server = buildServer(env, origin, caller);
   const transport = new WebStandardStreamableHTTPServerTransport({ enableJsonResponse: true });
   await server.connect(transport);
   return transport.handleRequest(request);

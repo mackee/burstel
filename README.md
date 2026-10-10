@@ -27,6 +27,15 @@ R2 / MCP はまだ含まない。収集した DuckDB ファイルを後から SQ
 > 同時 recording 上限 (`MAX_CONCURRENT_RECORDING`) を管理する。旧来の全社トークン
 > `POST /api/ingest-token` は廃止され `410 Gone` を返す。詳細は
 > [`cloudflare/README.md`](./cloudflare/README.md)。
+>
+> **Shared multi-user (spec 013 Part B)** は、1 つのデプロイを複数人で共有する。
+> admin が `POST /api/tokens` で **人ごとの**トークン (scope `admin` | `member`) を
+> 発行し、`member` は全 shot に対する操作権限 (作成/停止、per-shot token 発行、
+> query/analyze/compare) を持つがレジストリ管理はできない。token は digest のみを
+> SQLite の `AuthDO` に保存し、`GET /api/tokens` は値を返さない。`DELETE
+> /api/tokens/{id}` で個人単位に即時失効できる。`owner` は帰属表示専用で認可境界では
+> ない。MCP (`/mcp`) も admin|member で利用でき、レジストリ操作は admin 専用。
+> 詳細は [`cloudflare/README.md`](./cloudflare/README.md)。
 
 ## できること
 
@@ -144,8 +153,9 @@ DuckDB CLI で直接 SQL を書いてもよい(`duckdb -readonly shot-1.duckdb`)
 ### 2. デプロイ済み Worker を操作する(`burstel-cli`)
 
 Cloudflare 版([`cloudflare/README.md`](./cloudflare/README.md))をデプロイした後、
-shot の開始/停止、24 時間有効な push 専用 ingest トークンの発行、freeze 済み
-snapshot の query / analyze / compare を `burstel-cli` で行う。
+shot の開始/停止、24 時間有効な push 専用 ingest トークンの発行、人ごとの
+`admin`/`member` トークン管理、freeze 済み snapshot の query / analyze / compare を
+`burstel-cli` で行う。
 
 ```bash
 export BURSTEL_BASE_URL=https://burstel.<account>.workers.dev
@@ -156,27 +166,29 @@ chmod 600 ~/.config/burstel/token
 
 burstel-cli health
 
-# その日の push 専用トークンを発行し、exporter は 1 日固定の設定にする
-PUSH=$(burstel-cli token issue)
+# shot を作成し、その shot 専用の push トークンを発行する
+SHOT=$(burstel-cli shot start --metadata commit=abc123 --metadata scenario=bench)
+SHOT_ID=$(printf '%s' "$SHOT" | jq -r .shot_id)
+PUSH=$(printf '%s' "$SHOT" | jq -r .ingest_token)
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_EXPORTER_OTLP_ENDPOINT=$BURSTEL_BASE_URL/ingest
 export OTEL_EXPORTER_OTLP_HEADERS="X-Burstel-Token=$PUSH"
 
-# ベンチマークごとに start / stop するだけ
-burstel-cli shot start --metadata commit=abc123 --metadata scenario=bench
-#   ... ベンチマーク実行 ...
-burstel-cli shot stop <shot-id>
+# ベンチマーク実行後、freeze する
+burstel-cli shot stop "$SHOT_ID"
 
 # freeze 済み snapshot の解析
-burstel-cli shot get <shot-id>
-burstel-cli shot schema <shot-id>
-burstel-cli shot analyze <shot-id> --top-n 10
-burstel-cli shot query <shot-id> \
+burstel-cli shot get "$SHOT_ID"
+burstel-cli shot schema "$SHOT_ID"
+burstel-cli shot analyze "$SHOT_ID" --top-n 10
+burstel-cli shot query "$SHOT_ID" \
   --sql "SELECT service_name, count(*) AS n FROM spans GROUP BY 1 ORDER BY n DESC" --max-rows 20
-burstel-cli shot compare <shot-id> --other <other-shot-id> --top-n 10
+burstel-cli shot compare "$SHOT_ID" --other <other-shot-id> --top-n 10
 
-# トークンの失効(recording 中の shot が無いときのみ)
-burstel-cli token revoke
+# 人ごとのトークンを発行・一覧・失効 (admin のみ)
+burstel-cli token mint --scope member --owner alice --out .secrets/member-alice
+burstel-cli token list
+burstel-cli token revoke <token-id>
 ```
 
 全コマンドは `burstel-cli help` で確認できる。

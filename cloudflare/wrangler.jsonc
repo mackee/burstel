@@ -2,7 +2,8 @@
   // burstel: Worker + one ShotDO (SQLite-backed) + one Container per shot,
   // freezing the DuckDB artifact into R2. A singleton SQLite-backed IngestDO
   // coordinates per-shot push-only ingest tokens (token -> shot), the shot
-  // registry and the concurrent-recording cap (spec 013, Part A).
+  // registry and the concurrent-recording cap (spec 013, Part A). A singleton
+  // SQLite-backed AuthDO holds the per-person token registry (spec 013, Part B).
   //
   // The Container uses the well-supported `default` scheduling policy: the image
   // and instance size live here in Wrangler configuration, and the ShotDO starts
@@ -46,6 +47,10 @@
       {
         "name": "INGEST_DO",
         "class_name": "IngestDO"
+      },
+      {
+        "name": "AUTH_DO",
+        "class_name": "AuthDO"
       }
     ]
   },
@@ -56,6 +61,10 @@
       "storage": "sqlite"
     },
     "IngestDO": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "AuthDO": {
       "type": "durable-object",
       "storage": "sqlite"
     }

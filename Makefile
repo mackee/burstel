@@ -50,7 +50,8 @@ cf-preflight-config:
 cf-smoke:
 	scripts/cloudflare-smoke.sh
 
-# Spec 013 Part A: two concurrent shots with distinct per-shot tokens.
+# Spec 013 Parts A+B: two concurrent shots with distinct per-shot tokens plus a
+# shared multi-user (member token) section.
 cf-multishot-smoke:
 	scripts/cloudflare-multishot-smoke.sh
 

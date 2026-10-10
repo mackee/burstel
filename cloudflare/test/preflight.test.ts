@@ -79,6 +79,15 @@ describe("wrangler configuration validation", () => {
     expect(report.failed_required).toContain("export_ingestdo_sqlite");
   });
 
+  test("requires the SQLite AuthDO binding/export (spec 013, Part B)", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    cfg.exports!["AuthDO"]!.storage = "key-value";
+    cfg.durable_objects!.bindings = cfg.durable_objects!.bindings!.filter((b) => b.name !== "AUTH_DO");
+    const report = finalize(validateWranglerConfig(cfg));
+    expect(report.failed_required).toContain("export_authdo_sqlite");
+    expect(report.failed_required).toContain("do_binding_authdo");
+  });
+
   test("requires the BUCKET -> burstel-shots R2 binding", () => {
     const cfg = loadWranglerConfig(REAL_CONFIG);
     cfg.r2_buckets![0]!.bucket_name = "some-other-bucket";

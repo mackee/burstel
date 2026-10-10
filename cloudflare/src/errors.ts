@@ -31,6 +31,14 @@ export function notFound(message: string): HttpError {
   return new HttpError(404, message, false, "not_found");
 }
 
+/**
+ * The caller is authenticated but lacks the scope for this operation (spec 013,
+ * Part B). `member` is denied every registry operation; `admin` is required.
+ */
+export function forbidden(message = "forbidden: admin scope required"): HttpError {
+  return new HttpError(403, message, false, "forbidden");
+}
+
 export function conflict(message: string): HttpError {
   return new HttpError(409, message, false, "conflict");
 }

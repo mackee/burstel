@@ -7,61 +7,64 @@ replace it.
 ```
                  public HTTPS                       Worker           coordinator / per-shot DO
  exporter ──► POST /ingest/v1/{traces,metrics,logs} ─► token→shot ─► IngestDO ─► that shot's ShotDO ─► Container
- rec client ─► POST /api/shots            ──► admin auth ──────► IngestDO (reserve slot + mint token) + ShotDO
- rec client ─► POST /api/shots/{id}/ingest-token ─► admin auth ─► IngestDO (per-shot digest + expiry)
- rec client ─► GET  /api/shots            ──► admin auth ──────► IngestDO (shot registry, ?owner= filter)
- rec client ─► POST /api/shots/{id}/stop  ──► admin auth ──────► ShotDO ─► GET /internal/stop
-                                                                    │        GET /internal/artifact
-                                                                    ▼
-                                                          R2Bucket.put (streaming)
-                                                          shots/{id}/telemetry.duckdb
-                                                          shots/{id}/metadata.json
+ rec client ─► POST /api/shots            ──► admin|member ────► IngestDO (reserve slot + mint token) + ShotDO
+ rec client ─► POST /api/shots/{id}/ingest-token ─► admin|member ► IngestDO (per-shot digest + expiry)
+ rec client ─► GET  /api/shots            ──► admin|member ────► IngestDO (shot registry, ?owner= filter)
+ rec client ─► POST /api/shots/{id}/stop  ──► admin|member ────► ShotDO ─► GET /internal/stop
+ rec client ─► POST /api/tokens           ──► admin ──────────► AuthDO (digest + scope + owner)
+                                                                  │        GET /internal/artifact
+                                                                  ▼
+                                                        R2Bucket.put (streaming)
+                                                        shots/{id}/telemetry.duckdb
+                                                        shots/{id}/metadata.json
 ```
 
 * `src/index.ts` — Worker entrypoint.
-* `src/app.ts` — public HTTP routes + admin/push auth (whitelist only).
+* `src/app.ts` — public HTTP routes + principal (admin/member/push) auth (whitelist only).
+* `src/authz.ts` / `src/auth-core.ts` — principal resolution and the pure token registry (scopes, digests, revocation).
+* `src/auth-do.ts` — singleton SQLite `AuthDO` holding the per-person token registry (digest + scope + attribution-only owner).
 * `src/shot-do.ts` — `ShotDO extends DurableObject`, wires `ctx.storage.sql`,
   `ctx.container` and the `BUCKET` R2 binding into the core.
-* `src/ingest-do.ts` / `src/ingest-core.ts` — singleton SQLite `IngestDO`:
-  per-shot token digests/expiry (token → shot), the shot registry and the
-  concurrent-recording cap (pure core, fully unit tested).
-* `src/core.ts` — race-safe lifecycle state machine (pure; fully unit tested).
-* `src/store.ts` — SQLite-backed state store over a `SyncSql` seam.
-* `src/artifacts.ts` — streaming single-PUT / bounded multipart R2 freeze.
-* `src/container.ts` — wrapper around the Durable Object Container API.
 
 ## Public HTTP API
 
-Two scopes exist after Phase 13, Part A:
+Three credential scopes exist after Phase 13:
 
-* **Admin scope** — `Authorization: Bearer <BURSTEL_API_TOKEN>` (or
-  `X-Burstel-Token`): all `/api/*` control and analysis routes, `/mcp`, and the
-  legacy per-shot ingest path.
-* **Push scope** — a per-shot, admin-minted push-only token (valid exactly 24h):
-  `POST /ingest/v1/{traces,metrics,logs}` only, routed to the shot it is bound
-  to. It is never accepted anywhere else and the admin token is never accepted
-  for `/ingest`.
+* **Admin scope** — `BURSTEL_API_TOKEN` (legacy, resolved in the Worker) or a
+  registry token minted with `scope: "admin"`: every `/api/*` route including the
+  token registry, `/mcp`, and the legacy per-shot ingest path.
+* **Member scope** — a registry token minted with `scope: "member"`: the full
+  *operational* capability set on **every** shot (create/stop, mint per-shot
+  ingest tokens, list/get/query/analyze/schema/compare) but **not** the token
+  registry. There is no per-owner isolation; `owner` is attribution only.
+* **Push scope** — a per-shot, admin/member-minted push-only token (valid
+  exactly 24h): `POST /ingest/v1/{traces,metrics,logs}` only, routed to the shot
+  it is bound to. It is never accepted anywhere else and the admin/member tokens
+  are never accepted for `/ingest`.
 
 `GET /healthz` is unauthenticated.
 
 | Method | Path | Scope | Description |
 | --- | --- | --- | --- |
 | `GET` | `/healthz` | public | Worker reachability |
-| `POST` | `/api/ingest-token` | admin | **Retired** (spec 013). Always `410 Gone`; use a per-shot token. |
-| `POST` | `/api/shots` | admin | Create a recording shot, mint its per-shot ingest token (shown once) and reserve a concurrency slot. Optional `owner` (attribution only). |
-| `GET` | `/api/shots` | admin | List shots newest first; optional `?owner=` filter and `?limit=`/`?offset=` pagination. |
-| `GET` | `/api/shots/{id}` | admin | Lifecycle / metadata / counters |
-| `POST` | `/api/shots/{id}/ingest-token` | admin | Mint an additional per-shot push token (shown once, 24h) |
-| `POST` | `/api/shots/{id}/stop` | admin | Idempotent per-shot freeze; revokes the shot's token after a short grace |
-| `POST` | `/api/shots/{id}/query` | admin | Constrained read-only SQL against the frozen snapshot |
-| `POST` | `/api/shots/{id}/analyze` | admin | SQL-backed analytical summaries |
-| `GET` | `/api/shots/{id}/schema` | admin | Documented queryable schema + safety policy |
-| `POST` | `/api/shots/{id}/compare` | admin | SQL-derived diff with another frozen shot (`{"other":"<id>"}`) |
-| `POST` | `/mcp` | admin | Remote MCP (Streamable HTTP) endpoint |
+| `POST` | `/api/tokens` | admin | Mint a per-person token (`scope` admin\|member, attribution-only `owner`); value shown once |
+| `GET` | `/api/tokens` | admin | List token metadata (id/scope/owner/timestamps/revoked); never values |
+| `DELETE` | `/api/tokens/{id}` | admin | Revoke a per-person token immediately (idempotent) |
+| `POST` | `/api/ingest-token` | authenticated | **Retired** (spec 013). Always `410 Gone`; use a per-shot token. |
+| `POST` | `/api/shots` | admin\|member | Create a recording shot, mint its per-shot ingest token (shown once) and reserve a concurrency slot. Optional `owner` (attribution only). |
+| `GET` | `/api/shots` | admin\|member | List shots newest first; optional `?owner=` filter and `?limit=`/`?offset=` pagination. |
+| `GET` | `/api/shots/{id}` | admin\|member | Lifecycle / metadata / counters |
+| `POST` | `/api/shots/{id}/ingest-token` | admin\|member | Mint an additional per-shot push token (shown once, 24h) |
+| `POST` | `/api/shots/{id}/stop` | admin\|member | Idempotent per-shot freeze; revokes the shot's token after a short grace |
+| `POST` | `/api/shots/{id}/query` | admin\|member | Constrained read-only SQL against the frozen snapshot |
+| `POST` | `/api/shots/{id}/analyze` | admin\|member | SQL-backed analytical summaries |
+| `GET` | `/api/shots/{id}/schema` | admin\|member | Documented queryable schema + safety policy |
+| `POST` | `/api/shots/{id}/compare` | admin\|member | SQL-derived diff with another frozen shot (`{"other":"<id>"}`) |
+| `POST` | `/mcp` | admin\|member | Remote MCP (Streamable HTTP) endpoint |
 | `POST` | `/ingest/v1/traces` | push | Stable OTLP/HTTP ingest; the token selects the target shot |
 | `POST` | `/ingest/v1/metrics` | push | Stable OTLP/HTTP ingest; the token selects the target shot |
 | `POST` | `/ingest/v1/logs` | push | Stable OTLP/HTTP ingest; the token selects the target shot |
-| `POST` | `/shots/{id}/v1/{traces,metrics,logs}` | admin | **Deprecated** legacy per-shot path, kept for compatibility |
+| `POST` | `/shots/{id}/v1/{traces,metrics,logs}` | admin\|member | **Deprecated** legacy per-shot path, kept for compatibility |
 
 `POST /api/shots`, `POST /api/shots/{id}/ingest-token` and `GET /api/shots/{id}`
 return the stable `otlp_base_url` plus explicit `otlp_endpoints` for the three
@@ -87,10 +90,14 @@ Object, which reaches the container over its private TCP port.
   distinct, non-empty `BURSTEL_INTERNAL_TOKEN` and the DO fails closed
   (`500 internal_token_missing` / `internal_token_not_distinct`) rather than
   booting an unguarded container.
-* Admin authentication **fails closed** when `BURSTEL_API_TOKEN` is unset. The
-  only bypass is the explicit local-development flag
-  `BURSTEL_DEV_INSECURE_AUTH=1` (or `true`/`yes`), which must never be set in
+* Admin authentication **fails closed** when neither `BURSTEL_API_TOKEN` nor a
+  matching registry token is presented. The only bypass is the explicit
+  local-development flag `BURSTEL_DEV_INSECURE_AUTH=1` (or `true`/`yes`), which
+  only applies when `BURSTEL_API_TOKEN` is unset and must never be set in
   production. There are no hardcoded credential defaults.
+* Per-person registry tokens are stored only as SHA-256 digests in `AuthDO`,
+  compared in constant time and never returned by `GET /api/tokens`. A revoked
+  or expired token fails immediately (`401`).
 
 ## Stable ingest and per-shot tokens (spec 013, Part A)
 
@@ -149,6 +156,50 @@ curl -fsS -X POST https://<host>/api/shots/$SHOT/ingest-token \
   (missing/invalid/expired/revoked) in safe structured counters.
 
 
+## Shared multi-user access (spec 013, Part B)
+
+A deployment can be shared by several people, each with their **own revocable
+token**, without giving anyone the env admin secret. A new SQLite-backed
+`AuthDO` stores only the SHA-256 **digest** of each token plus its scope, an
+attribution-only owner label and timestamps.
+
+```bash
+# Admin mints a per-person token; the value is shown exactly once.
+curl -fsS -X POST https://<host>/api/tokens \
+  -H "Authorization: Bearer $BURSTEL_API_TOKEN" \
+  -d '{"scope":"member","owner":"alice"}'          # -> {"token":"bta_...","id":"...","scope":"member",...}
+
+# List metadata (id/scope/owner/timestamps/revoked); values are never returned.
+curl -fsS https://<host>/api/tokens -H "Authorization: Bearer $BURSTEL_API_TOKEN"
+
+# Revoke one person immediately, without rotating everyone else.
+curl -fsS -X DELETE https://<host>/api/tokens/<id> -H "Authorization: Bearer $BURSTEL_API_TOKEN"
+```
+
+* **Scopes.** `admin` may manage the registry and do everything; `member` has
+  the full *operational* capability set on **every** shot (create/stop, mint
+  per-shot ingest tokens, list/get/query/analyze/schema/compare) but is denied
+  `POST`/`GET`/`DELETE /api/tokens` and the MCP registry tools with `403`. The
+  scope check happens before any DO work, so a denied call starts no container
+  and mutates nothing.
+* **No ownership isolation.** `owner` is attribution/audit only (plus the
+  optional `GET /api/shots?owner=` convenience filter); it is never an
+  authorization boundary. Any operational token may act on any shot.
+* **Deny by default.** Unknown, revoked or expired tokens fail closed with
+  `401`. Comparison against stored digests is constant time. The env
+  `BURSTEL_API_TOKEN` remains the backward-compatible admin credential and is
+  resolved in the Worker, never stored in the registry.
+* **Per-shot tokens stay push-only.** A `POST /ingest` token is a distinct
+  credential; it is rejected on `/api/*` and `/mcp`, and the admin/member tokens
+  are rejected on `/ingest`.
+* **MCP.** `/mcp` accepts any admin/member token. Both scopes get the full
+  operational tool set (`shots_list`, `shot_start`, `shot_ingest_token`,
+  `shot_stop`, `shot_get`, `shot_query`, `shot_analyze`, `shot_schema`,
+  `shot_compare`); only `admin` may call `token_mint`/`token_list`/`token_revoke`.
+* **Migration.** The installation-wide 24h token is gone: `POST`/`DELETE`
+  `/api/ingest-token` return `410 Gone` pointing at the per-shot endpoint, and
+  the per-shot flow is the only ingest path.
+
 ## Phase 3 — MCP analysis and comparison
 
 The defining promise is **post-run analysis without the original recording
@@ -172,23 +223,30 @@ is always authoritative; the frozen object is never mutated.
 ### Remote MCP tools
 
 `POST /mcp` speaks MCP over Streamable HTTP with JSON responses, implemented
-with the maintained `@modelcontextprotocol/sdk`. The endpoint requires the same
-bearer token as the REST API, and each tool is a thin wrapper over the same
-per-shot ShotDO boundary, so MCP callers cannot bypass REST authentication.
+with the maintained `@modelcontextprotocol/sdk`. The endpoint accepts the env
+admin credential or any registered `admin`/`member` token, and each tool is a
+thin wrapper over the same per-shot ShotDO boundary, so MCP callers cannot
+bypass REST authentication.
 
-| Tool | Arguments | Result |
-| --- | --- | --- |
-| `shot_start` | `metadata?` | New shot id + OTLP endpoints |
-| `shot_stop` | `shot_id` | Frozen state, size, SHA-256 |
-| `shot_get` | `shot_id` | Lifecycle, metadata, counters, freeze info |
-| `shot_query` | `shot_id`, `sql`, `max_rows?` | Bounded typed rows |
-| `shot_analyze` | `shot_id`, `sections?`, `top_n?` | Latency p50/p95/p99, slow spans, errors, DB ops, log correlation, metrics |
-| `shot_compare` | `left_shot_id`, `right_shot_id`, `top_n?` | SQL-derived deltas + sample sizes + disclosure |
-| `shot_schema` | `shot_id` | Documented tables/columns/templates + safety policy |
+| Tool | Scope | Arguments | Result |
+| --- | --- | --- | --- |
+| `shots_list` | admin\|member | `owner?`, `limit?`, `offset?` | Shots newest first with state, owner, timings, size/SHA-256, counters |
+| `shot_start` | admin\|member | `metadata?`, `owner?` | New shot id + OTLP endpoints + per-shot push token |
+| `shot_ingest_token` | admin\|member | `shot_id` | Per-shot push token (shown once) |
+| `shot_stop` | admin\|member | `shot_id` | Frozen state, size, SHA-256 |
+| `shot_get` | admin\|member | `shot_id` | Lifecycle, metadata, counters, freeze info |
+| `shot_query` | admin\|member | `shot_id`, `sql`, `max_rows?` | Bounded typed rows |
+| `shot_analyze` | admin\|member | `shot_id`, `sections?`, `top_n?` | Latency p50/p95/p99, slow spans, errors, DB ops, log correlation, metrics |
+| `shot_compare` | admin\|member | `left_shot_id`, `right_shot_id`, `top_n?` | SQL-derived deltas + sample sizes + disclosure |
+| `shot_schema` | admin\|member | `shot_id` | Documented tables/columns/templates + safety policy |
+| `token_mint` | admin | `scope`, `owner?`, `expires_at?`, `ttl_seconds?` | New per-person token (shown once) |
+| `token_list` | admin | — | Token metadata (never values) |
+| `token_revoke` | admin | `id` | Immediately revokes a token |
 
-A shot id is a capability: possession of the id (plus the API token) grants
-access to that shot only. Tool errors are returned as MCP tool errors
-(`isError: true`), not protocol errors, so a model can recover.
+A shot id is a capability: possession of the id (plus an operational token)
+grants access to that shot. Tool errors are returned as MCP tool errors
+(`isError: true`), not protocol errors, so a model can recover; a `member`
+calling a registry tool gets a `403` tool error and no registry work happens.
 
 ### Query safety
 
@@ -377,6 +435,11 @@ token against `https://<host>/mcp`; call `initialize`, then `tools/list`, then
   late-data-after-stop non-attribution.
 * Auth rejection, shot isolation, OTLP proxy response semantics, and route
   validation through the real Worker request handler.
+* The shared multi-user registry (spec 013, Part B): the capability matrix over
+  REST and MCP (a `member` token may operate on **any** shot but is denied the
+  registry with `403`; `admin` may mint/list/revoke), immediate revocation,
+  optional expiry, digest-only persistence (never a value, never returned by
+  list), constant-time comparison, and the retired `/api/ingest-token` `410`.
 * Single-PUT and multipart R2 streaming code paths against a fake R2 bucket.
 * The real Go analysis engine over real DuckDB: read-only restore with
   size/SHA-256 verification, allowlisted SQL, p50/p95/p99 and error analysis,
@@ -384,10 +447,11 @@ token against `https://<host>/mcp`; call `initialize`, then `tools/list`, then
 * The DO analysis flow over fakes: the frozen artifact is streamed from the
   shared R2-like bucket into a fresh analysis container, tampering is detected,
   and non-frozen/missing-artifact cases fail closed.
-* MCP `initialize` / `tools/list` / `tools/call` envelopes and the full
-  start/stop/query/analyze/compare tool flow through the official SDK.
-* TypeScript typecheck and `wrangler deploy --dry-run` bundling (which lists
-  both `ShotDO` and `IngestDO` bindings).
+* MCP `initialize` / `tools/list` / `tools/call` envelopes, the full
+  start/stop/query/analyze/compare tool flow and the admin-only registry tools
+  through the official SDK.
+* TypeScript typecheck and `wrangler deploy --dry-run` bundling (which lists the
+  `ShotDO`, `IngestDO` and `AuthDO` bindings).
 
 `wrangler deploy --dry-run` (without `--containers-rollout=none`) additionally
 requires the Docker CLI because Wrangler must build the container image even for
@@ -417,10 +481,11 @@ scripts/cloudflare-preflight.sh                 # full read-only preflight (auth
 
 `cloudflare/src/preflight.ts` + `cloudflare/scripts/preflight.mjs` validate the
 `wrangler.jsonc` invariants (ShotDO container, `standard-1`, bounded
-`max_instances`, SQLite `ShotDO`/`IngestDO` exports, `BUCKET -> burstel-shots`,
-no anonymous admin) and parse read-only `wrangler whoami --json`,
-`wrangler secret list` (names only) and R2 bucket listings. The live
-[`scripts/cloudflare-smoke.sh`](../scripts/cloudflare-smoke.sh) is a bounded E2E
+`max_instances`, SQLite `ShotDO`/`IngestDO`/`AuthDO` exports,
+`BUCKET -> burstel-shots`, no anonymous admin) and parse read-only
+`wrangler whoami --json`, `wrangler secret list` (names only) and R2 bucket
+listings. The live [`scripts/cloudflare-smoke.sh`](../scripts/cloudflare-smoke.sh)
+is a bounded E2E
 (two short shots) that never exposes a secret in argv/files/logs.
 
 ### Not verified here (needs a distinct authorized deployment job)
@@ -428,5 +493,10 @@ no anonymous admin) and parse read-only `wrangler whoami --json`,
 * Real Cloudflare Container scheduling/readiness and `ctx.container` behavior.
 * Real R2 durability/checksums, real `wrangler deploy`, bucket creation, secret
   setup, migrations and account-level Container capacity.
+* The live multi-user E2E (two concurrent shots plus two `member` tokens
+  operating across each other's shots and the MCP token/analysis tools) is
+  written into `scripts/cloudflare-multishot-smoke.sh` but **not executed here**:
+  it needs the Cloudflare deploy host (a real `wrangler deploy` + Docker image),
+  which this sandbox does not have.
 * No Cloudflare API keys, R2 S3 keys or tokens are stored in this repository or
   image; `BURSTEL_API_TOKEN` is a Worker secret set at deploy time.

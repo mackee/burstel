@@ -9,8 +9,10 @@
 // own shot. The coordinator (`IngestDO`) holds the shot registry, enforces the
 // `MAX_CONCURRENT_RECORDING` cap and persists per-shot token digests.
 
+import { AUTH_DO_NAME, isScope } from "./auth-core";
+import type { AuthTokenIssue, AuthTokenMetadata } from "./auth-core";
 import { DO_ORIGIN } from "./env";
-import type { DoStubLike, IngestNamespaceLike, ShotNamespaceLike } from "./env";
+import type { AuthNamespaceLike, DoStubLike, IngestNamespaceLike, ShotNamespaceLike } from "./env";
 import { badRequest, capacityExhausted, conflict, HttpError } from "./errors";
 import { INGEST_DO_NAME } from "./ingest-core";
 import type { ShotIngestTokenIssue } from "./ingest-core";
@@ -20,6 +22,8 @@ export interface ToolContext {
   namespace: ShotNamespaceLike;
   /** Installation-wide coordinator: shot registry, per-shot tokens and cap. */
   ingest: IngestNamespaceLike;
+  /** Multi-user token registry (spec 013, Part B); optional in pure unit tests. */
+  auth?: AuthNamespaceLike;
   /** Origin of the incoming request, used to advertise OTLP endpoints. */
   origin: string;
   publicBaseUrl?: string;
@@ -71,7 +75,20 @@ export function createTools(ctx: ToolContext) {
     compare: (leftId: string, rightId: string, topN?: number) => compareShots(ctx, leftId, rightId, topN),
     list: (opts: { owner?: string; limit?: number; offset?: number } = {}) => listShots(ctx, opts),
     issueIngestToken: (shotId: string) => mintShotIngestToken(ctx, shotId),
+    mintToken: (input: MintTokenInput) => mintToken(ctx, input),
+    listTokens: () => listTokens(ctx),
+    revokeToken: (id: string) => revokeToken(ctx, id),
   };
+}
+
+/** Body accepted when minting a per-person token (REST or MCP). */
+export interface MintTokenInput {
+  scope: string;
+  owner?: string;
+  /** Absolute expiry as an ISO-8601 timestamp. */
+  expires_at?: string;
+  /** Relative expiry in seconds. */
+  ttl_seconds?: number;
 }
 
 // ---------------------------------------------------------------- start/stop
@@ -185,6 +202,26 @@ export async function mintShotIngestToken(
   return issueShotToken(ctx, shotId);
 }
 
+// -------------------------------------------------------- token registry
+
+/** Mints a per-person token (disclosed once). Scope is validated here and again in the DO. */
+export async function mintToken(ctx: ToolContext, input: MintTokenInput): Promise<AuthTokenIssue> {
+  if (!isScope(input.scope)) throw badRequest("scope must be admin or member");
+  const result = await authCall<AuthTokenIssue>(ctx, "/internal/mint", "POST", input);
+  return result;
+}
+
+/** Lists registry metadata (never values or digests), newest first. */
+export async function listTokens(ctx: ToolContext): Promise<{ tokens: AuthTokenMetadata[] }> {
+  return authCall<{ tokens: AuthTokenMetadata[] }>(ctx, "/internal/list", "GET");
+}
+
+/** Revokes a token immediately and idempotently. */
+export async function revokeToken(ctx: ToolContext, id: string): Promise<{ revoked: boolean; id: string }> {
+  if (typeof id !== "string" || id.trim() === "") throw badRequest("token id is required");
+  return authCall<{ revoked: boolean; id: string }>(ctx, "/internal/revoke", "POST", { id });
+}
+
 // ---------------------------------------------------------------- analysis
 
 export async function queryShot(
@@ -256,6 +293,28 @@ async function ingestCall<T>(
   }
   const resp = await ingestStub(ctx).fetch(new Request(`${DO_ORIGIN}${path}`, init));
   return (await parseJsonOrThrow(resp)) as T;
+}
+
+function authStub(ctx: ToolContext): DoStubLike {
+  if (!ctx.auth) {
+    throw new HttpError(500, "token registry is not configured", false, "auth_registry_unavailable");
+  }
+  return ctx.auth.getByName(AUTH_DO_NAME);
+}
+
+async function authCall<T>(
+  ctx: ToolContext,
+  path: string,
+  method: string,
+  body?: unknown,
+): Promise<T> {
+  const init: RequestInit = { method };
+  if (body !== undefined) {
+    init.headers = { "content-type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
+  const resp = await authStub(ctx).fetch(new Request(`${DO_ORIGIN}${path}`, init));
+  return (await parseJsonOrThrow(resp)) as unknown as T;
 }
 
 async function reserveRecordingSlot(ctx: ToolContext, shotId: string, owner: string): Promise<void> {

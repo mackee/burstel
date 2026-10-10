@@ -1,9 +1,10 @@
 // Command burstel-cli is a small admin client for a deployed burstel Worker.
 //
 // It creates/reads/lists/stops shots, mints a per-shot 24h push-only ingest
-// token, and runs REST query/analyze/schema/compare against a frozen shot's
-// DuckDB snapshot. The admin token is sent as `Authorization: Bearer`; a
-// per-shot push token is never accepted here.
+// token, manages the shared per-person token registry, and runs REST
+// query/analyze/schema/compare against a frozen shot's DuckDB snapshot. The
+// admin token is sent as `Authorization: Bearer`; a per-shot push token is never
+// accepted here.
 //
 // Usage:
 //
@@ -14,6 +15,9 @@
 //	version
 //	health
 //	token issue <shot-id> [--out FILE]  mint the shot's 24h push-only ingest token
+//	token mint --scope admin|member [--owner NAME] [--ttl-seconds N] [--out FILE]
+//	token list [--out FILE]             list per-person tokens (metadata only)
+//	token revoke <token-id>             revoke a per-person token immediately
 //	shot start [--owner NAME] [--metadata k=v ...]
 //	shot list [--owner NAME] [--limit N] [--offset N]
 //	shot get <shot-id>
@@ -296,7 +300,7 @@ func printJSON(v any) error {
 
 func (c *client) tokenCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("token: expected `issue <shot-id>`")
+		return errors.New("token: expected issue|mint|list|revoke")
 	}
 	switch args[0] {
 	case "issue":
@@ -327,10 +331,71 @@ func (c *client) tokenCommand(args []string) error {
 		fmt.Fprintf(os.Stderr, "shot_id=%s issued_at=%s expires_at=%s ttl_seconds=%d\n", shotID, resp.IssuedAt, resp.ExpiresAt, resp.TTL)
 		fmt.Fprintln(os.Stdout, resp.Token)
 		return nil
+	case "mint":
+		pos, opts, err := parseOpts(args[1:], map[string]bool{"scope": true, "owner": true, "ttl-seconds": true, "out": true})
+		if err != nil {
+			return err
+		}
+		if len(pos) != 0 {
+			return fmt.Errorf("token mint: unexpected argument %q", pos[0])
+		}
+		scope := last(opts, "scope")
+		if scope != "admin" && scope != "member" {
+			return errors.New("token mint: --scope admin|member is required")
+		}
+		body := map[string]any{"scope": scope}
+		if owner := last(opts, "owner"); owner != "" {
+			body["owner"] = owner
+		}
+		if n, ok, err := optInt(opts, "ttl-seconds"); err != nil {
+			return err
+		} else if ok {
+			body["ttl_seconds"] = n
+		}
+		var resp struct {
+			Token     string  `json:"token"`
+			ID        string  `json:"id"`
+			Scope     string  `json:"scope"`
+			Owner     string  `json:"owner"`
+			CreatedAt string  `json:"created_at"`
+			ExpiresAt *string `json:"expires_at"`
+		}
+		if err := c.do(http.MethodPost, "/api/tokens", body, &resp); err != nil {
+			return err
+		}
+		if out := last(opts, "out"); out != "" {
+			if err := writeSecretFile(out, resp.Token); err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "wrote token to %s (mode 600)\n", out)
+		}
+		expires := "never"
+		if resp.ExpiresAt != nil {
+			expires = *resp.ExpiresAt
+		}
+		fmt.Fprintf(os.Stderr, "id=%s scope=%s owner=%s created_at=%s expires_at=%s\n", resp.ID, resp.Scope, resp.Owner, resp.CreatedAt, expires)
+		fmt.Fprintln(os.Stdout, resp.Token)
+		return nil
+	case "list":
+		pos, _, err := parseOpts(args[1:], nil)
+		if err != nil {
+			return err
+		}
+		if len(pos) != 0 {
+			return fmt.Errorf("token list: unexpected argument %q", pos[0])
+		}
+		return c.getJSON("/api/tokens")
 	case "revoke":
-		// A per-shot token is revoked automatically when the shot freezes; there
-		// is no installation-wide token to revoke any more.
-		return errors.New("token revoke: per-shot tokens are revoked automatically when the shot freezes")
+		// Revokes a registered per-person token by id (from `token list`). A
+		// per-shot ingest token is revoked automatically when its shot freezes.
+		pos, _, err := parseOpts(args[1:], nil)
+		if err != nil {
+			return err
+		}
+		if len(pos) != 1 {
+			return fmt.Errorf("token revoke: expected exactly one token id, got %d", len(pos))
+		}
+		return c.postJSON(http.MethodDelete, "/api/tokens/"+pos[0], nil)
 	default:
 		return fmt.Errorf("token: unknown action %q", args[0])
 	}
@@ -500,6 +565,10 @@ Commands:
   version
   health
   token issue <shot-id> [--out FILE]  mint the shot's 24h push-only ingest token (prints the token)
+  token mint --scope admin|member [--owner NAME] [--ttl-seconds N] [--out FILE]
+                                      mint a per-person token (prints the token once)
+  token list                          list per-person token metadata (never values)
+  token revoke <token-id>             revoke a per-person token immediately
   shot start [--owner NAME] [--metadata k=v ...]
   shot list [--owner NAME] [--limit N] [--offset N]
   shot get <shot-id>
@@ -514,6 +583,9 @@ Examples:
   burstel-cli shot start --owner alice --metadata source=isucon
   burstel-cli shot list --owner alice
   TOKEN=$(burstel-cli token issue <shot-id>)
+  burstel-cli token mint --scope member --owner alice --out .secrets/member-alice
+  burstel-cli token list
+  burstel-cli token revoke <token-id>
   burstel-cli shot stop <shot-id>
   burstel-cli shot query <shot-id> --sql "SELECT span_name, count(*) c FROM spans GROUP BY 1 ORDER BY c DESC" --max-rows 10
 `)

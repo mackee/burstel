@@ -6,24 +6,32 @@
 // TCP port.
 //
 //   GET    /healthz                         (public)
-//   POST   /api/ingest-token                (admin) retired; 410 Gone
-//   POST   /api/shots                       (admin)
-//   GET    /api/shots                       (admin) list, optional ?owner=
-//   GET    /api/shots/{id}                  (admin)
-//   POST   /api/shots/{id}/ingest-token     (admin) mint per-shot push token
-//   POST   /api/shots/{id}/stop             (admin)
-//   POST   /api/shots/{id}/query            (admin)
-//   POST   /api/shots/{id}/analyze          (admin)
-//   GET    /api/shots/{id}/schema           (admin)
-//   POST   /api/shots/{id}/compare          (admin)
+//   POST   /api/ingest-token                (authenticated) retired; 410 Gone
+//   POST   /api/tokens                      (admin) mint a per-person token
+//   GET    /api/tokens                      (admin) list token metadata
+//   DELETE /api/tokens/{id}                 (admin) revoke a token
+//   POST   /api/shots                       (admin|member)
+//   GET    /api/shots                       (admin|member) list, optional ?owner=
+//   GET    /api/shots/{id}                  (admin|member)
+//   POST   /api/shots/{id}/ingest-token     (admin|member) mint per-shot push token
+//   POST   /api/shots/{id}/stop             (admin|member)
+//   POST   /api/shots/{id}/query            (admin|member)
+//   POST   /api/shots/{id}/analyze          (admin|member)
+//   GET    /api/shots/{id}/schema           (admin|member)
+//   POST   /api/shots/{id}/compare          (admin|member)
 //   POST   /ingest/v1/{traces,metrics,logs} (per-shot push token)
-//   POST   /shots/{id}/v1/{traces,metrics,logs} (admin, legacy per-shot path)
-//   POST   /mcp                             (admin)
+//   POST   /shots/{id}/v1/{traces,metrics,logs} (admin|member, legacy per-shot path)
+//   POST   /mcp                             (admin|member)
+//
+// Spec 013, Part B: `/api/*` and `/mcp` authenticate with `BURSTEL_API_TOKEN`
+// (admin) or a registered per-person token (`admin` | `member`). Only `admin`
+// may manage the token registry.
 
-import { adminAuthenticate, extractToken } from "./auth";
+import { extractToken } from "./auth";
+import { resolvePrincipal, isRegistryAdmin } from "./authz";
 import { DO_ORIGIN, maxConcurrentRecording, pagination } from "./env";
 import type { AppEnv, DoStubLike, IngestNamespaceLike, ShotNamespaceLike } from "./env";
-import { badRequest, HttpError, unauthorized } from "./errors";
+import { badRequest, forbidden, HttpError, notFound, unauthorized } from "./errors";
 import { errorResponse, json, readJson } from "./http";
 import { INGEST_DO_NAME } from "./ingest-core";
 import type { IngestAdmitResult } from "./ingest-core";
@@ -34,15 +42,18 @@ import {
   compareShots,
   getShot,
   listShots,
+  listTokens,
   mintShotIngestToken,
+  mintToken,
   queryShot,
+  revokeToken,
   schemaShot,
   startShot,
   stopShot,
 } from "./tools";
 import type { ToolContext } from "./tools";
 
-export type { AppEnv, DoStubLike, IngestNamespaceLike, ShotNamespaceLike } from "./env";
+export type { AppEnv, AuthNamespaceLike, DoStubLike, IngestNamespaceLike, ShotNamespaceLike } from "./env";
 
 export async function handleRequest(request: Request, env: AppEnv): Promise<Response> {
   try {
@@ -61,14 +72,15 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
       return await handleIngest(request, env, signal);
     }
 
-    // Everything below is admin-scoped and fails closed when no admin token is
-    // configured (unless the explicit local-development bypass is enabled).
-    if (!adminAuthenticate(request, env)) {
-      throw unauthorized();
-    }
+    // Everything below is scoped to an authenticated principal and fails
+    // closed when no credential is configured (unless the explicit
+    // local-development bypass is enabled).
+    const auth = await resolvePrincipal(request, env);
+    if (!auth.ok) throw unauthorized();
+    const principal = auth.principal;
 
     if (path === "/mcp") {
-      return await handleMcp(request, env);
+      return await handleMcp(request, env, principal);
     }
 
     // Retired in spec 013: the installation-wide 24h push token is gone. Point
@@ -82,6 +94,40 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
     }
 
     const ctx = toolContext(env, url);
+
+    // Token registry: admin-only (spec 013, Part B). A member token is denied
+    // here with 403 before any DO work.
+    if (path === "/api/tokens") {
+      if (!isRegistryAdmin(principal)) throw forbidden();
+      if (request.method === "POST") {
+        const body = await readJson<{
+          scope?: unknown;
+          owner?: unknown;
+          expires_at?: unknown;
+          ttl_seconds?: unknown;
+        }>(request);
+        return json(
+          201,
+          await mintToken(ctx, {
+            scope: typeof body.scope === "string" ? body.scope : "",
+            owner: typeof body.owner === "string" ? body.owner : undefined,
+            expires_at: typeof body.expires_at === "string" ? body.expires_at : undefined,
+            ttl_seconds: typeof body.ttl_seconds === "number" ? body.ttl_seconds : undefined,
+          }),
+        );
+      }
+      if (request.method === "GET") return json(200, await listTokens(ctx));
+      throw badRequest("method not allowed");
+    }
+
+    const tokenMatch = /^\/api\/tokens\/([^/]+)$/.exec(path);
+    if (tokenMatch) {
+      if (!isRegistryAdmin(principal)) throw forbidden();
+      if (request.method !== "DELETE") throw badRequest("method not allowed");
+      const result = await revokeToken(ctx, decodeURIComponent(tokenMatch[1]!));
+      if (!result.revoked) throw notFound("token not found");
+      return json(200, { revoked: true, id: result.id });
+    }
 
     if (path === "/api/shots") {
       if (request.method === "GET") {
@@ -170,6 +216,7 @@ function toolContext(env: AppEnv, url: URL): ToolContext {
   return {
     namespace: env.SHOT_DO,
     ingest: env.INGEST_DO,
+    auth: env.AUTH_DO,
     origin: url.origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
     maxConcurrentRecording: maxConcurrentRecording(env),
