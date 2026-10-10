@@ -11,6 +11,7 @@
 //
 // Commands:
 //
+//	version
 //	health
 //	token issue [--out FILE]     mint the 24h push-only ingest token
 //	token revoke                 revoke the current ingest token
@@ -51,6 +52,9 @@ const defaultBaseURL = "https://burstel.example.workers.dev"
 
 const defaultTokenFile = ".secrets/BURSTEL_API_TOKEN"
 
+// version is set at release time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		if errors.Is(err, errHelp) {
@@ -67,6 +71,10 @@ func run(args []string) error {
 	base, token, tokenFile, rest := extractGlobal(args)
 	if len(rest) == 0 {
 		usage()
+		return nil
+	}
+	if rest[0] == "version" || rest[0] == "--version" {
+		fmt.Println("burstel-cli " + version)
 		return nil
 	}
 
@@ -450,6 +458,7 @@ Global flags (may appear anywhere):
   --token-file PATH  read the admin token from PATH (default .secrets/BURSTEL_API_TOKEN, else ~/.config/burstel/token)
 
 Commands:
+  version
   health
   token issue [--out FILE]        mint the 24h push-only ingest token (prints the token)
   token revoke                    revoke the current ingest token

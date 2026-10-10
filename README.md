@@ -34,6 +34,150 @@ R2 / MCP はまだ含まない。収集した DuckDB ファイルを後から SQ
 - freeze 済み `telemetry.duckdb` を読み取り専用で再オープン可能
 - Cloudflare ShotDO が将来呼ぶ想定の internal API を提供
 
+## インストール
+
+[GitHub Releases](https://github.com/mackee/burstel/releases) にビルド済みバイナリを置いている。
+
+| アーカイブ | 中身 | 対応プラットフォーム |
+| --- | --- | --- |
+| `burstel_<tag>_<os>_<arch>.tar.gz` | `burstel`(recorder 本体)、`burstel-inspect`(freeze 済み shot の解析) | linux/amd64, linux/arm64, darwin/amd64, darwin/arm64 |
+| `burstel-cli_<tag>_<os>_<arch>.{tar.gz,zip}` | `burstel-cli`(デプロイ済み Worker 用の管理 CLI) | linux / darwin / windows × amd64 / arm64 |
+
+`burstel` は DuckDB を cgo で静的リンクしている。Linux 版は glibc 2.35 以降
+(Ubuntu 22.04 / Debian 12 相当)と `libstdc++` が必要。`burstel-cli` は依存なしの
+pure Go バイナリ。
+
+```bash
+TAG=v0.1.0   # 使いたいリリース
+OS=linux     # linux | darwin
+ARCH=amd64   # amd64 | arm64
+
+# 単体 recorder + 解析ツール
+curl -fsSLO "https://github.com/mackee/burstel/releases/download/${TAG}/burstel_${TAG}_${OS}_${ARCH}.tar.gz"
+tar xzf "burstel_${TAG}_${OS}_${ARCH}.tar.gz"
+install "burstel_${TAG}_${OS}_${ARCH}/burstel" "burstel_${TAG}_${OS}_${ARCH}/burstel-inspect" ~/.local/bin/
+
+# 管理 CLI
+curl -fsSLO "https://github.com/mackee/burstel/releases/download/${TAG}/burstel-cli_${TAG}_${OS}_${ARCH}.tar.gz"
+tar xzf "burstel-cli_${TAG}_${OS}_${ARCH}.tar.gz"
+install "burstel-cli_${TAG}_${OS}_${ARCH}/burstel-cli" ~/.local/bin/
+
+burstel -version
+burstel-cli version
+```
+
+private リポジトリの場合は `gh release download "$TAG" -R mackee/burstel` で取得する。
+各アーカイブの SHA-256 は `checksums.txt` に入っている。
+
+ソースからビルドする場合は Go 1.26 と C/C++ コンパイラ(cgo)が必要:
+
+```bash
+make build   # bin/ に burstel, burstel-inspect, burstel-cli, otlpsend, burstel-trial
+```
+
+### リリース手順(メンテナ向け)
+
+`v*` タグを push すると [`.github/workflows/release.yml`](./.github/workflows/release.yml)
+が各プラットフォームでビルドし、`checksums.txt` 付きで GitHub Release を作成する。
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+## 使い方
+
+### 1. 単体で使う(`burstel` + `burstel-inspect`)
+
+Cloudflare 無しで、手元やベンチ対象サーバの隣で recorder を動かす使い方。
+1 プロセスで 1 shot を記録し、`stop` で `telemetry.duckdb` を freeze する。
+
+```bash
+export BURSTEL_INTERNAL_TOKEN=$(openssl rand -hex 32)
+
+# recorder を起動(OTLP/HTTP を :4318 で待ち受け)
+burstel -addr :4318 -data-dir ./data
+
+# 別ターミナル: shot を開始
+curl -fsS -H "Authorization: Bearer $BURSTEL_INTERNAL_TOKEN" \
+  -X POST -d '{"shot_id":"shot-1","metadata":{"commit":"abc123"}}' \
+  http://localhost:4318/internal/start
+```
+
+計測対象アプリの OTel SDK を burstel に向けてからベンチマークを流す:
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://<burstel のホスト>:4318
+```
+
+ベンチマークが終わったら stop して freeze し、成果物を取り出す:
+
+```bash
+curl -fsS -H "Authorization: Bearer $BURSTEL_INTERNAL_TOKEN" \
+  -X POST -d '{"shot_id":"shot-1"}' http://localhost:4318/internal/stop
+
+# freeze 済みファイルは ./data/shot-1/telemetry.duckdb にある(HTTP でも取得可)
+curl -fsS -H "Authorization: Bearer $BURSTEL_INTERNAL_TOKEN" \
+  http://localhost:4318/internal/artifact -o shot-1.duckdb
+```
+
+1 プロセスは 1 shot を想定しているので、次の shot は `-data-dir` を変えるか
+burstel を再起動して記録する。
+
+freeze 済み shot は `burstel-inspect` で解析・比較できる(p50/p95/p99、遅い span、
+エラー、DB 操作、N+1 候補などを表示。2 つ渡すと差分も出す):
+
+```bash
+burstel-inspect -left shot-1.duckdb                       # 単体解析
+burstel-inspect -left shot-1.duckdb -right shot-2.duckdb  # 2 shot 比較
+burstel-inspect -left shot-1.duckdb -out result.json \
+  -query "SELECT name, count(*) FROM spans GROUP BY 1 ORDER BY 2 DESC LIMIT 10"
+```
+
+DuckDB CLI で直接 SQL を書いてもよい(`duckdb -readonly shot-1.duckdb`)。
+クエリ例は [`examples/queries.sql`](./examples/queries.sql)、スキーマは後述。
+
+### 2. デプロイ済み Worker を操作する(`burstel-cli`)
+
+Cloudflare 版([`cloudflare/README.md`](./cloudflare/README.md))をデプロイした後、
+shot の開始/停止、24 時間有効な push 専用 ingest トークンの発行、freeze 済み
+snapshot の query / analyze / compare を `burstel-cli` で行う。
+
+```bash
+export BURSTEL_BASE_URL=https://burstel.<account>.workers.dev
+# 管理者トークン: --token > $BURSTEL_API_TOKEN > --token-file
+#   > ./.secrets/BURSTEL_API_TOKEN > ~/.config/burstel/token の順で解決
+mkdir -p ~/.config/burstel && printf '%s' "<admin token>" > ~/.config/burstel/token
+chmod 600 ~/.config/burstel/token
+
+burstel-cli health
+
+# その日の push 専用トークンを発行し、exporter は 1 日固定の設定にする
+PUSH=$(burstel-cli token issue)
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=$BURSTEL_BASE_URL/ingest
+export OTEL_EXPORTER_OTLP_HEADERS="X-Burstel-Token=$PUSH"
+
+# ベンチマークごとに start / stop するだけ
+burstel-cli shot start --metadata commit=abc123 --metadata scenario=bench
+#   ... ベンチマーク実行 ...
+burstel-cli shot stop <shot-id>
+
+# freeze 済み snapshot の解析
+burstel-cli shot get <shot-id>
+burstel-cli shot schema <shot-id>
+burstel-cli shot analyze <shot-id> --top-n 10
+burstel-cli shot query <shot-id> \
+  --sql "SELECT service_name, count(*) AS n FROM spans GROUP BY 1 ORDER BY n DESC" --max-rows 20
+burstel-cli shot compare <shot-id> --other <other-shot-id> --top-n 10
+
+# トークンの失効(recording 中の shot が無いときのみ)
+burstel-cli token revoke
+```
+
+全コマンドは `burstel-cli help` で確認できる。
+
 ## アーキテクチャ
 
 ```
@@ -55,6 +199,8 @@ R2 / MCP はまだ含まない。収集した DuckDB ファイルを後から SQ
 | パッケージ | 役割 |
 | --- | --- |
 | `cmd/burstel` | 設定読み込み、HTTP サーバ起動、graceful shutdown |
+| `cmd/burstel-inspect` | freeze 済み shot を独立プロセスで restore → analyze / compare する CLI |
+| `cmd/burstel-cli` | デプロイ済み Worker 用の管理 CLI(shot / ingest token / 解析) |
 | `cmd/otlpsend` | ローカル動作確認用の小さな OTLP 送信クライアント |
 | `internal/config` | フラグ/環境変数による設定 |
 | `internal/otlp` | 公式 OTLP protobuf を decode し、射影行を生成 |
@@ -105,7 +251,7 @@ freeze 済み snapshot の解析用 (Phase 3、Worker/DO 経由のみ):
 `BURSTEL_DEV_INSECURE_AUTH=1` (または `-dev-insecure-auth`) を明示すると
 トークン無しで実行できる。既定では無効。
 
-## クイックスタート
+## 開発用クイックスタート(ソースから)
 
 必要なもの: Go 1.26 と C コンパイラ(cgo で DuckDB をリンクするため)、`gcc`/`g++`。
 

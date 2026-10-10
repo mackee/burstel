@@ -1,0 +1,138 @@
+# Build release binaries and publish a GitHub Release when a v* tag is pushed.
+#
+# - burstel / burstel-inspect link DuckDB through cgo, so they are built per
+#   platform with a native (or cross) C/C++ toolchain:
+#     linux/amd64   native gcc on ubuntu-22.04 (glibc 2.35 baseline)
+#     linux/arm64   aarch64-linux-gnu cross gcc on ubuntu-22.04
+#     darwin/arm64  native clang on macOS
+#     darwin/amd64  clang -arch x86_64 on macOS
+# - burstel-cli is pure Go and is cross-compiled for linux/darwin/windows.
+#
+# Release it with:
+#   git tag v0.1.0 && git push origin v0.1.0
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to (re)build and release"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  burstel:
+    name: burstel ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-22.04, goos: linux, goarch: amd64, cc: gcc, cxx: g++ }
+          - { runner: ubuntu-22.04, goos: linux, goarch: arm64, cc: aarch64-linux-gnu-gcc, cxx: aarch64-linux-gnu-g++ }
+          - { runner: macos-latest, goos: darwin, goarch: arm64, cc: clang, cxx: clang++ }
+          - { runner: macos-latest, goos: darwin, goarch: amd64, cc: "clang -arch x86_64", cxx: "clang++ -arch x86_64" }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install cross toolchain
+        if: matrix.goos == 'linux' && matrix.goarch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: |
+          name="burstel_${TAG}_${GOOS}_${GOARCH}"
+          mkdir -p "dist/$name"
+          ldflags="-s -w -X main.version=${TAG}"
+          go build -trimpath -ldflags="$ldflags" -o "dist/$name/burstel" ./cmd/burstel
+          go build -trimpath -ldflags="$ldflags" -o "dist/$name/burstel-inspect" ./cmd/burstel-inspect
+          cp README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+      - name: Smoke test
+        if: (matrix.goos == 'linux' && matrix.goarch == 'amd64') || (matrix.goos == 'darwin' && matrix.goarch == 'arm64')
+        run: |
+          ./dist/burstel_${TAG}_${{ matrix.goos }}_${{ matrix.goarch }}/burstel -version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: burstel-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  burstel-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            goos="${target%/*}"; goarch="${target#*/}"
+            name="burstel-cli_${TAG}_${goos}_${goarch}"
+            ext=""; [ "$goos" = windows ] && ext=".exe"
+            mkdir -p "dist/$name"
+            GOOS=$goos GOARCH=$goarch go build -trimpath -ldflags="-s -w -X main.version=${TAG}" \
+              -o "dist/$name/burstel-cli$ext" ./cmd/burstel-cli
+            if [ "$goos" = windows ]; then
+              (cd dist && zip -qr "$name.zip" "$name")
+            else
+              tar -C dist -czf "dist/$name.tar.gz" "$name"
+            fi
+          done
+          ./dist/burstel-cli_${TAG}_linux_amd64/burstel-cli version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: burstel-cli
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [burstel, burstel-cli]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag
+          fi

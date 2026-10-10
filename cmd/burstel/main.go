@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -24,9 +25,13 @@ import (
 	"github.com/mackee/burstel/internal/server"
 )
 
+// version is set at release time via -ldflags "-X main.version=...".
+var version = "dev"
+
 func main() {
 	cfg := config.Load()
 
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.StringVar(&cfg.Addr, "addr", cfg.Addr, "HTTP listen address")
 	flag.StringVar(&cfg.DataDir, "data-dir", cfg.DataDir, "directory for per-shot DuckDB files")
 	flag.StringVar(&cfg.InternalToken, "internal-token", cfg.InternalToken, "bearer token required on /internal/* (required unless -dev-insecure-auth)")
@@ -35,6 +40,11 @@ func main() {
 	flag.IntVar(&cfg.MaxInflight, "max-inflight", cfg.MaxInflight, "max concurrent durable writes")
 	flag.DurationVar(&cfg.WriteTimeout, "write-timeout", cfg.WriteTimeout, "timeout for a single durable write")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("burstel " + version)
+		return
+	}
 
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
@@ -54,7 +64,7 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("burstel listening", "addr", cfg.Addr, "data_dir", cfg.DataDir, "schema_version", "1")
+		logger.Info("burstel listening", "addr", cfg.Addr, "data_dir", cfg.DataDir, "schema_version", "1", "version", version)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
