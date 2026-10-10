@@ -16,3 +16,6 @@ coverage.out
 # Wrangler local dev secrets. NEVER commit real tokens.
 .dev.vars
 **/.dev.vars
+
+# Worker secrets generated for local retrieval (scripts/secret-put.sh)
+/.secrets/

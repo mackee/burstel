@@ -501,12 +501,12 @@ export class ShotCore {
     if (!artifact) throw notFound(`frozen artifact ${freeze.artifact_key} is missing`);
     const resp = await this.container.request("/internal/restore", {
       method: "POST",
-      headers: {
+      headers: this.internalHeaders({
         "content-type": "application/octet-stream",
         "x-burstel-restore-id": restoreId,
         "x-burstel-size": String(freeze.artifact_size),
         "x-burstel-sha256": freeze.artifact_sha256,
-      },
+      }),
       body: artifact.body,
       duplex: "half",
     } as RequestInit);

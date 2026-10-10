@@ -58,12 +58,17 @@ die() { printf 'cloudflare-smoke: %s\n' "$*" >&2; exit 1; }
 req() {
   local method="$1" path="$2" body="${3:-}" auth="${4:-}"
   local cfg
-  cfg="$(printf 'silent\nshow-error\nmax-time = 30\nrequest = "%s"\n' "$method")"
-  if [ -n "$auth" ]; then
-    cfg+="$(printf 'header = "%s"\n' "$auth")"
-  fi
+  # Build the whole curl config in ONE command substitution. Each `printf`
+  # keeps its own trailing newline, so `request`, `header` and `data-binary`
+  # stay on separate lines. Chaining `cfg+=` command substitutions would strip
+  # each trailing newline and glue the `request` line to the following
+  # `header` line, silently dropping the Authorization header.
+  cfg="$( {
+    printf 'silent\nshow-error\nmax-time = 30\nrequest = "%s"\n' "$method"
+    if [ -n "$auth" ]; then printf 'header = "%s"\n' "$auth"; fi
+    if [ -n "$body" ]; then printf 'header = "Content-Type: application/json"\ndata-binary = "@-"\n'; fi
+  } )"
   if [ -n "$body" ]; then
-    cfg+="$(printf 'header = "Content-Type: application/json"\ndata-binary = "@-"\n')"
     HTTP_CODE="$(printf '%s' "$body" | curl --config <(printf '%s' "$cfg") -o "$BODY_FILE" -w '%{http_code}' "$BASE$path")"
   else
     HTTP_CODE="$(curl --config <(printf '%s' "$cfg") -o "$BODY_FILE" -w '%{http_code}' "$BASE$path")"
@@ -90,14 +95,7 @@ expect_code 401 "anonymous admin"
 req POST /api/shots '{"metadata":{"source":"smoke"}}' "Authorization: Bearer wrong-token"
 expect_code 401 "wrong admin token"
 
-echo "== shot A: create -> push token -> OTLP -> freeze ==" >&2
-req POST /api/shots "{\"metadata\":{\"source\":\"cloudflare-smoke\",\"ts\":\"$(date +%s)\"}}" "$ADMIN"
-expect_code 201 "create shot A"
-SHOT_A="$(printf '%s' "$BODY" | jget "['shot_id']")"
-OTLP_BASE="$(printf '%s' "$BODY" | jget "['otlp_base_url']")"
-[ -n "$SHOT_A" ] || die "no shot_id returned"
-case "$OTLP_BASE" in */ingest) ;; *) die "otlp_base_url=$OTLP_BASE is not the fixed /ingest endpoint" ;; esac
-
+echo "== issue the push token once (24h) before any shot is recording ==" >&2
 req POST /api/ingest-token "" "$ADMIN"
 expect_code 201 "issue push token"
 PUSH="$(printf '%s' "$BODY" | jget "['token']")"
@@ -106,6 +104,14 @@ ISSUED="$(printf '%s' "$BODY" | jget "['issued_at']")"
 EXPIRES="$(printf '%s' "$BODY" | jget "['expires_at']")"
 [ -n "$PUSH" ] || die "push token was not disclosed once"
 [ "$TTL" = "86400" ] || die "push token ttl_seconds=$TTL, want 86400"
+
+echo "== shot A: create -> OTLP -> freeze ==" >&2
+req POST /api/shots "{\"metadata\":{\"source\":\"cloudflare-smoke\",\"ts\":\"$(date +%s)\"}}" "$ADMIN"
+expect_code 201 "create shot A"
+SHOT_A="$(printf '%s' "$BODY" | jget "['shot_id']")"
+OTLP_BASE="$(printf '%s' "$BODY" | jget "['otlp_base_url']")"
+[ -n "$SHOT_A" ] || die "no shot_id returned"
+case "$OTLP_BASE" in */ingest) ;; *) die "otlp_base_url=$OTLP_BASE is not the fixed /ingest endpoint" ;; esac
 
 # Send the three real fixtures to the fixed /ingest endpoint. The token goes
 # through the environment, never argv.
