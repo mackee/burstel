@@ -60,6 +60,7 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
     namespace: env.SHOT_DO,
     ingest: env.INGEST_DO,
     auth: env.AUTH_DO,
+    compactor: env.COMPACTOR_DO,
     origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
     bucket: env.BUCKET,
@@ -385,6 +386,45 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
     async ({ left_shot_id, right_shot_id, top_n }) => {
       try {
         return ok(await tools.compare(left_shot_id, right_shot_id, top_n));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  // ------------------------------------------------------- compaction tools
+  // Status is operational metadata (no secrets) and is available to admin and
+  // member; a manual run mutates the journal/segment lifecycle and is admin-only.
+
+  server.registerTool(
+    "compaction_status",
+    {
+      title: "Compaction backlog and health",
+      description:
+        "Return the durable compaction backlog (unprocessed journal count, oldest backlog age), completed verified segments, covered/journal bytes, last success/failure, consecutive failures, the active lease and whether the scheduler is active.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        return ok(await tools.compactionStatus());
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "compaction_run",
+    {
+      title: "Run one bounded compaction tick",
+      description:
+        "Admin only. Run exactly one bounded, fenced compaction tick (or an explicit GC pass with gc=true). Overlapping calls are safe: at most one active compaction per partition, and publication is idempotent.",
+      inputSchema: { gc: z.boolean().optional().describe("Run an explicit GC pass instead of a compaction tick") },
+    },
+    async ({ gc }) => {
+      if (!isAdmin) return failForbidden();
+      try {
+        return ok(await tools.compactionRun({ gc }));
       } catch (error) {
         return fail(error);
       }

@@ -1,8 +1,18 @@
 import { describe, expect, test } from "bun:test";
 
+import { CompactorCore } from "../src/compactor-core";
 import type { AppEnv, DoStubLike, ShotNamespaceLike } from "../src/env";
 import { handleMcp } from "../src/mcp";
-import { FakeAuthNamespace, FakeBucket, FakeIngestNamespace, makeAuth, makeCore, makeIngest } from "./fakes";
+import {
+  FakeAuthNamespace,
+  FakeBucket,
+  FakeCompactorContainer,
+  FakeIngestNamespace,
+  makeAuth,
+  makeCore,
+  makeIngest,
+  sha256Hex,
+} from "./fakes";
 import type { IngestHarness } from "./fakes";
 
 const TOKEN = "mcp-window-token";
@@ -78,6 +88,8 @@ describe("MCP window shots and token tools", () => {
       "instance_token_mint",
       "instance_token_list",
       "instance_token_revoke",
+      "compaction_status",
+      "compaction_run",
     ]) {
       expect(names).toContain(expected);
     }
@@ -198,6 +210,97 @@ describe("MCP window analysis over segments", () => {
     const harness = ns.shots.get(shotId);
     expect(harness?.container.windowSegments.length).toBeGreaterThan(0);
     expect(harness?.container.windowSegments[0]!.key).toBe("seg-1");
+  });
+
+  test("compaction-produced segments flow into window analysis without manual steps", async () => {
+    const now = Date.now();
+    const bucket = new FakeBucket();
+    const ingest = makeIngest({ now: () => now, bucket });
+    const instance = await ingest.core.instanceRegistry.upsert("web-1");
+    const receivedAt = now - 600_000;
+
+    // Seed one raw journal object exactly as the intake path would.
+    const bytes = new TextEncoder().encode("otlp");
+    const sha = await sha256Hex(bytes);
+    const key = `journal/${instance.instance_id}/traces/${receivedAt}-a.bin`;
+    await bucket.put(key, bytes, { sha256: sha, customMetadata: { sha256: sha } });
+    await ingest.core.commitJournal({
+      key,
+      instance_id: instance.instance_id,
+      instance: "web-1",
+      signal: "traces",
+      size: bytes.byteLength,
+      sha256: sha,
+      content_type: "application/x-protobuf",
+      content_encoding: "",
+      received_at: receivedAt,
+    });
+
+    const compactor = new CompactorCore({
+      ingest: new FakeIngestNamespace(ingest.core),
+      bucket,
+      container: new FakeCompactorContainer(),
+      holder: "test",
+      now: () => now,
+      config: { graceMs: 0 },
+    });
+    const report = await compactor.tick();
+    expect(report.segments_published).toBe(1);
+    const published = (await ingest.core.listSegments({ limit: 10, offset: 0 })).segments[0]!;
+
+    // A window shot over the published segment analyzes it with no manual publish.
+    const env = makeEnv({}, ingest, bucket);
+    const created = await callTool(env, "shot_create", {
+      started_at: new Date(receivedAt - 1000).toISOString(),
+      ended_at: new Date(receivedAt + 1000).toISOString(),
+      instances: ["web-1"],
+    });
+    const shotId = String(created["shot_id"]);
+    const query = await callTool(env, "shot_query", { shot_id: shotId, sql: "SELECT name FROM spans" });
+    expect(query["row_count"]).toBe(1);
+
+    const ns = env.SHOT_DO as unknown as FakeShotNamespace;
+    const harness = ns.shots.get(shotId);
+    expect(harness?.container.windowSegments.length).toBeGreaterThan(0);
+    expect(harness?.container.windowSegments[0]!.key).toBe(published.segment_key);
+  });
+
+  test("discloses un-compacted journal as pending, never silently complete", async () => {
+    const now = Date.now();
+    const start = now - 120_000;
+    const end = now - 60_000;
+    const bucket = new FakeBucket();
+    const ingest = makeIngest({ now: () => now, bucket });
+    const instance = await ingest.core.instanceRegistry.upsert("web-1");
+    const bytes = new TextEncoder().encode("x");
+    const sha = await sha256Hex(bytes);
+    const key = `journal/${instance.instance_id}/traces/${start}-p.bin`;
+    await bucket.put(key, bytes, { sha256: sha, customMetadata: { sha256: sha } });
+    await ingest.core.commitJournal({
+      key,
+      instance_id: instance.instance_id,
+      instance: "web-1",
+      signal: "traces",
+      size: bytes.byteLength,
+      sha256: sha,
+      content_type: "application/x-protobuf",
+      content_encoding: "",
+      received_at: start,
+    });
+
+    const env = makeEnv({}, ingest, bucket);
+    const created = await callTool(env, "shot_create", {
+      started_at: new Date(start).toISOString(),
+      ended_at: new Date(end).toISOString(),
+      instances: ["web-1"],
+    });
+    const shotId = String(created["shot_id"]);
+    await callTool(env, "shot_query", { shot_id: shotId, sql: "SELECT 1" });
+
+    const got = await callTool(env, "shot_get", { shot_id: shotId });
+    const coverage = got["coverage"] as Record<string, unknown>;
+    expect(coverage["complete"]).toBe(false);
+    expect(coverage["pending_journal"]).toBe(1);
   });
 
   test("rejects a window query when a candidate segment is not available", async () => {

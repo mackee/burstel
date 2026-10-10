@@ -13,8 +13,15 @@
 import { AUTH_DO_NAME, isScope } from "./auth-core";
 import type { AuthTokenIssue, AuthTokenMetadata } from "./auth-core";
 import type { R2BucketLike } from "./artifacts";
+import { COMPACTOR_DO_NAME } from "./compactor-core";
 import { DO_ORIGIN } from "./env";
-import type { AuthNamespaceLike, DoStubLike, IngestNamespaceLike, ShotNamespaceLike } from "./env";
+import type {
+  AuthNamespaceLike,
+  CompactorNamespaceLike,
+  DoStubLike,
+  IngestNamespaceLike,
+  ShotNamespaceLike,
+} from "./env";
 import { badRequest, conflict, HttpError } from "./errors";
 import { INGEST_DO_NAME, isValidInstanceName, normalizeInstanceName } from "./ingest-core";
 import type { CreateWindowShotInput, InstanceMetadata, InstanceTokenIssue, InstanceTokenMetadata, SegmentManifestRow, StartWindowShotInput, WindowShotRecord } from "./ingest-core";
@@ -28,6 +35,8 @@ export interface ToolContext {
   ingest: IngestNamespaceLike;
   /** Multi-user token registry (spec 013, Part B); optional in pure unit tests. */
   auth?: AuthNamespaceLike;
+  /** Compaction coordinator (spec 018); optional in pure unit tests. */
+  compactor?: CompactorNamespaceLike;
   /** Origin of the incoming request, used to advertise OTLP endpoints. */
   origin: string;
   publicBaseUrl?: string;
@@ -99,6 +108,8 @@ export function createTools(ctx: ToolContext) {
       issueInstanceToken(ctx, name, opts),
     listInstanceTokens: (name: string) => listInstanceTokens(ctx, name),
     revokeInstanceToken: (name: string, id: string) => revokeInstanceToken(ctx, name, id),
+    compactionStatus: () => compactionStatus(ctx),
+    compactionRun: (opts: { gc?: boolean } = {}) => compactionRun(ctx, opts),
   };
 }
 
@@ -364,6 +375,34 @@ export async function revokeInstanceToken(
   });
 }
 
+// --------------------------------------------------------- compaction
+
+/** Compaction backlog/health (spec 018). admin|member; never returns secrets. */
+export async function compactionStatus(ctx: ToolContext): Promise<Record<string, unknown>> {
+  const stub = compactorStub(ctx);
+  return doJson(stub, "/internal/status", "GET");
+}
+
+/**
+ * Triggers one bounded compaction tick (or an explicit GC pass). Admin only:
+ * it mutates the journal/segment lifecycle, so it must not be reachable by a
+ * push-only instance token or an arbitrary member.
+ */
+export async function compactionRun(
+  ctx: ToolContext,
+  opts: { gc?: boolean } = {},
+): Promise<Record<string, unknown>> {
+  const stub = compactorStub(ctx);
+  return doJson(stub, opts.gc === true ? "/internal/gc" : "/internal/trigger", "POST");
+}
+
+function compactorStub(ctx: ToolContext): DoStubLike {
+  if (!ctx.compactor) {
+    throw new HttpError(503, "compaction coordinator is not configured", true, "compactor_unavailable");
+  }
+  return ctx.compactor.getByName(COMPACTOR_DO_NAME);
+}
+
 // -------------------------------------------------------- token registry
 
 /** Mints a per-person token (disclosed once). Scope is validated here and again in the DO. */
@@ -530,7 +569,7 @@ async function openWindowSession(
   sessionId: string,
   window: ShotWindow,
   catalog: SegmentManifestRow[],
-): Promise<{ selected: number; available: number; missing: string[] }> {
+): Promise<{ selected: number; available: number; missing: string[]; pending_journal: number }> {
   if (!ctx.bucket) throw new HttpError(503, "window analysis requires the object bucket binding", true, "bucket_unavailable");
   const instances = await ingestCall<{ instances: InstanceMetadata[] }>(ctx, "/internal/instance/list", "GET").catch(
     () => ({ instances: [] as InstanceMetadata[] }),
@@ -577,7 +616,19 @@ async function openWindowSession(
     available += 1;
   }
   await doJson(stub, "/internal/window/commit", "POST", { session_id: sessionId });
-  return { selected: selection.selected.length, available, missing };
+  // Disclose un-compacted journal data in the window: never claim empty/complete
+  // when the journal still holds data that has not become a segment yet.
+  const windowNames = new Set(window.instances);
+  const instanceIds =
+    windowNames.size === 0
+      ? []
+      : instances.instances.filter((i) => windowNames.has(i.name)).map((i) => i.instance_id);
+  const pending = await ingestCall<{ pending_journal: number }>(ctx, "/internal/compaction/pending", "POST", {
+    instance_ids: instanceIds,
+    from_ms: window.start_ms,
+    to_ms: window.end_ms,
+  }).catch(() => ({ pending_journal: 0 }));
+  return { selected: selection.selected.length, available, missing, pending_journal: pending.pending_journal };
 }
 
 /** Runs `run` against a freshly committed window session, then releases it. */
@@ -627,17 +678,20 @@ async function syncCoverage(
   ctx: ToolContext,
   record: WindowShotRecord,
   catalog: SegmentManifestRow[],
-  result: { missing?: string[] },
+  result: { missing?: string[]; pending_journal?: number },
 ): Promise<void> {
+  const missing = result.missing ?? [];
+  const pending = result.pending_journal ?? 0;
   try {
     await ingestCall(ctx, "/internal/shot/window/coverage", "POST", {
       shot_id: record.shot_id,
       coverage: {
         expected_segments: catalog.length,
-        available_segments: catalog.length - (result.missing?.length ?? 0),
-        missing_segments: result.missing ?? [],
+        available_segments: catalog.length - missing.length,
+        missing_segments: missing,
         instances: record.window?.instances ?? [],
-        complete: (result.missing?.length ?? 0) === 0,
+        pending_journal: pending,
+        complete: missing.length === 0 && pending === 0,
       },
     });
   } catch {

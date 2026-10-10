@@ -51,6 +51,7 @@ export interface WranglerConfig {
   exports?: Record<string, DoExport>;
   r2_buckets?: R2Binding[];
   vars?: Record<string, unknown>;
+  triggers?: { crons?: string[] };
   workers_dev?: boolean;
 }
 
@@ -61,6 +62,7 @@ export interface WranglerValidationOptions {
   expectedImage?: string;
   expectedImageBuildContext?: string;
   expectedInstanceType?: string;
+  expectedCompactorImage?: string;
 }
 
 /** Removes `//` and block comments while preserving string contents. */
@@ -188,6 +190,7 @@ export function validateWranglerConfig(
   const expectedImage = opts.expectedImage ?? "../Dockerfile";
   const expectedContext = opts.expectedImageBuildContext ?? "..";
   const expectedInstanceType = opts.expectedInstanceType ?? "standard-1";
+  const expectedCompactorImage = opts.expectedCompactorImage ?? "../Dockerfile.compactor";
   const checks: Check[] = [];
   const add = (name: string, ok: boolean, required: boolean, detail: string): void => {
     checks.push({ name, ok, required, detail });
@@ -240,7 +243,42 @@ export function validateWranglerConfig(
     `max_instances=${max ?? "<unset>"} must be an integer in 1..${maxInstances}`,
   );
 
+  // Spec 018: a distinct, bounded compactor Container + coordinator DO.
+  const compactorContainers = containers.filter((c) => c.class_name === "CompactorDO");
+  add(
+    "container_compactordo_singleton",
+    compactorContainers.length === 1,
+    true,
+    `CompactorDO container entries=${compactorContainers.length}`,
+  );
+  const compactor = compactorContainers[0];
+  add(
+    "container_compactor_image",
+    compactor !== undefined &&
+      compactor.image === expectedCompactorImage &&
+      compactor.image_build_context === expectedContext,
+    true,
+    compactor
+      ? `image=${compactor.image ?? "<unset>"} context=${compactor.image_build_context ?? "<unset>"}`
+      : "no CompactorDO container",
+  );
+  add(
+    "container_compactor_max_instances_bounded",
+    typeof compactor?.max_instances === "number" &&
+      Number.isInteger(compactor.max_instances) &&
+      compactor.max_instances >= 1 &&
+      compactor.max_instances <= 2,
+    true,
+    `CompactorDO max_instances=${compactor?.max_instances ?? "<unset>"} must be 1 or 2`,
+  );
+
   const bindings = cfg.durable_objects?.bindings ?? [];
+  add(
+    "do_binding_compactordo",
+    bindings.some((b) => b.name === "COMPACTOR_DO" && b.class_name === "CompactorDO"),
+    true,
+    "COMPACTOR_DO -> CompactorDO durable object binding",
+  );
   add(
     "do_binding_shotdo",
     bindings.some((b) => b.name === "SHOT_DO" && b.class_name === "ShotDO"),
@@ -279,6 +317,19 @@ export function validateWranglerConfig(
     true,
     `exports.AuthDO=${JSON.stringify(exports["AuthDO"] ?? null)}`,
   );
+  add(
+    "export_compactordo_sqlite",
+    exports["CompactorDO"]?.type === "durable-object" && exports["CompactorDO"]?.storage === "sqlite",
+    true,
+    `exports.CompactorDO=${JSON.stringify(exports["CompactorDO"] ?? null)}`,
+  );
+  const crons = cfg.triggers?.crons;
+  add(
+    "compaction_cron_trigger",
+    Array.isArray(crons) && crons.length > 0 && crons.every((c) => typeof c === "string" && c.trim() !== ""),
+    true,
+    `triggers.crons=${JSON.stringify(crons ?? null)} (the compaction backstop trigger)`,
+  );
 
   const r2 = cfg.r2_buckets ?? [];
   add(
@@ -301,6 +352,15 @@ export function validateWranglerConfig(
     !("BURSTEL_API_TOKEN" in vars) && !("BURSTEL_INTERNAL_TOKEN" in vars),
     true,
     "admin/internal tokens must be Worker secrets, not plaintext vars",
+  );
+  // Destructive GC must stay opt-in: a default-on retention/GC can never be
+  // shipped accidentally (spec 018).
+  const gc = vars["COMPACTION_GC"];
+  add(
+    "compaction_gc_opt_in",
+    gc === undefined || gc === false || gc === 0 || gc === "0" || gc === "",
+    true,
+    `COMPACTION_GC=${JSON.stringify(gc ?? null)} must be disabled (0/false/empty) by default`,
   );
 
   return checks;

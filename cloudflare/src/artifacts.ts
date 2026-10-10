@@ -11,6 +11,10 @@ export interface R2ObjectLike {
   key: string;
   size: number;
   etag?: string;
+  /** Lowercase hex SHA-256 when the runtime exposes it. */
+  sha256?: string;
+  /** Object custom metadata (the DO writes `sha256` here on segment PUT). */
+  customMetadata?: Record<string, string>;
 }
 
 export interface R2UploadedPartLike {
@@ -49,6 +53,13 @@ export interface R2BucketLike {
     options?: R2PutOptionsLike,
   ): Promise<R2ObjectLike | null>;
   get(key: string): Promise<R2ObjectBodyLike | null>;
+  /**
+   * Metadata-only lookup. Used by the coordinator to re-verify an uploaded
+   * segment's size/checksum before advertising it (spec 018). Optional so the
+   * pure unit-test fakes that never publish segments can omit it.
+   */
+  head?(key: string): Promise<R2ObjectLike | null>;
+  delete?(key: string): Promise<void>;
   createMultipartUpload(key: string, options?: R2PutOptionsLike): Promise<R2MultipartUploadLike>;
 }
 

@@ -1,8 +1,9 @@
 GO ?= go
 BUN ?= bun
 IMAGE ?= burstel:deploy
+IMAGE_COMPACTOR ?= burstel-compactor:deploy
 
-.PHONY: build test vet fmt tidy run burstel-cli docker clean cf-typecheck cf-test cf-preflight cf-preflight-config cf-smoke cf-multishot-smoke cf-secret-put container-smoke trial trial-smoke
+.PHONY: build test vet fmt tidy run burstel-cli docker docker-compactor clean cf-typecheck cf-test cf-preflight cf-preflight-config cf-smoke cf-multishot-smoke cf-secret-put container-smoke compactor-smoke trial trial-smoke
 
 build:
 	$(GO) build -o bin/burstel ./cmd/burstel
@@ -34,6 +35,10 @@ burstel-cli:
 docker:
 	docker build -t burstel:dev .
 
+# Spec 018: the short-lived DO-mediated compactor service image.
+docker-compactor:
+	docker build -f Dockerfile.compactor -t burstel-compactor:dev .
+
 # Phase 2 Cloudflare Worker (see cloudflare/README.md)
 cf-typecheck:
 	cd cloudflare && $(BUN) run typecheck && $(BUN) run typecheck:test
@@ -64,6 +69,10 @@ cf-secret-put:
 # Real linux/amd64 container smoke against an already-built image
 container-smoke:
 	scripts/container-smoke.sh $(IMAGE)
+
+# Spec 018: real linux/amd64 smoke for the compactor image
+compactor-smoke:
+	scripts/compactor-smoke.sh $(IMAGE_COMPACTOR)
 
 # Standalone field trial (Phase 4); see docs/standalone-field-trial.md
 trial:

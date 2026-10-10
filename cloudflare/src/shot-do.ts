@@ -93,7 +93,7 @@ export class ShotDO extends DurableObject<Env> {
   }
 }
 
-function containerPort(env: Env): number {
+export function containerPort(env: { CONTAINER_PORT?: string }): number {
   const raw = env.CONTAINER_PORT;
   const port = raw ? Number.parseInt(raw, 10) : DEFAULT_CONTAINER_PORT;
   return Number.isFinite(port) && port > 0 ? port : DEFAULT_CONTAINER_PORT;
@@ -109,7 +109,7 @@ function createSqlAdapter(sql: SqlStorage): SyncSql {
   };
 }
 
-function requireContainer(ctx: DurableObjectState): ContainerLike {
+export function requireContainer(ctx: DurableObjectState): ContainerLike {
   const container = ctx.container;
   if (!container) {
     return {

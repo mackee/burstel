@@ -20,8 +20,22 @@
   // Spec 014: named instances with push-only tokens. There is no
   // application-level concurrent-recording cap; backend capacity is bounded by
   // the container `max_instances` control below.
+  //
+  // Spec 018 compaction knobs. GC is OFF by default: the compactor always
+  // publishes verified segments, but it only deletes covered raw journal data
+  // when COMPACTION_GC is explicitly enabled.
   "vars": {
-    "MAX_INGEST_BYTES": "8388608"
+    "MAX_INGEST_BYTES": "8388608",
+    "COMPACTION_WINDOW_MS": "60000",
+    "COMPACTION_GRACE_MS": "90000",
+    "COMPACTION_RETENTION_MS": "86400000",
+    "COMPACTION_GC": "0",
+    "COMPACTION_BATCH_OBJECTS": "2048",
+    "COMPACTION_BATCH_BYTES": "33554432",
+    "COMPACTION_MAX_BATCHES": "4",
+    "COMPACTION_TICK_BUDGET_MS": "600000",
+    "COMPACTION_SCHEDULE_MS": "120000",
+    "COMPACTION_LEASE_TTL_MS": "900000"
   },
 
   "containers": [
@@ -36,6 +50,18 @@
       // A limited number of concurrent Container instances; exceeding this is
       // surfaced to clients as a retryable capacity error.
       "max_instances": 10
+    },
+    {
+      // Spec 018: the short-lived, bounded compactor service. It is a distinct
+      // class so it never shares storage, image or lifecycle with ShotDO.
+      "class_name": "CompactorDO",
+      "scheduling_policy": "default",
+      "image": "../Dockerfile.compactor",
+      "image_build_context": "..",
+      "instance_type": "standard-1",
+      // At most one active compactor instance; the fenced lease enforces a
+      // single active compaction per partition regardless.
+      "max_instances": 1
     }
   ],
 
@@ -52,6 +78,10 @@
       {
         "name": "AUTH_DO",
         "class_name": "AuthDO"
+      },
+      {
+        "name": "COMPACTOR_DO",
+        "class_name": "CompactorDO"
       }
     ]
   },
@@ -68,7 +98,18 @@
     "AuthDO": {
       "type": "durable-object",
       "storage": "sqlite"
+    },
+    "CompactorDO": {
+      "type": "durable-object",
+      "storage": "sqlite"
     }
+  },
+
+  // Spec 018: Cron backstop. The CompactorDO's own alarm is the primary
+  // scheduler; this kicks a bounded tick so a lost alarm cannot stall
+  // compaction. Overlapping triggers are safe (fenced lease).
+  "triggers": {
+    "crons": ["*/5 * * * *"]
   },
 
   "r2_buckets": [

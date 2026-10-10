@@ -1,0 +1,47 @@
+# syntax=docker/dockerfile:1
+
+# burstel-compact service image (spec 018). This is the short-lived, bounded
+# compactor Container driven by the CompactorDO coordinator. It never talks to
+# R2 directly: the Durable Object streams bounded raw journal bodies in and
+# streams the immutable segment bytes back out, so no account-wide R2/S3
+# credential is ever injected into the instance. This image is linux/amd64 only
+# (the DuckDB bindings ship a linux-amd64 static library and the build uses cgo).
+FROM golang:1.26-bookworm AS build
+
+WORKDIR /src
+
+# cgo + C++ linker for the DuckDB static library.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends g++ \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ENV CGO_ENABLED=1
+RUN go build -trimpath -ldflags="-s -w" -o /out/burstel-compact ./cmd/burstel-compact
+
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates libstdc++6 \
+  && rm -rf /var/lib/apt/lists/* \
+  && useradd --system --uid 10001 --create-home --shell /usr/sbin/nologin burstel
+
+COPY --from=build /out/burstel-compact /usr/local/bin/burstel-compact
+
+# Scratch space for segment builds; never a mounted bucket and never R2.
+WORKDIR /work
+RUN chown burstel:burstel /work
+USER burstel
+
+EXPOSE 8080
+# BURSTEL_INTERNAL_TOKEN is injected by the CompactorDO at runtime and must be
+# distinct from the admin token. Without it (or the explicit local-development
+# opt-in) the /v1/* routes fail closed, so the image is never left unguarded.
+ENV BURSTEL_ADDR=:8080 \
+    BURSTEL_COMPACT_WORK_DIR=/work
+
+ENTRYPOINT ["/usr/local/bin/burstel-compact", "-serve"]

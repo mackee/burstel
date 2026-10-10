@@ -20,6 +20,7 @@
 //     is never extended by shot creation, stop, queries or telemetry.
 //   * A frozen shot's artifact outlives its (former) credentials by design.
 
+import type { R2BucketLike } from "./artifacts";
 import { badRequest } from "./errors";
 import { errorResponse, json, readJson } from "./http";
 import { InstanceCore, newInstanceToken } from "./instance-core";
@@ -42,6 +43,13 @@ export { constantTimeEqual, sha256Hex } from "./crypto";
 
 /** Name of the singleton coordinator Durable Object. */
 export const INGEST_DO_NAME = "ingest-primary";
+
+/**
+ * How long a logical window shot protects its receive-time range from GC. The
+ * pin is refreshed on start/stop and expires on its own, so a shot can never
+ * protect data forever (spec 018).
+ */
+export const DEFAULT_SHOT_PIN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** One registered shot, as persisted by the coordinator. */
 export interface RegisteredShot {
@@ -71,6 +79,11 @@ export interface WindowCoverage {
   instances: string[];
   late_arrivals?: number;
   log_observed_fallbacks?: number;
+  /**
+   * Un-compacted raw journal objects inside the window. A non-zero count makes
+   * the window explicitly incomplete, never silently empty/complete (spec 018).
+   */
+  pending_journal?: number;
   complete: boolean;
 }
 
@@ -173,6 +186,82 @@ export interface SegmentPublishResult {
   covered_skipped: number;
 }
 
+/** One uncovered raw journal object selected for compaction (spec 018). */
+export interface CompactionObject {
+  key: string;
+  instance_id: string;
+  instance: string;
+  signal: string;
+  size: number;
+  sha256: string;
+  content_type: string;
+  content_encoding: string;
+  received_at: number;
+}
+
+/** One bounded, single-instance receive-time window ready to compact. */
+export interface CompactionBatch {
+  instance_id: string;
+  instance: string;
+  first_received_at: number;
+  last_received_at: number;
+  objects: CompactionObject[];
+}
+
+/** The coordinator's durable answer to "what should be compacted next?". */
+export interface CompactionPlan {
+  batches: CompactionBatch[];
+  pending: number;
+  eligible: number;
+  oldest_pending_age_ms: number | null;
+  watermark: number;
+}
+
+export interface CompactionPlanOptions {
+  grace_ms: number;
+  window_ms: number;
+  max_objects: number;
+  max_bytes: number;
+  max_batches: number;
+  max_scan?: number;
+}
+
+/** A fenced, single-active compaction lease. */
+export interface CompactionLease {
+  ok: boolean;
+  holder: string;
+  fencing: number;
+  expires_at: number;
+  held_by?: string;
+}
+
+export interface CompactionPin {
+  shot_id: string;
+  instance_id: string | null;
+  from_ms: number;
+  to_ms: number;
+  pinned_at: number;
+  expires_at: number | null;
+}
+
+/** One GC candidate: a covered journal object eligible for deletion. */
+export interface GCandidate {
+  key: string;
+  size: number;
+  received_at: number;
+  instance_id: string;
+  segment_key: string;
+}
+
+export interface CompactionResultInput {
+  holder: string;
+  fencing: number;
+  ok: boolean;
+  segments_published?: number;
+  bytes_published?: number;
+  error?: string | null;
+}
+
 export interface IngestCoreDeps {
   sql: SyncSql;
   /** Injectable clock (epoch ms) for deterministic tests. */
@@ -183,6 +272,13 @@ export interface IngestCoreDeps {
   generateInstanceId?: () => string;
   /** Injectable token-id generator for deterministic tests. */
   generateTokenId?: () => string;
+  /**
+   * Durable object bucket (spec 018). When present, `publishSegment` re-verifies
+   * the advertised R2 object's size and checksum itself before it advertises a
+   * segment, so the coordinator can never silently believe an unverified
+   * client-supplied hash. Optional only for pure unit tests.
+   */
+  bucket?: R2BucketLike;
 }
 
 const SCHEMA_STATEMENTS: string[] = [
@@ -256,18 +352,47 @@ const SCHEMA_STATEMENTS: string[] = [
      covered_at  INTEGER NOT NULL
    )`,
   `CREATE INDEX IF NOT EXISTS segment_coverage_segment ON segment_coverage (segment_key)`,
+  // Spec 018: single-active lease per compaction partition. At-least-once
+  // scheduling is fenced by (holder, fencing): a stale holder can never publish
+  // or delete after a newer holder has taken the lease.
+  `CREATE TABLE IF NOT EXISTS compaction_lease (
+     partition  TEXT PRIMARY KEY,
+     holder     TEXT NOT NULL,
+     fencing    INTEGER NOT NULL,
+     expires_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL
+   )`,
+  // Spec 018: durable scheduler health (last success/failure, consecutive
+  // failures). Counters that only ever increase live in `ingest_counters`.
+  `CREATE TABLE IF NOT EXISTS compaction_meta (
+     name  TEXT PRIMARY KEY,
+     value INTEGER NOT NULL
+   )`,
+  // Spec 018: shot pins protect a receive-time range from GC. GC never deletes a
+  // journal object whose segment range overlaps a pin.
+  `CREATE TABLE IF NOT EXISTS segment_pins (
+     shot_id     TEXT NOT NULL,
+     instance_id TEXT,
+     from_ms     INTEGER NOT NULL,
+     to_ms       INTEGER NOT NULL,
+     pinned_at   INTEGER NOT NULL,
+     expires_at  INTEGER
+   )`,
+  `CREATE INDEX IF NOT EXISTS segment_pins_shot ON segment_pins (shot_id)`,
 ];
 
 export class IngestCore {
   private readonly sql: SyncSql;
   private readonly now: () => number;
   private readonly instances: InstanceCore;
+  private readonly bucket?: R2BucketLike;
   private loaded = false;
   private loading?: Promise<void>;
 
   constructor(deps: IngestCoreDeps) {
     this.sql = deps.sql;
     this.now = deps.now ?? (() => Date.now());
+    this.bucket = deps.bucket;
     this.instances = new InstanceCore({
       sql: deps.sql,
       now: deps.now,
@@ -286,6 +411,8 @@ export class IngestCore {
       `ALTER TABLE shot_registry ADD COLUMN window_json TEXT`,
       `ALTER TABLE shot_registry ADD COLUMN query_watermark_ms INTEGER`,
       `ALTER TABLE shot_registry ADD COLUMN coverage_json TEXT`,
+      // Additive migration for a segment_pins table created before TTL support.
+      `ALTER TABLE segment_pins ADD COLUMN expires_at INTEGER`,
     ]) {
       try {
         this.sql.exec(stmt);
@@ -417,6 +544,8 @@ export class IngestCore {
     const coverage = normalizeCoverage(input.coverage, window.instances);
     const state = coverage.complete ? "ready" : "incomplete";
     this.upsertWindowRow(input.shot_id, input.owner, window, state, coverage, input.metadata);
+    // Protect the shot's receive-time range from GC (TTL-bounded).
+    await this.addPin(input.shot_id, null, window.start_ms, window.end_ms, DEFAULT_SHOT_PIN_TTL_MS);
     const row = this.getShotRecord(input.shot_id);
     if (!row) throw new Error("failed to persist window shot");
     return row;
@@ -437,6 +566,7 @@ export class IngestCore {
       complete: false,
     };
     this.upsertWindowRow(input.shot_id, input.owner, window, "open", coverage, input.metadata);
+    await this.addPin(input.shot_id, null, window.start_ms, window.end_ms, DEFAULT_SHOT_PIN_TTL_MS);
     const row = this.getShotRecord(input.shot_id);
     if (!row) throw new Error("failed to persist window shot");
     return row;
@@ -488,6 +618,8 @@ export class IngestCore {
       JSON.stringify(coverage),
       shotId,
     );
+    // Refresh the GC pin over the finalized window range (TTL-bounded).
+    await this.addPin(shotId, null, window.start_ms, window.end_ms, DEFAULT_SHOT_PIN_TTL_MS);
     const updated = this.getShotRecord(shotId);
     if (!updated) throw new Error("failed to persist stopped window shot");
     return updated;
@@ -640,6 +772,15 @@ export class IngestCore {
     const validated = validateSegmentPublish(input);
     if (!validated.ok) throw badRequest(validated.error);
 
+    // Spec 018 hardening: never advertise a segment before re-verifying the
+    // stored R2 object ourselves. This closes the gap where a caller could
+    // otherwise assert an unverified size/checksum. Only skipped by pure unit
+    // tests that inject no bucket binding at all.
+    if (this.bucket) {
+      const verified = await verifyStoredSegment(this.bucket, validated.value);
+      if (!verified.ok) throw new Error(verified.error);
+    }
+
     const existing = this.sql
       .exec(`SELECT sha256 FROM segment_manifest WHERE segment_key = ?`, validated.value.segment_key)
       .toArray();
@@ -732,6 +873,393 @@ export class IngestCore {
     return { segments: rows.map(segmentRow), total };
   }
 
+  // ---------------------------------------------------------- compaction
+
+  /**
+   * Selects the next bounded batch of uncovered, finalized raw journal objects,
+   * grouped by instance into receive-time windows. Only rows that are not yet
+   * attributed to a segment and that are older than the grace watermark are
+   * eligible, so a late arrival cannot be silently skipped.
+   */
+  async planCompaction(opts: CompactionPlanOptions): Promise<CompactionPlan> {
+    await this.ensureLoaded();
+    const now = this.now();
+    const watermark = now - Math.max(0, opts.grace_ms);
+    const maxObjects = Math.max(1, opts.max_objects);
+    const maxBytes = Math.max(1, opts.max_bytes);
+    const maxBatches = Math.max(1, opts.max_batches);
+    const maxScan = Math.max(maxObjects, opts.max_scan ?? maxObjects * maxBatches * 4);
+
+    const pendingRow = this.sql
+      .exec(
+        `SELECT COUNT(*) AS n FROM journal_ledger j
+           LEFT JOIN segment_coverage c ON c.journal_key = j.object_key
+          WHERE c.journal_key IS NULL`,
+      )
+      .toArray();
+    const pending = Number(pendingRow[0]?.n ?? 0);
+    const oldestRow = this.sql
+      .exec(
+        `SELECT MIN(j.received_at) AS m FROM journal_ledger j
+           LEFT JOIN segment_coverage c ON c.journal_key = j.object_key
+          WHERE c.journal_key IS NULL`,
+      )
+      .toArray();
+    const oldest = oldestRow[0]?.m == null ? null : Number(oldestRow[0].m);
+
+    const rows = this.sql
+      .exec(
+        `SELECT j.object_key, j.instance_id, j.instance, j.signal, j.size, j.sha256,
+                j.content_type, j.content_encoding, j.received_at
+           FROM journal_ledger j
+           LEFT JOIN segment_coverage c ON c.journal_key = j.object_key
+          WHERE c.journal_key IS NULL AND j.received_at <= ?
+          ORDER BY j.instance_id ASC, j.received_at ASC, j.object_key ASC
+          LIMIT ?`,
+        watermark,
+        maxScan,
+      )
+      .toArray();
+
+    const batches: CompactionBatch[] = [];
+    let cur: CompactionBatch | null = null;
+    let curBytes = 0;
+    for (const row of rows) {
+      if (batches.length >= maxBatches) break;
+      const obj: CompactionObject = {
+        key: String(row.object_key),
+        instance_id: String(row.instance_id),
+        instance: String(row.instance ?? ""),
+        signal: String(row.signal),
+        size: Number(row.size),
+        sha256: String(row.sha256),
+        content_type: String(row.content_type ?? ""),
+        content_encoding: String(row.content_encoding ?? ""),
+        received_at: Number(row.received_at),
+      };
+      const split =
+        cur === null ||
+        cur.instance_id !== obj.instance_id ||
+        obj.received_at - cur.first_received_at >= opts.window_ms ||
+        cur.objects.length >= maxObjects ||
+        curBytes + obj.size > maxBytes;
+      if (split) {
+        if (cur !== null) batches.push(cur);
+        if (batches.length >= maxBatches) break;
+        cur = {
+          instance_id: obj.instance_id,
+          instance: obj.instance,
+          first_received_at: obj.received_at,
+          last_received_at: obj.received_at,
+          objects: [],
+        };
+        curBytes = 0;
+      }
+      cur!.objects.push(obj);
+      cur!.last_received_at = Math.max(cur!.last_received_at, obj.received_at);
+      curBytes += obj.size;
+    }
+    if (cur !== null && batches.length < maxBatches) batches.push(cur);
+
+    return {
+      batches,
+      pending,
+      eligible: rows.length,
+      oldest_pending_age_ms: oldest === null ? null : now - oldest,
+      watermark,
+    };
+  }
+
+  /**
+   * Acquires or renews the single-active compaction lease for a partition. A
+   * live lease held by a different holder is never stolen; an expired lease is
+   * taken over with an incremented fencing token.
+   */
+  async acquireLease(partition: string, holder: string, ttlMs: number): Promise<CompactionLease> {
+    await this.ensureLoaded();
+    const now = this.now();
+    const rows = this.sql
+      .exec(`SELECT holder, fencing, expires_at FROM compaction_lease WHERE partition = ?`, partition)
+      .toArray();
+    if (rows.length > 0) {
+      const existingHolder = String(rows[0]!.holder);
+      const fencing = Number(rows[0]!.fencing);
+      const expiresAt = Number(rows[0]!.expires_at);
+      if (existingHolder !== holder && expiresAt > now) {
+        return { ok: false, holder: existingHolder, fencing, expires_at: expiresAt, held_by: existingHolder };
+      }
+      const next = fencing + 1;
+      this.sql.exec(
+        `UPDATE compaction_lease SET holder = ?, fencing = ?, expires_at = ?, updated_at = ? WHERE partition = ?`,
+        holder,
+        next,
+        now + ttlMs,
+        now,
+        partition,
+      );
+      return { ok: true, holder, fencing: next, expires_at: now + ttlMs };
+    }
+    this.sql.exec(
+      `INSERT INTO compaction_lease (partition, holder, fencing, expires_at, updated_at) VALUES (?,?,?,?,?)`,
+      partition,
+      holder,
+      1,
+      now + ttlMs,
+      now,
+    );
+    return { ok: true, holder, fencing: 1, expires_at: now + ttlMs };
+  }
+
+  /** Releases a lease only when the holder and fencing token still match. */
+  async releaseLease(partition: string, holder: string, fencing: number): Promise<{ released: boolean }> {
+    await this.ensureLoaded();
+    const cursor = this.sql.exec(
+      `DELETE FROM compaction_lease WHERE partition = ? AND holder = ? AND fencing = ?`,
+      partition,
+      holder,
+      fencing,
+    );
+    return { released: (cursor.rowsWritten ?? 0) > 0 };
+  }
+
+  /** Records the outcome of a fenced compaction run (stale holders are ignored). */
+  async recordCompaction(input: CompactionResultInput): Promise<{ ok: boolean; ignored: boolean }> {
+    await this.ensureLoaded();
+    const lease = this.sql
+      .exec(`SELECT holder, fencing FROM compaction_lease WHERE partition = 'primary'`)
+      .toArray();
+    if (lease.length > 0) {
+      const same =
+        String(lease[0]!.holder) === input.holder && Number(lease[0]!.fencing) === input.fencing;
+      if (!same) return { ok: false, ignored: true };
+    }
+    const now = this.now();
+    if (input.ok) {
+      this.setMeta("last_success_at", now);
+      this.setMeta("consecutive_failures", 0);
+      this.bump("compaction_success");
+      if (input.segments_published) this.bump("segments_published", input.segments_published);
+      if (input.bytes_published) this.bump("bytes_published", input.bytes_published);
+    } else {
+      this.setMeta("last_failure_at", now);
+      this.bump("consecutive_failures", 1);
+      this.bump("compaction_failure");
+    }
+    return { ok: true, ignored: false };
+  }
+
+  /**
+   * Counts raw journal objects that are still un-compacted inside a half-open
+   * receive-time range (optionally scoped to instances). Window analysis uses
+   * this to disclose `pending` data rather than silently claiming an empty or
+   * complete window (spec 018).
+   */
+  async pendingJournalInRange(
+    instanceIds: string[],
+    fromMS: number,
+    toMS: number,
+  ): Promise<{ pending_journal: number }> {
+    await this.ensureLoaded();
+    let q = `SELECT COUNT(*) AS n FROM journal_ledger j
+               LEFT JOIN segment_coverage c ON c.journal_key = j.object_key
+              WHERE c.journal_key IS NULL AND j.received_at >= ? AND j.received_at < ?`;
+    const args: SqlValue[] = [fromMS, toMS];
+    if (instanceIds.length > 0) {
+      q += ` AND j.instance_id IN (${instanceIds.map(() => "?").join(",")})`;
+      for (const id of instanceIds) args.push(id);
+    }
+    const rows = this.sql.exec(q, ...args).toArray();
+    return { pending_journal: Number(rows[0]?.n ?? 0) };
+  }
+
+  /** Storage/retention/backlog health for the compaction subsystem. */
+  async compactionStatus(): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    const now = this.now();
+    const pending = Number(
+      this.sql
+        .exec(
+          `SELECT COUNT(*) AS n FROM journal_ledger j
+             LEFT JOIN segment_coverage c ON c.journal_key = j.object_key
+            WHERE c.journal_key IS NULL`,
+        )
+        .toArray()[0]?.n ?? 0,
+    );
+    const oldestRow = this.sql
+      .exec(
+        `SELECT MIN(j.received_at) AS m FROM journal_ledger j
+           LEFT JOIN segment_coverage c ON c.journal_key = j.object_key
+          WHERE c.journal_key IS NULL`,
+      )
+      .toArray();
+    const oldest = oldestRow[0]?.m == null ? null : Number(oldestRow[0].m);
+    const lease = this.sql
+      .exec(`SELECT holder, fencing, expires_at FROM compaction_lease WHERE partition = 'primary'`)
+      .toArray();
+    return {
+      unprocessed_journal: pending,
+      oldest_backlog_age_ms: oldest === null ? null : now - oldest,
+      completed_segments: this.countSegments(),
+      coverage_rows: this.countCoverage(),
+      covered_bytes: Number(
+        this.sql.exec(`SELECT COALESCE(SUM(size_bytes),0) AS n FROM segment_manifest`).toArray()[0]?.n ?? 0,
+      ),
+      journal_bytes: Number(
+        this.sql.exec(`SELECT COALESCE(SUM(size),0) AS n FROM journal_ledger`).toArray()[0]?.n ?? 0,
+      ),
+      late_segments: Number(
+        this.sql.exec(`SELECT COUNT(*) AS n FROM segment_manifest WHERE late = 1`).toArray()[0]?.n ?? 0,
+      ),
+      last_success_at: this.metaValue("last_success_at"),
+      last_failure_at: this.metaValue("last_failure_at"),
+      consecutive_failures: this.metaValue("consecutive_failures") ?? 0,
+      lease:
+        lease.length === 0
+          ? null
+          : {
+              holder: String(lease[0]!.holder),
+              fencing: Number(lease[0]!.fencing),
+              expires_at: Number(lease[0]!.expires_at),
+              expired: Number(lease[0]!.expires_at) <= now,
+            },
+      counters: this.counters(),
+    };
+  }
+
+  /**
+   * Lists covered journal objects eligible for GC. A verified segment must
+   * cover the object, the retention window must have elapsed (unless force) and
+   * the object's segment range must not overlap an active shot pin.
+   */
+  async listGCEligible(opts: {
+    now: number;
+    retention_ms: number;
+    force: boolean;
+    limit: number;
+  }): Promise<{ candidates: GCandidate[]; protected: number; considered: number }> {
+    await this.ensureLoaded();
+    const limit = Math.max(1, Math.min(opts.limit, 5000));
+    const rows = this.sql
+      .exec(
+        `SELECT c.journal_key, j.size, c.received_at, c.instance_id, c.segment_key,
+                s.first_received_at, s.last_received_at
+           FROM segment_coverage c
+           JOIN segment_manifest s ON s.segment_key = c.segment_key
+           JOIN journal_ledger j ON j.object_key = c.journal_key
+          WHERE s.status = 'verified'
+          ORDER BY c.received_at ASC
+          LIMIT ?`,
+        limit,
+      )
+      .toArray();
+    const pins = this.sql
+      .exec(`SELECT shot_id, instance_id, from_ms, to_ms, expires_at FROM segment_pins`)
+      .toArray();
+    const cutoff = opts.now - opts.retention_ms;
+    const candidates: GCandidate[] = [];
+    let protectedCount = 0;
+    for (const row of rows) {
+      const segFirst = Number(row.first_received_at);
+      const segLast = Number(row.last_received_at);
+      const instanceId = String(row.instance_id);
+      if (isPinned(pins, instanceId, segFirst, segLast, opts.now)) {
+        protectedCount += 1;
+        continue;
+      }
+      const receivedAt = Number(row.received_at);
+      if (!opts.force && (opts.retention_ms <= 0 || receivedAt > cutoff)) continue;
+      candidates.push({
+        key: String(row.journal_key),
+        size: Number(row.size),
+        received_at: receivedAt,
+        instance_id: instanceId,
+        segment_key: String(row.segment_key),
+      });
+    }
+    return { candidates, protected: protectedCount, considered: rows.length };
+  }
+
+  /**
+   * Removes the durable ledger rows for covered journal objects. Only objects
+   * already attributed to a *verified* segment may be dropped; a concurrent
+   * re-publish can never resurrect them.
+   */
+  async deleteJournalKeys(keys: string[]): Promise<{ deleted: number }> {
+    await this.ensureLoaded();
+    let deleted = 0;
+    for (const key of keys) {
+      const covered = this.sql
+        .exec(
+          `SELECT 1 AS one FROM segment_coverage c
+             JOIN segment_manifest s ON s.segment_key = c.segment_key
+            WHERE c.journal_key = ? AND s.status = 'verified'`,
+          key,
+        )
+        .toArray();
+      if (covered.length === 0) continue;
+      const cursor = this.sql.exec(`DELETE FROM journal_ledger WHERE object_key = ?`, key);
+      deleted += cursor.rowsWritten ?? 0;
+    }
+    if (deleted > 0) this.bump("gc_deleted", deleted);
+    return { deleted };
+  }
+
+  /**
+   * Protects a receive-time range for a shot from GC. A shot holds at most one
+   * pin (the range is replaced on update) and the pin may carry a TTL so it can
+   * never accumulate forever.
+   */
+  async addPin(
+    shotId: string,
+    instanceId: string | null,
+    fromMS: number,
+    toMS: number,
+    ttlMs?: number,
+  ): Promise<{ pinned: boolean }> {
+    await this.ensureLoaded();
+    const now = this.now();
+    const expiresAt = typeof ttlMs === "number" && ttlMs > 0 ? now + ttlMs : null;
+    this.sql.exec(`DELETE FROM segment_pins WHERE shot_id = ?`, shotId);
+    this.sql.exec(
+      `INSERT INTO segment_pins (shot_id, instance_id, from_ms, to_ms, pinned_at, expires_at) VALUES (?,?,?,?,?,?)`,
+      shotId,
+      instanceId,
+      fromMS,
+      toMS,
+      now,
+      expiresAt,
+    );
+    this.bump("pins_added");
+    return { pinned: true };
+  }
+
+  /** Releases every pin held by a shot (idempotent). */
+  async removePins(shotId: string): Promise<{ removed: number }> {
+    await this.ensureLoaded();
+    const cursor = this.sql.exec(`DELETE FROM segment_pins WHERE shot_id = ?`, shotId);
+    const removed = cursor.rowsWritten ?? 0;
+    if (removed > 0) this.bump("pins_removed", removed);
+    return { removed };
+  }
+
+  async listPins(): Promise<{ pins: CompactionPin[] }> {
+    await this.ensureLoaded();
+    const pins = this.sql
+      .exec(
+        `SELECT shot_id, instance_id, from_ms, to_ms, pinned_at, expires_at FROM segment_pins ORDER BY pinned_at ASC`,
+      )
+      .toArray()
+      .map((row) => ({
+        shot_id: String(row.shot_id),
+        instance_id: row.instance_id == null ? null : String(row.instance_id),
+        from_ms: Number(row.from_ms),
+        to_ms: Number(row.to_ms),
+        pinned_at: Number(row.pinned_at),
+        expires_at: row.expires_at == null ? null : Number(row.expires_at),
+      }));
+    return { pins };
+  }
+
   /** Storage/health summary for the compaction subsystem. */
   async segmentStatus(): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
@@ -811,6 +1339,103 @@ export class IngestCore {
       if (path === "/internal/segment/status") {
         if (request.method !== "GET") return json(405, { error: "method not allowed" });
         return json(200, await this.segmentStatus());
+      }
+      if (path === "/internal/compaction/plan") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<Partial<CompactionPlanOptions>>(request);
+        return json(200, await this.planCompaction(normalizePlanOptions(body)));
+      }
+      if (path === "/internal/compaction/lease") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ partition?: string; holder?: string; ttl_ms?: number }>(request);
+        if (typeof body.holder !== "string" || body.holder === "") {
+          return json(400, { error: "holder is required", code: "bad_request" });
+        }
+        const partition = typeof body.partition === "string" && body.partition !== "" ? body.partition : "primary";
+        const ttl = typeof body.ttl_ms === "number" && body.ttl_ms > 0 ? Math.min(body.ttl_ms, 600_000) : 60_000;
+        return json(200, await this.acquireLease(partition, body.holder, ttl));
+      }
+      if (path === "/internal/compaction/release") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ partition?: string; holder?: string; fencing?: number }>(request);
+        if (typeof body.holder !== "string" || typeof body.fencing !== "number") {
+          return json(400, { error: "holder and fencing are required", code: "bad_request" });
+        }
+        const partition = typeof body.partition === "string" && body.partition !== "" ? body.partition : "primary";
+        return json(200, await this.releaseLease(partition, body.holder, body.fencing));
+      }
+      if (path === "/internal/compaction/result") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<Partial<CompactionResultInput>>(request);
+        if (typeof body.holder !== "string" || typeof body.fencing !== "number") {
+          return json(400, { error: "holder and fencing are required", code: "bad_request" });
+        }
+        return json(
+          200,
+          await this.recordCompaction({
+            holder: body.holder,
+            fencing: body.fencing,
+            ok: body.ok === true,
+            segments_published: numberOrUndefined(body.segments_published),
+            bytes_published: numberOrUndefined(body.bytes_published),
+            error: typeof body.error === "string" ? body.error : null,
+          }),
+        );
+      }
+      if (path === "/internal/compaction/status") {
+        if (request.method !== "GET") return json(405, { error: "method not allowed" });
+        return json(200, await this.compactionStatus());
+      }
+      if (path === "/internal/compaction/pending") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ instance_ids?: string[]; from_ms?: number; to_ms?: number }>(request);
+        const instanceIds = Array.isArray(body.instance_ids)
+          ? body.instance_ids.filter((v): v is string => typeof v === "string")
+          : [];
+        const fromMS = typeof body.from_ms === "number" && Number.isFinite(body.from_ms) ? body.from_ms : 0;
+        const toMS = typeof body.to_ms === "number" && Number.isFinite(body.to_ms) ? body.to_ms : Number.MAX_SAFE_INTEGER;
+        return json(200, await this.pendingJournalInRange(instanceIds, fromMS, toMS));
+      }
+      if (path === "/internal/compaction/gc/list") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ retention_ms?: number; force?: boolean; limit?: number }>(request);
+        const retention = typeof body.retention_ms === "number" ? body.retention_ms : 24 * 60 * 60 * 1000;
+        const limit = typeof body.limit === "number" && body.limit > 0 ? body.limit : 500;
+        return json(200, await this.listGCEligible({ now: this.now(), retention_ms: retention, force: body.force === true, limit }));
+      }
+      if (path === "/internal/compaction/gc/delete") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ keys?: string[] }>(request);
+        const keys = Array.isArray(body.keys) ? body.keys.filter((k): k is string => typeof k === "string") : [];
+        return json(200, await this.deleteJournalKeys(keys));
+      }
+      if (path === "/internal/compaction/pin") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{
+          shot_id?: string;
+          instance_id?: string | null;
+          from_ms?: number;
+          to_ms?: number;
+          ttl_ms?: number;
+        }>(request);
+        if (typeof body.shot_id !== "string" || body.shot_id === "" || typeof body.from_ms !== "number" || typeof body.to_ms !== "number") {
+          return json(400, { error: "shot_id, from_ms and to_ms are required", code: "bad_request" });
+        }
+        const instanceId = typeof body.instance_id === "string" && body.instance_id !== "" ? body.instance_id : null;
+        const ttl = typeof body.ttl_ms === "number" && body.ttl_ms > 0 ? body.ttl_ms : undefined;
+        return json(200, await this.addPin(body.shot_id, instanceId, body.from_ms, body.to_ms, ttl));
+      }
+      if (path === "/internal/compaction/unpin") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ shot_id?: string }>(request);
+        if (typeof body.shot_id !== "string" || body.shot_id === "") {
+          return json(400, { error: "shot_id is required", code: "bad_request" });
+        }
+        return json(200, await this.removePins(body.shot_id));
+      }
+      if (path === "/internal/compaction/pins") {
+        if (request.method !== "GET") return json(405, { error: "method not allowed" });
+        return json(200, await this.listPins());
       }
       if (path === "/internal/shot/register") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
@@ -951,6 +1576,20 @@ export class IngestCore {
     return Number(rows[0]?.n ?? 0);
   }
 
+  private setMeta(name: string, value: number): void {
+    this.sql.exec(
+      `INSERT INTO compaction_meta (name, value) VALUES (?, ?)
+       ON CONFLICT (name) DO UPDATE SET value = excluded.value`,
+      name,
+      value,
+    );
+  }
+
+  private metaValue(name: string): number | null {
+    const rows = this.sql.exec(`SELECT value FROM compaction_meta WHERE name = ?`, name).toArray();
+    return rows.length === 0 ? null : Number(rows[0]!.value);
+  }
+
   private bump(name: string, delta = 1): void {
     this.sql.exec(
       `INSERT INTO ingest_counters (name, value) VALUES (?, ?)
@@ -998,6 +1637,7 @@ function registeredRow(row: SqlRow): WindowShotRecord {
 /** Normalizes a coverage summary; a missing list is never silently complete. */
 export function normalizeCoverage(input: WindowCoverage | undefined, instances: string[]): WindowCoverage {
   const missing = Array.isArray(input?.missing_segments) ? input!.missing_segments.map(String) : [];
+  const pending = numOr(input?.pending_journal, 0);
   const coverage: WindowCoverage = {
     expected_segments: numOr(input?.expected_segments, 0),
     available_segments: numOr(input?.available_segments, 0),
@@ -1005,13 +1645,36 @@ export function normalizeCoverage(input: WindowCoverage | undefined, instances: 
     instances: normalizeInstances(instances.length > 0 ? instances : input?.instances),
     late_arrivals: numOr(input?.late_arrivals, 0),
     log_observed_fallbacks: numOr(input?.log_observed_fallbacks, 0),
-    complete: input?.complete === true && missing.length === 0,
+    pending_journal: pending,
+    complete: input?.complete === true && missing.length === 0 && pending === 0,
   };
   return coverage;
 }
 
 function numOr(v: unknown, fallback: number): number {
   return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : fallback;
+}
+
+function numberOrUndefined(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
+}
+
+/** Bounds a compaction plan request so the coordinator can never over-ask. */
+function normalizePlanOptions(raw: Partial<CompactionPlanOptions> | undefined): CompactionPlanOptions {
+  const bounded = (v: unknown, def: number, max: number): number =>
+    typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.min(v, max) : def;
+  const grace =
+    typeof raw?.grace_ms === "number" && Number.isFinite(raw.grace_ms) && raw.grace_ms >= 0
+      ? Math.min(raw.grace_ms, 24 * 60 * 60 * 1000)
+      : 90_000;
+  return {
+    grace_ms: grace,
+    window_ms: bounded(raw?.window_ms, 60_000, 24 * 60 * 60 * 1000),
+    max_objects: bounded(raw?.max_objects, 2048, 100_000),
+    max_bytes: bounded(raw?.max_bytes, 32 * 1024 * 1024, 512 * 1024 * 1024),
+    max_batches: bounded(raw?.max_batches, 4, 1000),
+    max_scan: bounded(raw?.max_scan, 20_000, 1_000_000),
+  };
 }
 
 function journalRow(row: SqlRow): JournalEntry {
@@ -1137,6 +1800,44 @@ export function validateSegmentPublish(raw: Partial<SegmentPublishInput> | undef
       coverage,
     },
   };
+}
+
+/**
+ * Re-verifies a segment object directly against R2 before it is advertised.
+ * Requires a size match and a stored checksum match; a missing object, a size
+ * mismatch or a checksum mismatch is a hard rejection (spec 018).
+ */
+async function verifyStoredSegment(
+  bucket: R2BucketLike,
+  seg: SegmentPublishInput,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  if (!bucket.head) return { ok: true };
+  const head = await bucket.head(seg.object_key);
+  if (!head) return { ok: false, error: `segment object ${seg.object_key} is not present in R2` };
+  if (head.size !== seg.size_bytes) {
+    return { ok: false, error: `stored segment ${seg.object_key} size mismatch` };
+  }
+  const stored = (head.sha256 ?? head.customMetadata?.["sha256"] ?? "").toLowerCase();
+  if (!stored) {
+    return { ok: false, error: `stored segment ${seg.object_key} has no verifiable checksum` };
+  }
+  if (stored !== seg.sha256.toLowerCase()) {
+    return { ok: false, error: `stored segment ${seg.object_key} checksum mismatch` };
+  }
+  return { ok: true };
+}
+
+/** True when a live pin's receive-time range overlaps a segment's range. */
+function isPinned(pins: SqlRow[], instanceId: string, segFirst: number, segLast: number, now: number): boolean {
+  for (const pin of pins) {
+    const expiresAt = pin.expires_at == null ? null : Number(pin.expires_at);
+    if (expiresAt !== null && expiresAt <= now) continue;
+    const pinInstance = pin.instance_id == null ? null : String(pin.instance_id);
+    if (pinInstance !== null && pinInstance !== instanceId) continue;
+    if (Number(pin.to_ms) < segFirst || Number(pin.from_ms) > segLast) continue;
+    return true;
+  }
+  return false;
 }
 
 function segmentRow(row: SqlRow): SegmentManifestRow {

@@ -893,7 +893,11 @@ func parseJournalKey(key string, o *JournalObject) error {
 	return nil
 }
 
-func segmentKey(instanceID string, firstMS, lastMS int64, srcKeys []string) string {
+// SegmentKey returns the deterministic, content-addressed R2 key of the segment
+// built from exactly these source journal keys for an instance. It is a pure
+// function of the (sorted) source keys and their receive-time range, so a retry
+// after a crash produces the same key and can reuse an already-uploaded object.
+func SegmentKey(instanceID string, firstMS, lastMS int64, srcKeys []string) string {
 	h := sha256.New()
 	for _, k := range srcKeys {
 		io.WriteString(h, k)
@@ -901,6 +905,10 @@ func segmentKey(instanceID string, firstMS, lastMS int64, srcKeys []string) stri
 	}
 	fp := hex.EncodeToString(h.Sum(nil))[:16]
 	return fmt.Sprintf("%s/%s/%d-%d-%s.duckdb", SegmentsPrefix, instanceID, firstMS, lastMS, fp)
+}
+
+func segmentKey(instanceID string, firstMS, lastMS int64, srcKeys []string) string {
+	return SegmentKey(instanceID, firstMS, lastMS, srcKeys)
 }
 
 func shortHash(s string) string {

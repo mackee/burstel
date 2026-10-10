@@ -22,6 +22,11 @@ export interface AuthNamespaceLike {
   getByName(name: string): DoStubLike;
 }
 
+/** Structural subset of `DurableObjectNamespace<CompactorDO>`. */
+export interface CompactorNamespaceLike {
+  getByName(name: string): DoStubLike;
+}
+
 export interface AppEnv {
   SHOT_DO: ShotNamespaceLike;
   INGEST_DO: IngestNamespaceLike;
@@ -31,6 +36,12 @@ export interface AppEnv {
    * non-admin bearer token fails closed (`401`).
    */
   AUTH_DO?: AuthNamespaceLike;
+  /**
+   * Compaction coordinator Durable Object (spec 018). Optional so pure unit
+   * tests that never touch compaction can omit it; when absent the
+   * `compaction_status`/`compaction_run` tools fail closed.
+   */
+  COMPACTOR_DO?: CompactorNamespaceLike;
   /**
    * Durable raw-journal bucket for continuous OTLP intake (spec 014). The
    * trusted R2 bucket binding; every acknowledged export is committed here

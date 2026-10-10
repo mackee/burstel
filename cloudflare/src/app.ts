@@ -45,6 +45,8 @@ import type { Signal } from "./store";
 import {
   analyzeShot,
   compareShots,
+  compactionRun,
+  compactionStatus,
   createInstance,
   createWindowShot,
   dispatchGet,
@@ -186,6 +188,20 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
       const result = await revokeToken(ctx, decodeURIComponent(tokenMatch[1]!));
       if (!result.revoked) throw notFound("token not found");
       return json(200, { revoked: true, id: result.id });
+    }
+
+    // -------------------------------------------------- compaction (spec 018)
+    // Status is available to any authenticated principal; a manual run mutates
+    // the journal/segment lifecycle and is admin-only.
+    if (path === "/api/compaction/status") {
+      if (request.method !== "GET") throw badRequest("method not allowed");
+      return json(200, await compactionStatus(ctx));
+    }
+    if (path === "/api/compaction/run") {
+      if (!isRegistryAdmin(principal)) throw forbidden();
+      if (request.method !== "POST") throw badRequest("method not allowed");
+      const body = await readJson<{ gc?: unknown }>(request).catch(() => ({ gc: false }));
+      return json(200, await compactionRun(ctx, { gc: body.gc === true }));
     }
 
     if (path === "/api/shots") {
@@ -335,6 +351,7 @@ function toolContext(env: AppEnv, url: URL): ToolContext {
     namespace: env.SHOT_DO,
     ingest: env.INGEST_DO,
     auth: env.AUTH_DO,
+    compactor: env.COMPACTOR_DO,
     origin: url.origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
     bucket: env.BUCKET,

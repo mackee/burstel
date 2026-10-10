@@ -109,6 +109,26 @@ describe("wrangler configuration validation", () => {
     const report = finalize(validateWranglerConfig(cfg));
     expect(report.failed_required).toContain("container_image");
   });
+
+  test("requires the spec-018 compactor Container, DO, export and cron trigger", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    cfg.containers = cfg.containers!.filter((c) => c.class_name !== "CompactorDO");
+    cfg.durable_objects!.bindings = cfg.durable_objects!.bindings!.filter((b) => b.name !== "COMPACTOR_DO");
+    delete cfg.exports!["CompactorDO"];
+    cfg.triggers = { crons: [] };
+    const report = finalize(validateWranglerConfig(cfg));
+    expect(report.failed_required).toContain("container_compactordo_singleton");
+    expect(report.failed_required).toContain("do_binding_compactordo");
+    expect(report.failed_required).toContain("export_compactordo_sqlite");
+    expect(report.failed_required).toContain("compaction_cron_trigger");
+  });
+
+  test("rejects a default-on destructive GC", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    cfg.vars = { ...(cfg.vars ?? {}), COMPACTION_GC: "1" };
+    const report = finalize(validateWranglerConfig(cfg));
+    expect(report.failed_required).toContain("compaction_gc_opt_in");
+  });
 });
 
 describe("wrangler whoami / secret / r2 parsing", () => {
@@ -190,6 +210,16 @@ describe("cross-file deployment invariants", () => {
     expect(shotDo).toContain("BURSTEL_ADDR: `:${port}`");
     // The container gets a distinct internal token, never the admin token.
     expect(shotDo).toContain("containerEnv[\"BURSTEL_DEV_INSECURE_AUTH\"]");
+  });
+
+  test("Dockerfile.compactor advertises 8080 and the DO injects BURSTEL_ADDR", () => {
+    const dockerfile = repoFile("../../Dockerfile.compactor");
+    expect(dockerfile).toMatch(/^EXPOSE 8080$/m);
+    expect(dockerfile).toMatch(/^ENV BURSTEL_ADDR=:8080/m);
+    expect(dockerfile).toContain("USER burstel");
+    const compactorDo = repoFile("../src/compactor-do.ts");
+    expect(compactorDo).toContain("BURSTEL_ADDR: `:${port}`");
+    expect(compactorDo).toContain("ctx.storage.setAlarm");
   });
 
   test(".dev.vars is gitignored so real tokens are never committed", () => {

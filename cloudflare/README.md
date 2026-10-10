@@ -305,6 +305,43 @@ crossing spans are always disclosed. Legacy frozen shots remain readable.
 
 See [`docs/adr-005-logical-window-shots.md`](./docs/adr-005-logical-window-shots.md).
 
+## Compaction: journal → verified segments (spec 018)
+
+The compactor is the missing production link between the durable raw journal and
+window analysis. A singleton `CompactorDO` (Container DO, `max_instances: 1`)
+drives the short-lived `burstel-compact` service image
+([`Dockerfile.compactor`](../Dockerfile.compactor)) on a Cron trigger and its own
+DO alarm:
+
+1. acquire a fenced, single-active lease from the `IngestDO` (the durable source
+   of truth — never a local DuckDB manifest);
+2. plan the next bounded batch of *uncovered*, grace-finalized `journal/*`
+   objects, grouped into receive-time windows;
+3. stream their exact bytes into the Container, which reuses
+   `internal/compaction` + the OTLP decoder and returns one immutable DuckDB
+   segment (deterministic key + checksum);
+4. stream the segment bytes straight into R2 (R2 enforces the SHA-256), then
+   HEAD-verify size/checksum;
+5. publish the verified manifest + exact coverage set to the `IngestDO`, which
+   independently re-verifies the stored object before advertising it.
+
+The Container is credential-free: it never receives the admin token, an instance
+token or an R2/S3 key — only a distinct `BURSTEL_INTERNAL_TOKEN`. No account-wide
+R2 credential exists at all. Retries are idempotent (deterministic key, unique
+coverage), and GC is **off by default** (`COMPACTION_GC=0`); when enabled it only
+deletes objects attributed to a *verified* segment and never touches a live shot
+pin. `GET /api/compaction/status` and the MCP `compaction_status` tool report the
+backlog, lease and scheduler; `POST /api/compaction/run` and `compaction_run`
+(admin only) force one bounded tick.
+
+Window analysis needs no manual publish: once a segment is verified, `shot_query`
+/ `shot_analyze` / `shot_compare` stream it from R2 automatically, and a window
+with un-compacted journal is explicitly `incomplete` (with `pending_journal`)
+rather than silently empty.
+
+See [`docs/adr-006-compactor-r2-bridge.md`](./docs/adr-006-compactor-r2-bridge.md)
+and [`docs/cloudflare-018-rollout-runbook.md`](../docs/cloudflare-018-rollout-runbook.md).
+
 ## Lifecycle
 
 ```

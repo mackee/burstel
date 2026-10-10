@@ -16,10 +16,16 @@ import type {
   R2PutOptionsLike,
 } from "../src/artifacts";
 import { AuthCore } from "../src/auth-core";
+import { expectedSegmentKey } from "../src/compactor-core";
 import type { ContainerControl } from "../src/container";
 import type { HeartbeatScheduler, ShotCoreDeps } from "../src/core";
 import { ShotCore } from "../src/core";
-import type { AuthNamespaceLike, DoStubLike, IngestNamespaceLike } from "../src/env";
+import type {
+  AuthNamespaceLike,
+  CompactorNamespaceLike,
+  DoStubLike,
+  IngestNamespaceLike,
+} from "../src/env";
 import { IngestCore } from "../src/ingest-core";
 import type { SqlCursor, SqlRow, SqlValue, SyncSql } from "../src/store";
 
@@ -347,6 +353,132 @@ export class FakeContainer implements ContainerControl {
   }
 }
 
+export interface FakeCompactorOptions {
+  failBuild?: boolean;
+  failDownload?: boolean;
+  /** Return a segment key the coordinator did not ask for. */
+  wrongKey?: boolean;
+  /** Advertise a checksum that does not match the returned bytes. */
+  lieAboutSha?: boolean;
+  /** Claim coverage for journal keys outside the requested batch. */
+  extraCoverage?: boolean;
+}
+
+/**
+ * In-process stand-in for the Go compactor Container (spec 018). It implements
+ * the bounded `/v1/segments` build/download contract and computes the exact
+ * deterministic segment key the Go service would, so the coordinator's
+ * verification logic is exercised without Docker or a Go toolchain.
+ */
+export class FakeCompactorContainer implements ContainerControl {
+  runningFlag = false;
+  started = false;
+  destroyed = false;
+  startEnv: Record<string, string> | undefined;
+  readonly keepAlives: number[] = [];
+  buildCalls = 0;
+  readonly builtObjectCounts: number[] = [];
+
+  private readonly segments = new Map<string, { bytes: Uint8Array; sha: string; key: string }>();
+
+  constructor(private readonly options: FakeCompactorOptions = {}) {}
+
+  get running(): boolean {
+    return this.runningFlag;
+  }
+
+  start(env: Record<string, string>): void {
+    this.started = true;
+    this.startEnv = env;
+    this.runningFlag = true;
+  }
+
+  async ensureReady(): Promise<void> {
+    this.runningFlag = true;
+  }
+
+  async keepAlive(durationMs: number): Promise<void> {
+    this.keepAlives.push(durationMs);
+  }
+
+  async destroy(): Promise<void> {
+    this.destroyed = true;
+    this.runningFlag = false;
+  }
+
+  async request(path: string, init?: RequestInit): Promise<Response> {
+    if (path === "/readyz") return new Response("ready\n", { status: 200 });
+    if (path === "/healthz") return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+
+    const method = init?.method ?? "GET";
+    if (path === "/v1/segments" && method === "POST") {
+      this.buildCalls += 1;
+      if (this.options.failBuild) {
+        return new Response(JSON.stringify({ error: "build failed", code: "build_failed" }), { status: 500 });
+      }
+      const body = init?.body ? (JSON.parse(await textBody(init.body)) as Record<string, unknown>) : {};
+      const objects = (body.objects ?? []) as Array<{ key: string; signal: string; received_at: number }>;
+      this.builtObjectCounts.push(objects.length);
+      const keys = objects.map((o) => o.key);
+      const first = objects.reduce((m, o) => Math.min(m, o.received_at), Number.POSITIVE_INFINITY);
+      const last = objects.reduce((m, o) => Math.max(m, o.received_at), Number.NEGATIVE_INFINITY);
+      let key = await expectedSegmentKey(String(body.instance_id ?? ""), first, last, keys);
+      if (this.options.wrongKey) key = "segments/evil/forged.duckdb";
+      const bytes = new TextEncoder().encode(`duckdb:${key}`);
+      const realSha = await sha256Hex(bytes);
+      const advertisedSha = this.options.lieAboutSha ? await sha256Hex(new Uint8Array([0])) : realSha;
+      const token = `tok-${this.buildCalls}`;
+      this.segments.set(token, { bytes, sha: realSha, key });
+      const coverage = objects.map((o) => ({
+        journal_key: o.key,
+        signal: o.signal,
+        received_at: o.received_at,
+      }));
+      if (this.options.extraCoverage) {
+        coverage.push({ journal_key: "journal/other/traces/1-evil.bin", signal: "traces", received_at: 1 });
+      }
+      return new Response(
+        JSON.stringify({
+          segment_key: key,
+          size_bytes: bytes.byteLength,
+          sha256: advertisedSha,
+          first_received_at: first,
+          last_received_at: last,
+          request_count: objects.length,
+          record_count: objects.length,
+          span_count: 0,
+          log_count: 0,
+          metric_count: 0,
+          event_min_ns: null,
+          event_max_ns: null,
+          coverage,
+          download_token: token,
+        }),
+        { status: 201, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    const match = /^\/v1\/segments\/([^/]+)$/.exec(path);
+    if (match) {
+      const token = decodeURIComponent(match[1]!);
+      if (method === "DELETE") {
+        this.segments.delete(token);
+        return new Response(JSON.stringify({ deleted: true }), { status: 200 });
+      }
+      if (this.options.failDownload) {
+        return new Response(JSON.stringify({ error: "download failed", code: "download_failed" }), { status: 500 });
+      }
+      const seg = this.segments.get(token);
+      if (!seg) return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+      return new Response(seg.bytes, {
+        status: 200,
+        headers: { "content-type": "application/vnd.duckdb", "x-burstel-sha256": seg.sha },
+      });
+    }
+    return new Response("not found", { status: 404 });
+  }
+}
+
 export interface FakeArtifactsOptions {
   failPut?: Error;
 }
@@ -404,13 +536,18 @@ export class FakeBucket implements R2BucketLike {
     this.putCalls += 1;
     if (this.failPut) throw this.failPut;
     const bytes = await coerceBytes(value);
+    const sha = await sha256Hex(bytes);
+    // R2 rejects a PUT whose declared SHA-256 does not match the bytes.
+    if (options?.sha256 && options.sha256.toLowerCase() !== sha) {
+      throw new Error(`R2 sha256 mismatch for ${key}`);
+    }
     this.objects.set(key, {
       bytes,
       contentType: options?.httpMetadata?.contentType,
       customMetadata: options?.customMetadata,
-      sha256: options?.sha256,
+      sha256: sha,
     });
-    return { key, size: bytes.byteLength, etag: `"${key}"` };
+    return { key, size: bytes.byteLength, etag: `"${key}"`, sha256: sha, customMetadata: options?.customMetadata };
   }
 
   async get(key: string): Promise<R2ObjectBodyLike | null> {
@@ -421,10 +558,27 @@ export class FakeBucket implements R2BucketLike {
     return {
       key,
       size: copy.byteLength,
+      sha256: object.sha256,
       body: new Response(copy).body as ReadableStream<Uint8Array>,
       text: async () => new TextDecoder().decode(object.bytes),
       customMetadata: object.customMetadata,
     };
+  }
+
+  async head(key: string): Promise<R2ObjectLike | null> {
+    const object = this.objects.get(key);
+    if (!object) return null;
+    return {
+      key,
+      size: object.bytes.byteLength,
+      etag: `"${key}"`,
+      sha256: object.sha256,
+      customMetadata: object.customMetadata,
+    };
+  }
+
+  async delete(key: string): Promise<void> {
+    this.objects.delete(key);
   }
 
   async createMultipartUpload(): Promise<never> {
@@ -472,6 +626,7 @@ export function makeIngest(
     generateInstanceId?: () => string;
     generateTokenId?: () => string;
     sql?: BunSql;
+    bucket?: R2BucketLike;
   } = {},
 ): IngestHarness {
   const sql = options.sql ?? new BunSql();
@@ -481,6 +636,7 @@ export function makeIngest(
     generateToken: options.generateToken,
     generateInstanceId: options.generateInstanceId,
     generateTokenId: options.generateTokenId,
+    bucket: options.bucket,
   });
   return { core, sql };
 }
@@ -488,6 +644,15 @@ export function makeIngest(
 /** Namespace stand-in for the singleton IngestDO binding. */
 export class FakeIngestNamespace implements IngestNamespaceLike {
   constructor(readonly core: IngestCore) {}
+
+  getByName(): DoStubLike {
+    return { fetch: (request: Request) => this.core.handleInternal(request) };
+  }
+}
+
+/** Namespace stand-in for the singleton CompactorDO binding. */
+export class FakeCompactorNamespace implements CompactorNamespaceLike {
+  constructor(readonly core: { handleInternal(request: Request): Promise<Response> }) {}
 
   getByName(): DoStubLike {
     return { fetch: (request: Request) => this.core.handleInternal(request) };

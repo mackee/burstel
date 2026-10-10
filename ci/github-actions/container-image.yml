@@ -25,22 +25,26 @@ on:
   push:
     paths:
       - "Dockerfile"
+      - "Dockerfile.compactor"
       - ".dockerignore"
       - "go.mod"
       - "go.sum"
       - "cmd/**"
       - "internal/**"
       - "scripts/container-smoke.sh"
+      - "scripts/compactor-smoke.sh"
       - ".github/workflows/container-image.yml"
   pull_request:
     paths:
       - "Dockerfile"
+      - "Dockerfile.compactor"
       - ".dockerignore"
       - "go.mod"
       - "go.sum"
       - "cmd/**"
       - "internal/**"
       - "scripts/container-smoke.sh"
+      - "scripts/compactor-smoke.sh"
       - ".github/workflows/container-image.yml"
   workflow_dispatch:
 
@@ -78,3 +82,29 @@ jobs:
 
       - name: Container smoke (OTLP, freeze, checksum, persistence, nonroot)
         run: scripts/container-smoke.sh burstel:ci
+
+  build-and-smoke-compactor:
+    name: build linux/amd64 compactor image and smoke it
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build linux/amd64 compactor image (real cgo DuckDB link)
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --tag burstel-compactor:ci \
+            -f Dockerfile.compactor \
+            .
+
+      - name: Prove the built image is linux/amd64
+        run: docker image inspect burstel-compactor:ci --format '{{.Os}}/{{.Architecture}}'
+
+      - name: Compactor smoke (health, auth, real segment build, checksum, nonroot)
+        run: scripts/compactor-smoke.sh burstel-compactor:ci
