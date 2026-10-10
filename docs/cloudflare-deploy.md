@@ -32,7 +32,7 @@ runs as the nonroot user `burstel` (uid 10001).
 | --- | --- | --- |
 | `BURSTEL_API_TOKEN` | admin: `/api/*`, `/mcp`, legacy per-shot path | Worker secret |
 | `BURSTEL_INTERNAL_TOKEN` | recorder `/internal/*` defense-in-depth | Worker secret, injected into the container by the `ShotDO` |
-| push-only token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h | minted at runtime by `POST /api/ingest-token`, shown **once** |
+| per-shot push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its shot | minted at runtime by `POST /api/shots` (or `POST /api/shots/{id}/ingest-token`), shown **once** |
 
 Rules (all fail closed): the internal token must be non-empty and **different**
 from the admin token; the admin token is never forwarded to the container; the
@@ -143,17 +143,23 @@ scripts/cloudflare-smoke.sh
 
 `scripts/cloudflare-smoke.sh` is a **small, bounded** E2E (two short shots —
 never a 60/180s benchmark). It checks health, auth boundaries, creates a shot,
-issues the 24h push token once, sends real OTLP traces/metrics/logs through the
-fixed `/ingest` endpoint, freezes, then runs REST query/analyze/schema/compare
-and MCP `tools/list`/`tools/call`, verifies admin/push scope separation, and
-revokes the token. Tokens are read from the environment, passed to curl through
-`--config` process substitution (never argv) and to `cmd/otlpsend` through
-`BURSTEL_PUSH_TOKEN`; they are never echoed, written to the repo, logged, put in
-URLs or CI artifacts. It does not touch an ISUCON host.
+reads the per-shot 24h push token disclosed at creation, sends real OTLP
+traces/metrics/logs through the fixed `/ingest` endpoint, freezes, then runs REST
+query/analyze/schema/compare and MCP `tools/list`/`tools/call`, verifies
+admin/push scope separation, and asserts the retired `/api/ingest-token` endpoint
+returns `410`. `scripts/cloudflare-multishot-smoke.sh` additionally runs two
+**concurrent** shots with distinct tokens and proves per-shot data isolation.
+Tokens are read from the environment, passed to curl through `--config` process
+substitution (never argv) and to `cmd/otlpsend` through `BURSTEL_PUSH_TOKEN`;
+they are never echoed, written to the repo, logged, put in URLs or CI artifacts.
+It does not touch an ISUCON host. Both scripts need a live deploy host and are
+not executed by the offline test suites.
 
 ### Installing the collector token on the ISUCON host (manual)
 
-1. Issue the push token once: `POST /api/ingest-token` (admin auth).
+1. Create the shot (`POST /api/shots`, admin auth); the response discloses its
+   per-shot push token **once** (or mint a replacement at
+   `POST /api/shots/{id}/ingest-token`).
 2. On the benchmark host, set it in the shell/unit environment only:
    `export OTEL_EXPORTER_OTLP_HEADERS="X-Burstel-Token=<token>"` with
    `OTEL_EXPORTER_OTLP_ENDPOINT=https://<host>/ingest`.

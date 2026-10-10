@@ -6,9 +6,10 @@ replace it.
 
 ```
                  public HTTPS                       Worker           coordinator / per-shot DO
- exporter ──► POST /ingest/v1/{traces,metrics,logs} ─► push auth ─► IngestDO ─► active ShotDO ─► Container
- rec client ─► POST /api/shots            ──► admin auth ──────► IngestDO + ShotDO
- rec client ─► POST /api/ingest-token     ──► admin auth ──────► IngestDO (digest + expiry)
+ exporter ──► POST /ingest/v1/{traces,metrics,logs} ─► token→shot ─► IngestDO ─► that shot's ShotDO ─► Container
+ rec client ─► POST /api/shots            ──► admin auth ──────► IngestDO (reserve slot + mint token) + ShotDO
+ rec client ─► POST /api/shots/{id}/ingest-token ─► admin auth ─► IngestDO (per-shot digest + expiry)
+ rec client ─► GET  /api/shots            ──► admin auth ──────► IngestDO (shot registry, ?owner= filter)
  rec client ─► POST /api/shots/{id}/stop  ──► admin auth ──────► ShotDO ─► GET /internal/stop
                                                                     │        GET /internal/artifact
                                                                     ▼
@@ -21,8 +22,9 @@ replace it.
 * `src/app.ts` — public HTTP routes + admin/push auth (whitelist only).
 * `src/shot-do.ts` — `ShotDO extends DurableObject`, wires `ctx.storage.sql`,
   `ctx.container` and the `BUCKET` R2 binding into the core.
-* `src/ingest-do.ts` / `src/ingest-core.ts` — singleton SQLite `IngestDO`: push
-  token digest/expiry and active-shot mapping (pure core, fully unit tested).
+* `src/ingest-do.ts` / `src/ingest-core.ts` — singleton SQLite `IngestDO`:
+  per-shot token digests/expiry (token → shot), the shot registry and the
+  concurrent-recording cap (pure core, fully unit tested).
 * `src/core.ts` — race-safe lifecycle state machine (pure; fully unit tested).
 * `src/store.ts` — SQLite-backed state store over a `SyncSql` seam.
 * `src/artifacts.ts` — streaming single-PUT / bounded multipart R2 freeze.
@@ -30,42 +32,44 @@ replace it.
 
 ## Public HTTP API
 
-Two scopes exist after Phase 5 (spec 006):
+Two scopes exist after Phase 13, Part A:
 
 * **Admin scope** — `Authorization: Bearer <BURSTEL_API_TOKEN>` (or
   `X-Burstel-Token`): all `/api/*` control and analysis routes, `/mcp`, and the
   legacy per-shot ingest path.
-* **Push scope** — a random, admin-issued push-only token (valid exactly 24h):
-  `POST /ingest/v1/{traces,metrics,logs}` only. It is never accepted anywhere
-  else and the admin token is never accepted for `/ingest`.
+* **Push scope** — a per-shot, admin-minted push-only token (valid exactly 24h):
+  `POST /ingest/v1/{traces,metrics,logs}` only, routed to the shot it is bound
+  to. It is never accepted anywhere else and the admin token is never accepted
+  for `/ingest`.
 
 `GET /healthz` is unauthenticated.
 
 | Method | Path | Scope | Description |
 | --- | --- | --- | --- |
 | `GET` | `/healthz` | public | Worker reachability |
-| `POST` | `/api/ingest-token` | admin | Issue/replace the push token. Returns the raw secret **once** plus `issued_at`/`expires_at` (exact 24h). `Cache-Control: no-store`. |
-| `GET` | `/api/ingest-token` | admin | Token status. Never returns the secret or digest. |
-| `DELETE` | `/api/ingest-token` | admin | Revoke the active push token. |
-| `POST` | `/api/shots` | admin | Create a shot and activate it for stable ingest. |
+| `POST` | `/api/ingest-token` | admin | **Retired** (spec 013). Always `410 Gone`; use a per-shot token. |
+| `POST` | `/api/shots` | admin | Create a recording shot, mint its per-shot ingest token (shown once) and reserve a concurrency slot. Optional `owner` (attribution only). |
+| `GET` | `/api/shots` | admin | List shots newest first; optional `?owner=` filter and `?limit=`/`?offset=` pagination. |
 | `GET` | `/api/shots/{id}` | admin | Lifecycle / metadata / counters |
-| `POST` | `/api/shots/{id}/stop` | admin | Idempotent freeze flow; detaches stable ingest |
+| `POST` | `/api/shots/{id}/ingest-token` | admin | Mint an additional per-shot push token (shown once, 24h) |
+| `POST` | `/api/shots/{id}/stop` | admin | Idempotent per-shot freeze; revokes the shot's token after a short grace |
 | `POST` | `/api/shots/{id}/query` | admin | Constrained read-only SQL against the frozen snapshot |
 | `POST` | `/api/shots/{id}/analyze` | admin | SQL-backed analytical summaries |
 | `GET` | `/api/shots/{id}/schema` | admin | Documented queryable schema + safety policy |
 | `POST` | `/api/shots/{id}/compare` | admin | SQL-derived diff with another frozen shot (`{"other":"<id>"}`) |
 | `POST` | `/mcp` | admin | Remote MCP (Streamable HTTP) endpoint |
-| `POST` | `/ingest/v1/traces` | push | Stable OTLP/HTTP ingest (streamed to the active shot) |
-| `POST` | `/ingest/v1/metrics` | push | Stable OTLP/HTTP ingest (streamed to the active shot) |
-| `POST` | `/ingest/v1/logs` | push | Stable OTLP/HTTP ingest (streamed to the active shot) |
+| `POST` | `/ingest/v1/traces` | push | Stable OTLP/HTTP ingest; the token selects the target shot |
+| `POST` | `/ingest/v1/metrics` | push | Stable OTLP/HTTP ingest; the token selects the target shot |
+| `POST` | `/ingest/v1/logs` | push | Stable OTLP/HTTP ingest; the token selects the target shot |
 | `POST` | `/shots/{id}/v1/{traces,metrics,logs}` | admin | **Deprecated** legacy per-shot path, kept for compatibility |
 
-`POST /api/shots` and `GET /api/shots/{id}` return the stable `otlp_base_url`
-plus explicit `otlp_endpoints` for the three signals, e.g.
-`https://<host>/ingest/v1/traces`. The same URL is returned for every shot so a
-collector is configured **once per day**, not once per shot. The deprecated
-per-shot paths are still advertised as `legacy_otlp_base_url` /
-`legacy_otlp_endpoints` and continue to work with the admin token.
+`POST /api/shots`, `POST /api/shots/{id}/ingest-token` and `GET /api/shots/{id}`
+return the stable `otlp_base_url` plus explicit `otlp_endpoints` for the three
+signals, e.g. `https://<host>/ingest/v1/traces`. The endpoint is identical for
+every shot; the **per-shot token** returned once chooses which shot receives the
+data, so several shots can record concurrently. The deprecated per-shot admin
+paths are still advertised as `legacy_otlp_base_url` / `legacy_otlp_endpoints`
+and continue to work with the admin token.
 
 The Go recorder's `/internal/*`, artifact and query endpoints are **never**
 exposed. The Worker only forwards the whitelisted paths above to a Durable
@@ -88,53 +92,61 @@ Object, which reaches the container over its private TCP port.
   `BURSTEL_DEV_INSECURE_AUTH=1` (or `true`/`yes`), which must never be set in
   production. There are no hardcoded credential defaults.
 
-## Stable ingest and the 24h push token (spec 006)
+## Stable ingest and per-shot tokens (spec 013, Part A)
 
-Standard OTel HTTP exporters are configured **once** for a day:
+The endpoint is stable; the **token chooses the shot**. OTel HTTP exporters are
+configured with the URL once and the shot's token:
 
 ```
 OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 OTEL_EXPORTER_OTLP_ENDPOINT=https://<host>/ingest
-OTEL_EXPORTER_OTLP_HEADERS=X-Burstel-Token=<day's push token>
+OTEL_EXPORTER_OTLP_HEADERS=X-Burstel-Token=<this shot's push token>
 ```
 
-The admin issues that token explicitly, at most as often as needed:
+Creating a shot mints its token and returns it exactly once; an additional token
+can be minted explicitly:
 
 ```bash
-curl -fsS -X POST https://<host>/api/ingest-token \
+# token shown once in the create response (`ingest_token`)
+curl -fsS -X POST https://<host>/api/shots \
+  -H "Authorization: Bearer $BURSTEL_API_TOKEN" \
+  -d '{"owner":"alice","metadata":{"scenario":"bench"}}'
+
+# or, later, for an existing shot
+curl -fsS -X POST https://<host>/api/shots/$SHOT/ingest-token \
   -H "Authorization: Bearer $BURSTEL_API_TOKEN"
-# -> {"token":"<secret shown once>","issued_at":"...","expires_at":"...","ttl_seconds":86400}
+# -> {"token":"<secret shown once>","shot_id":"...","issued_at":"...","expires_at":"...","ttl_seconds":86400}
 ```
 
-* The raw secret is returned **exactly once**, is at least 256 bits of CSPRNG
-  and is persisted only as a one-way SHA-256 digest in the SQLite-backed
-  `IngestDO`. It is never written to logs, specs, git history or R2.
-* The token is accepted iff `now < expires_at` where
+* Each token is bound to exactly one shot id; the stable `/ingest` endpoint
+  routes by token, so **several shots record concurrently** and independently.
+  The raw secret is returned **exactly once**, is at least 256 bits of CSPRNG and
+  is persisted only as a one-way SHA-256 digest in the SQLite-backed `IngestDO`.
+  It is never written to logs, specs, git history or R2.
+* A token is accepted iff `now < expires_at` where
   `expires_at = issued_at + 86_400s`. At `expires_at` and later the server
   replies `401` and proxies nothing. Expiry survives Worker/DO eviction because
   it is persisted, and is never extended by shot start/stop, queries or ingest.
-* Issuing a replacement atomically revokes the prior token. Rotation is
-  **refused while a shot is recording** so a benchmark cannot be abruptly cut
-  off; stop the shot first, then rotate.
-* `POST /api/shots` activates the new shot as the stable-ingest target once it
-  is recording. A shot that is already recording is **not** silently displaced:
-  a second `shot_start` returns `409`. `shot_stop` detaches the target, drains
-  in-flight requests and freezes the correct shot, so late signals are never
-  attributed to the next shot.
-* Between shots the exporter may still send background data. The server replies
-  a valid OTLP/HTTP `200` (empty proto message / `{}`) and consciously discards
-  it, labelled `X-Burstel-Disposition: ignored-no-active-shot`; discarded
-  requests are counted in management status. Nothing is stored while no shot is
-  active.
-* **Expiry is about the token, not the shot.** A shot recording when the token
+* Freezing a shot **revokes its token(s)** with a short grace so late but already
+  admitted batches still drain (they reach a non-recording shot and are
+  discarded). After the grace the token fails closed with `401`.
+* `POST /api/shots` reserves a concurrency slot before creating any container
+  state. At most `MAX_CONCURRENT_RECORDING` (Worker var, default `10`) shots may
+  record at once; beyond that the request returns a retryable
+  `503 capacity_exhausted` and leaves no partial state.
+* If a token's shot is not recording (stopped, lost or stopping), the server
+  replies a valid OTLP/HTTP `200` (empty proto message / `{}`) and consciously
+  discards it, labelled `X-Burstel-Disposition: ignored-no-active-shot` (or
+  `ignored-shot-lost`). Discarded requests are counted. Nothing is stored for a
+  non-recording shot.
+* **Expiry is about the token, not the shot.** A shot recording when its token
   expires keeps recording until the admin stops it; frozen shots and their R2
-  artifacts never expire. `GET /api/ingest-token` exposes `expires_at`,
-  `remaining_seconds` and a sub-hour warning so the operator can rotate
-  proactively.
-* Scope separation: the push token cannot call `/api/*`, `/mcp`, `/shots/*` or
-  the legacy per-shot path; the admin token cannot call `/ingest`. Failed
-  authorization is distinguished (missing/invalid/expired/revoked) in safe
-  structured counters on the token status response.
+  artifacts never expire. `GET /api/shots` lists shots (newest first) with an
+  optional `?owner=` attribution filter.
+* `POST /api/ingest-token` is **retired** and returns `410 Gone`. Scope
+  separation: a per-shot token cannot call `/api/*`, `/mcp` or `/shots/*`; the
+  admin token cannot call `/ingest`. Failed authorization is distinguished
+  (missing/invalid/expired/revoked) in safe structured counters.
 
 
 ## Phase 3 — MCP analysis and comparison
@@ -311,24 +323,23 @@ SQL-derived deltas. It also proves the raw OTLP bytes are unchanged.
 Against a real `wrangler dev` (needs a container engine), the same flow is:
 
 ```bash
-# 1. Issue the day's push-only token (once per day, admin auth).
-PUSH=$(curl -fsS -X POST https://<host>/api/ingest-token \
-  -H "Authorization: Bearer $TOKEN" | jq -r .token)
+# 1. Start a shot; its per-shot push token is shown once in the response.
+SHOT=$(curl -fsS -X POST https://<host>/api/shots \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"owner":"alice","metadata":{"scenario":"bench"}}')
+SHOT_ID=$(printf '%s' "$SHOT" | jq -r .shot_id)
+PUSH=$(printf '%s' "$SHOT" | jq -r .ingest_token)
 
-# 2. Configure the exporter ONCE for the day, then keep it fixed.
+# 2. Configure the exporter with the stable URL and this shot's token.
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_EXPORTER_OTLP_ENDPOINT=https://<host>/ingest
 export OTEL_EXPORTER_OTLP_HEADERS="X-Burstel-Token=$PUSH"
 
-# 3. For each benchmark shot, just start/stop; the URL and token never change.
-for i in 1 2 3; do
-  curl -s -H "Authorization: Bearer $TOKEN" -X POST \
-    -d '{"metadata":{"commit":"abc123","scenario":"bench"}}' \
-    https://<host>/api/shots
-  # -> {"shot_id":"...","otlp_base_url":"https://<host>/ingest", ...}
-  # ... run the benchmark so the exporter sends traces/metrics/logs ...
-  curl -s -H "Authorization: Bearer $TOKEN" -X POST https://<host>/api/shots/<id>/stop
-done
+# 3. Run the benchmark so the exporter sends traces/metrics/logs, then stop.
+curl -s -H "Authorization: Bearer $TOKEN" -X POST https://<host>/api/shots/$SHOT_ID/stop
+
+# Multiple shots may record concurrently, each with its own token; list them with
+#   curl -s -H "Authorization: Bearer $TOKEN" 'https://<host>/api/shots?owner=alice'
 
 # 4. Query and analyze any frozen snapshot (no recording container is running).
 curl -s -H "Authorization: Bearer $TOKEN" -X POST \

@@ -1,9 +1,9 @@
 // Command burstel-cli is a small admin client for a deployed burstel Worker.
 //
-// It creates/reads/stops shots, mints and revokes the 24h push-only ingest
+// It creates/reads/lists/stops shots, mints a per-shot 24h push-only ingest
 // token, and runs REST query/analyze/schema/compare against a frozen shot's
-// DuckDB snapshot. The admin token is sent as `Authorization: Bearer`; the
-// push-only token is never accepted here.
+// DuckDB snapshot. The admin token is sent as `Authorization: Bearer`; a
+// per-shot push token is never accepted here.
 //
 // Usage:
 //
@@ -13,9 +13,9 @@
 //
 //	version
 //	health
-//	token issue [--out FILE]     mint the 24h push-only ingest token
-//	token revoke                 revoke the current ingest token
-//	shot start [--metadata k=v ...]
+//	token issue <shot-id> [--out FILE]  mint the shot's 24h push-only ingest token
+//	shot start [--owner NAME] [--metadata k=v ...]
+//	shot list [--owner NAME] [--limit N] [--offset N]
 //	shot get <shot-id>
 //	shot stop <shot-id>
 //	shot query <shot-id> --sql "SELECT ..." [--max-rows N]
@@ -41,6 +41,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -295,21 +296,26 @@ func printJSON(v any) error {
 
 func (c *client) tokenCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("token: expected `issue` or `revoke`")
+		return errors.New("token: expected `issue <shot-id>`")
 	}
 	switch args[0] {
 	case "issue":
-		_, opts, err := parseOpts(args[1:], map[string]bool{"out": true})
+		pos, opts, err := parseOpts(args[1:], map[string]bool{"out": true})
+		if err != nil {
+			return err
+		}
+		shotID, err := oneShotID(pos)
 		if err != nil {
 			return err
 		}
 		var resp struct {
 			Token     string `json:"token"`
+			ShotID    string `json:"shot_id"`
 			IssuedAt  string `json:"issued_at"`
 			ExpiresAt string `json:"expires_at"`
 			TTL       int    `json:"ttl_seconds"`
 		}
-		if err := c.do(http.MethodPost, "/api/ingest-token", nil, &resp); err != nil {
+		if err := c.do(http.MethodPost, "/api/shots/"+shotID+"/ingest-token", nil, &resp); err != nil {
 			return err
 		}
 		if out := last(opts, "out"); out != "" {
@@ -318,11 +324,13 @@ func (c *client) tokenCommand(args []string) error {
 			}
 			fmt.Fprintf(os.Stderr, "wrote token to %s (mode 600)\n", out)
 		}
-		fmt.Fprintf(os.Stderr, "issued_at=%s expires_at=%s ttl_seconds=%d\n", resp.IssuedAt, resp.ExpiresAt, resp.TTL)
+		fmt.Fprintf(os.Stderr, "shot_id=%s issued_at=%s expires_at=%s ttl_seconds=%d\n", shotID, resp.IssuedAt, resp.ExpiresAt, resp.TTL)
 		fmt.Fprintln(os.Stdout, resp.Token)
 		return nil
 	case "revoke":
-		return c.postJSON(http.MethodDelete, "/api/ingest-token", nil)
+		// A per-shot token is revoked automatically when the shot freezes; there
+		// is no installation-wide token to revoke any more.
+		return errors.New("token revoke: per-shot tokens are revoked automatically when the shot freezes")
 	default:
 		return fmt.Errorf("token: unknown action %q", args[0])
 	}
@@ -330,12 +338,12 @@ func (c *client) tokenCommand(args []string) error {
 
 func (c *client) shotCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("shot: expected start|get|stop|query|analyze|schema|compare")
+		return errors.New("shot: expected start|list|get|stop|query|analyze|schema|compare")
 	}
 	action, rest := args[0], args[1:]
 	switch action {
 	case "start":
-		pos, opts, err := parseOpts(rest, map[string]bool{"metadata": true})
+		pos, opts, err := parseOpts(rest, map[string]bool{"metadata": true, "owner": true})
 		if err != nil {
 			return err
 		}
@@ -350,7 +358,38 @@ func (c *client) shotCommand(args []string) error {
 			}
 			meta[key] = val
 		}
-		return c.postJSON(http.MethodPost, "/api/shots", map[string]any{"metadata": meta})
+		body := map[string]any{"metadata": meta}
+		if owner := last(opts, "owner"); owner != "" {
+			body["owner"] = owner
+		}
+		return c.postJSON(http.MethodPost, "/api/shots", body)
+	case "list":
+		pos, opts, err := parseOpts(rest, map[string]bool{"owner": true, "limit": true, "offset": true})
+		if err != nil {
+			return err
+		}
+		if len(pos) != 0 {
+			return fmt.Errorf("shot list: unexpected argument %q", pos[0])
+		}
+		q := url.Values{}
+		if owner := last(opts, "owner"); owner != "" {
+			q.Set("owner", owner)
+		}
+		if n, ok, err := optInt(opts, "limit"); err != nil {
+			return err
+		} else if ok {
+			q.Set("limit", strconv.Itoa(n))
+		}
+		if n, ok, err := optInt(opts, "offset"); err != nil {
+			return err
+		} else if ok {
+			q.Set("offset", strconv.Itoa(n))
+		}
+		path := "/api/shots"
+		if enc := q.Encode(); enc != "" {
+			path += "?" + enc
+		}
+		return c.getJSON(path)
 	case "get", "stop", "schema":
 		pos, _, err := parseOpts(rest, nil)
 		if err != nil {
@@ -460,9 +499,9 @@ Global flags (may appear anywhere):
 Commands:
   version
   health
-  token issue [--out FILE]        mint the 24h push-only ingest token (prints the token)
-  token revoke                    revoke the current ingest token
-  shot start [--metadata k=v ...]
+  token issue <shot-id> [--out FILE]  mint the shot's 24h push-only ingest token (prints the token)
+  shot start [--owner NAME] [--metadata k=v ...]
+  shot list [--owner NAME] [--limit N] [--offset N]
   shot get <shot-id>
   shot stop <shot-id>
   shot query <shot-id> --sql "SELECT ..." [--max-rows N]
@@ -472,8 +511,9 @@ Commands:
 
 Examples:
   export BURSTEL_BASE_URL=https://burstel.example.workers.dev
-  TOKEN=$(burstel-cli token issue)
-  burstel-cli shot start --metadata source=isucON
+  burstel-cli shot start --owner alice --metadata source=isucon
+  burstel-cli shot list --owner alice
+  TOKEN=$(burstel-cli token issue <shot-id>)
   burstel-cli shot stop <shot-id>
   burstel-cli shot query <shot-id> --sql "SELECT span_name, count(*) c FROM spans GROUP BY 1 ORDER BY c DESC" --max-rows 10
 `)

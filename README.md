@@ -18,11 +18,14 @@ R2 / MCP はまだ含まない。収集した DuckDB ファイルを後から SQ
 > 詳細は [`cloudflare/README.md`](./cloudflare/README.md) と
 > [`cloudflare/docs/adr-001-analysis-query-safety.md`](./cloudflare/docs/adr-001-analysis-query-safety.md)。
 >
-> **Stable ingest (spec 006)** は、shot ごとに exporter を再設定する従来フローを
-> やめ、固定の `https://<host>/ingest` と、管理者が 24 時間だけ発行する
-> push 専用トークン (`POST /api/ingest-token`) で複数 shot を連続収集する。
-> 24 時間の期限は **トークン** のもので shot ではない。SQLite バックエンドの
-> `IngestDO` が token の digest と有効期限、アクティブ shot を管理する。詳細は
+> **Stable ingest (spec 006 / spec 013 Part A)** は、shot ごとに exporter を再設定する
+> 従来フローをやめ、固定の `https://<host>/ingest` を使う。管理者が shot 作成時に
+> **shot ごとの** push 専用トークン (24 時間、`POST /api/shots` または
+> `POST /api/shots/{id}/ingest-token` で発行) を一度だけ開示し、トークンがどの shot に
+> 届くかを決めるため複数 shot を同時収集できる。24 時間の期限は **トークン** のもので
+> shot ではない。SQLite バックエンドの `IngestDO` が token の digest、shot registry、
+> 同時 recording 上限 (`MAX_CONCURRENT_RECORDING`) を管理する。旧来の全社トークン
+> `POST /api/ingest-token` は廃止され `410 Gone` を返す。詳細は
 > [`cloudflare/README.md`](./cloudflare/README.md)。
 
 ## できること

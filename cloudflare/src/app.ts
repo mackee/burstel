@@ -6,22 +6,22 @@
 // TCP port.
 //
 //   GET    /healthz                         (public)
-//   POST   /api/ingest-token                (admin) issue/replace push token
-//   GET    /api/ingest-token                (admin) token status, never the secret
-//   DELETE /api/ingest-token                (admin) revoke push token
+//   POST   /api/ingest-token                (admin) retired; 410 Gone
 //   POST   /api/shots                       (admin)
+//   GET    /api/shots                       (admin) list, optional ?owner=
 //   GET    /api/shots/{id}                  (admin)
+//   POST   /api/shots/{id}/ingest-token     (admin) mint per-shot push token
 //   POST   /api/shots/{id}/stop             (admin)
 //   POST   /api/shots/{id}/query            (admin)
 //   POST   /api/shots/{id}/analyze          (admin)
 //   GET    /api/shots/{id}/schema           (admin)
 //   POST   /api/shots/{id}/compare          (admin)
-//   POST   /ingest/v1/{traces,metrics,logs} (push token only)
+//   POST   /ingest/v1/{traces,metrics,logs} (per-shot push token)
 //   POST   /shots/{id}/v1/{traces,metrics,logs} (admin, legacy per-shot path)
 //   POST   /mcp                             (admin)
 
 import { adminAuthenticate, extractToken } from "./auth";
-import { DO_ORIGIN } from "./env";
+import { DO_ORIGIN, maxConcurrentRecording, pagination } from "./env";
 import type { AppEnv, DoStubLike, IngestNamespaceLike, ShotNamespaceLike } from "./env";
 import { badRequest, HttpError, unauthorized } from "./errors";
 import { errorResponse, json, readJson } from "./http";
@@ -33,6 +33,8 @@ import {
   analyzeShot,
   compareShots,
   getShot,
+  listShots,
+  mintShotIngestToken,
   queryShot,
   schemaShot,
   startShot,
@@ -69,15 +71,36 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
       return await handleMcp(request, env);
     }
 
+    // Retired in spec 013: the installation-wide 24h push token is gone. Point
+    // collectors at the per-shot endpoint so the change is explicit.
     if (path === "/api/ingest-token") {
-      return await handleIngestToken(request, env);
+      return json(410, {
+        error:
+          "the installation-wide ingest token was removed; mint a per-shot token with POST /api/shots/{id}/ingest-token",
+        code: "gone",
+      });
     }
 
     const ctx = toolContext(env, url);
 
-    if (request.method === "POST" && path === "/api/shots") {
-      const body = await readJson<{ metadata?: Record<string, unknown> }>(request);
-      return json(201, await startShot(ctx, body.metadata ?? {}));
+    if (path === "/api/shots") {
+      if (request.method === "GET") {
+        const { limit, offset } = pagination(url);
+        const owner = url.searchParams.get("owner") ?? undefined;
+        return json(200, await listShots(ctx, { owner, limit, offset }));
+      }
+      if (request.method === "POST") {
+        const body = await readJson<{ metadata?: Record<string, unknown>; owner?: unknown }>(request);
+        const owner = typeof body.owner === "string" ? body.owner : undefined;
+        return json(201, await startShot(ctx, body.metadata ?? {}, owner));
+      }
+      throw badRequest("method not allowed");
+    }
+
+    const ingestTokenMatch = /^\/api\/shots\/([^/]+)\/ingest-token$/.exec(path);
+    if (ingestTokenMatch) {
+      if (request.method !== "POST") throw badRequest("method not allowed");
+      return json(201, await mintShotIngestToken(ctx, requireShotId(ingestTokenMatch[1]!)));
     }
 
     const statusMatch = /^\/api\/shots\/([^/]+)$/.exec(path);
@@ -149,6 +172,7 @@ function toolContext(env: AppEnv, url: URL): ToolContext {
     ingest: env.INGEST_DO,
     origin: url.origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
+    maxConcurrentRecording: maxConcurrentRecording(env),
   };
 }
 
@@ -169,7 +193,8 @@ async function handleIngest(
       reason: admitted.reason,
     });
   }
-  const shotId = admitted.active_shot_id;
+  // The token is bound to exactly one shot, so it routes there directly.
+  const shotId = admitted.shot_id;
   if (!shotId) {
     return discardResponse(request, "ignored-no-active-shot");
   }
@@ -187,7 +212,6 @@ async function handleIngest(
     const disposition =
       resp.headers.get("x-burstel-disposition") === "ignored-shot-lost" ? "ignored-shot-lost" : "ignored-no-active-shot";
     await resp.body?.cancel().catch(() => undefined);
-    await ingestJson(ingest, "/internal/detach", "POST", { shot_id: shotId, late: true }).catch(() => undefined);
     return discardResponse(request, disposition);
   }
   const out = new Response(resp.body, resp);
@@ -251,25 +275,6 @@ async function forwardLegacyIngest(
   return out;
 }
 
-// --------------------------------------------------------- token lifecycle
-
-async function handleIngestToken(request: Request, env: AppEnv): Promise<Response> {
-  const ingest = ingestStub(env);
-  if (request.method === "POST") {
-    const issued = await ingestJson<Record<string, unknown>>(ingest, "/internal/token/issue", "POST");
-    return json(201, issued);
-  }
-  if (request.method === "GET") {
-    const status = await ingestJson<Record<string, unknown>>(ingest, "/internal/token/status", "GET");
-    return json(200, status);
-  }
-  if (request.method === "DELETE") {
-    const revoked = await ingestJson<Record<string, unknown>>(ingest, "/internal/token/revoke", "DELETE");
-    return json(200, revoked);
-  }
-  throw badRequest("method not allowed");
-}
-
 // ---------------------------------------------------------------- helpers
 
 function ingestStub(env: AppEnv): DoStubLike {
@@ -293,14 +298,16 @@ async function ingestJson<T>(
   }
   let message = `ingest coordinator request failed with status ${resp.status}`;
   let code = "error";
+  let retryable = false;
   try {
-    const parsed = (await resp.json()) as { error?: string; code?: string };
+    const parsed = (await resp.json()) as { error?: string; code?: string; retryable?: boolean };
     if (parsed.error) message = parsed.error;
     if (parsed.code) code = parsed.code;
+    retryable = parsed.retryable === true;
   } catch {
     // keep defaults
   }
-  throw new HttpError(resp.status, message, false, code);
+  throw new HttpError(resp.status, message, retryable, code);
 }
 
 function requireShotId(raw: string): string {

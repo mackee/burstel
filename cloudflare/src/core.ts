@@ -42,6 +42,8 @@ export const METADATA_NAME = "metadata.json";
 export interface ShotInfo {
   shot_id: string;
   state: ShotState;
+  /** Attribution-only principal label; never an authorization boundary. */
+  owner: string;
   created_at: string;
   started_at?: string;
   stopped_at?: string;
@@ -58,6 +60,7 @@ export interface ShotInfo {
 export interface ShotResult {
   shot_id: string;
   state: ShotState;
+  owner: string;
   created_at: string;
   started_at?: string;
   stopped_at?: string;
@@ -195,7 +198,7 @@ export class ShotCore {
 
   // ---------------------------------------------------------------- create
 
-  async create(metadata: Record<string, unknown> = {}): Promise<ShotInfo> {
+  async create(metadata: Record<string, unknown> = {}, owner = "legacy"): Promise<ShotInfo> {
     await this.ensureLoaded();
     this.requireInternalAuth();
     return this.exclusive(async () => {
@@ -219,7 +222,7 @@ export class ShotCore {
           throw conflict("metadata does not match the existing shot");
         }
       } else {
-        this.store.create(this.shotId, metadataJSON, this.now());
+        this.store.create(this.shotId, metadataJSON, this.now(), owner);
         row = this.store.get(this.shotId);
         if (!row) throw new Error("failed to persist new shot");
       }
@@ -689,8 +692,9 @@ export class ShotCore {
       const path = new URL(request.url).pathname;
       if (path === "/internal/create") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
-        const body = await readJson<{ metadata?: Record<string, unknown> }>(request);
-        return json(201, await this.create(body.metadata ?? {}));
+        const body = await readJson<{ metadata?: Record<string, unknown>; owner?: string }>(request);
+        const owner = typeof body.owner === "string" && body.owner.trim() !== "" ? body.owner.trim() : "legacy";
+        return json(201, await this.create(body.metadata ?? {}, owner));
       }
       if (path === "/internal/status") {
         return json(200, await this.status());
@@ -829,6 +833,7 @@ export class ShotCore {
     return {
       shot_id: row.shot_id,
       state: row.state,
+      owner: row.owner,
       created_at: iso(row.created_at),
       started_at: optionalIso(row.started_at),
       stopped_at: optionalIso(row.stopped_at),
@@ -847,6 +852,7 @@ export class ShotCore {
     return {
       shot_id: row.shot_id,
       state: row.state,
+      owner: row.owner,
       created_at: iso(row.created_at),
       started_at: optionalIso(row.started_at),
       stopped_at: optionalIso(row.stopped_at),

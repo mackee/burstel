@@ -1,6 +1,8 @@
 # ADR-002: Stable OTLP `/ingest` with a 24h push-only token
 
-Status: accepted (spec 006)
+Status: accepted (spec 006); **superseded by spec 013, Part A** (the
+installation-wide token is replaced by per-shot tokens; the stable URL and the
+token→shot routing are retained).
 
 ## Context
 

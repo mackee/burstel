@@ -10,7 +10,7 @@ change that introduced it.
 | --- | --- | --- | --- |
 | `BURSTEL_API_TOKEN` | admin: `/api/*`, `/mcp`, legacy per-shot `/shots/{id}` | Worker secret | sent to a container, logged, committed |
 | `BURSTEL_INTERNAL_TOKEN` | recorder `/internal/*` only (defense in depth) | Worker secret **and** injected into the container env by the DO | reused as the admin token, logged, committed |
-| push-only token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h | minted by `POST /api/ingest-token`, returned once | stored raw, logged, used for admin routes |
+| per-shot push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its shot | minted by `POST /api/shots` (or `POST /api/shots/{id}/ingest-token`), returned once | stored raw, logged, used for admin routes |
 
 Requirements, all **fail closed** when violated:
 

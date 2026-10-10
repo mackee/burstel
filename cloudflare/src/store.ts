@@ -49,6 +49,11 @@ export interface FreezeMetadata {
 export interface StateRow {
   shot_id: string;
   state: ShotState;
+  /**
+   * Attribution-only principal label (spec 013). Never an authorization
+   * boundary; existing shots migrate to `"legacy"`.
+   */
+  owner: string;
   metadata_json: string;
   freeze_json: string;
   created_at: number;
@@ -82,6 +87,7 @@ const SCHEMA_STATEMENTS: string[] = [
   `CREATE TABLE IF NOT EXISTS shot_state (
      shot_id       TEXT PRIMARY KEY,
      state         TEXT NOT NULL,
+     owner         TEXT NOT NULL DEFAULT 'legacy',
      metadata_json TEXT NOT NULL DEFAULT '{}',
      freeze_json   TEXT NOT NULL DEFAULT '{}',
      created_at    INTEGER NOT NULL,
@@ -109,6 +115,7 @@ const SCHEMA_STATEMENTS: string[] = [
 
 const STATE_COLUMNS = new Set<string>([
   "state",
+  "owner",
   "metadata_json",
   "freeze_json",
   "started_at",
@@ -127,12 +134,19 @@ export class ShotStore {
     for (const stmt of SCHEMA_STATEMENTS) {
       this.sql.exec(stmt);
     }
+    // Add `owner` to pre-existing shot_state tables. Idempotent: a duplicate
+    // column error means the migration already ran.
+    try {
+      this.sql.exec(`ALTER TABLE shot_state ADD COLUMN owner TEXT NOT NULL DEFAULT 'legacy'`);
+    } catch {
+      // Column already exists.
+    }
   }
 
   get(id: string): StateRow | undefined {
     const rows = this.sql
       .exec(
-        `SELECT shot_id, state, metadata_json, freeze_json, created_at, started_at,
+        `SELECT shot_id, state, owner, metadata_json, freeze_json, created_at, started_at,
                 stopping_at, stopped_at, size_bytes, sha256, last_error
            FROM shot_state WHERE shot_id = ?`,
         id,
@@ -143,19 +157,20 @@ export class ShotStore {
   }
 
   /** Inserts a `created` row. Returns true when a new row was inserted. */
-  create(id: string, metadataJSON: string, now: number): boolean {
+  create(id: string, metadataJSON: string, now: number, owner = "legacy"): boolean {
     const cursor = this.sql.exec(
-      `INSERT INTO shot_state (shot_id, state, metadata_json, created_at)
-       VALUES (?, 'created', ?, ?)
+      `INSERT INTO shot_state (shot_id, state, owner, metadata_json, created_at)
+       VALUES (?, 'created', ?, ?, ?)
        ON CONFLICT (shot_id) DO NOTHING`,
       id,
+      owner,
       metadataJSON,
       now,
     );
     return (cursor.rowsWritten ?? 0) > 0;
   }
 
-  update(id: string, patch: Partial<Pick<StateRow, "state" | "metadata_json" | "freeze_json" | "started_at" | "stopping_at" | "stopped_at" | "size_bytes" | "sha256" | "last_error">>): void {
+  update(id: string, patch: Partial<Pick<StateRow, "state" | "owner" | "metadata_json" | "freeze_json" | "started_at" | "stopping_at" | "stopped_at" | "size_bytes" | "sha256" | "last_error">>): void {
     const entries = Object.entries(patch).filter(([k]) => STATE_COLUMNS.has(k));
     if (entries.length === 0) return;
     const assignments = entries.map(([k]) => `${k} = ?`).join(", ");
@@ -220,6 +235,7 @@ function rowToState(row: SqlRow): StateRow {
   return {
     shot_id: String(row.shot_id),
     state: String(row.state) as ShotState,
+    owner: row.owner == null ? "legacy" : String(row.owner),
     metadata_json: String(row.metadata_json ?? "{}"),
     freeze_json: String(row.freeze_json ?? "{}"),
     created_at: Number(row.created_at),

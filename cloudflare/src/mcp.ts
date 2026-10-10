@@ -11,6 +11,7 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 import { z } from "zod";
 
 import { adminAuthenticate } from "./auth";
+import { maxConcurrentRecording } from "./env";
 import type { AppEnv } from "./env";
 import { unauthorized } from "./errors";
 import { errorMessage } from "./errors";
@@ -48,6 +49,7 @@ function buildServer(env: AppEnv, origin: string): McpServer {
     ingest: env.INGEST_DO,
     origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
+    maxConcurrentRecording: maxConcurrentRecording(env),
   });
 
   server.registerTool(
@@ -55,12 +57,15 @@ function buildServer(env: AppEnv, origin: string): McpServer {
     {
       title: "Start a shot",
       description:
-        "Create a new recording shot and return its id plus the stable OTLP/HTTP ingest URL. metadata may carry the commit SHA, benchmark/scenario and a note. The push token is issued separately from POST /api/ingest-token and is never returned here.",
-      inputSchema: { metadata: z.record(z.string(), z.any()).optional() },
+        "Create a new recording shot and return its id plus the stable OTLP/HTTP ingest URL and a per-shot push token (disclosed once). metadata may carry the commit SHA, benchmark/scenario and a note; owner is an optional attribution label.",
+      inputSchema: {
+        metadata: z.record(z.string(), z.any()).optional(),
+        owner: z.string().optional().describe("Attribution-only owner label; never an authorization boundary"),
+      },
     },
-    async ({ metadata }) => {
+    async ({ metadata, owner }) => {
       try {
-        return ok(await tools.start((metadata ?? {}) as Record<string, unknown>));
+        return ok(await tools.start((metadata ?? {}) as Record<string, unknown>, owner));
       } catch (error) {
         return fail(error);
       }

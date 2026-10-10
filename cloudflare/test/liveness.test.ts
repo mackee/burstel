@@ -197,8 +197,7 @@ describe("stable /ingest and stop with a lost shot", () => {
     const h = makeCore("shotLostE2eAbcdef01");
     await h.core.create({});
     const ingest = makeIngest({ now: () => 1_700_000_000_000, generateToken: () => "blt_lost" });
-    const issued = await ingest.core.issueToken();
-    await ingest.core.activate("shotLostE2eAbcdef01");
+    const issued = await ingest.core.issueShotToken("shotLostE2eAbcdef01");
     const env: AppEnv = {
       SHOT_DO: new CoreNamespace(h),
       INGEST_DO: new FakeIngestNamespace(ingest.core),
@@ -208,8 +207,8 @@ describe("stable /ingest and stop with a lost shot", () => {
     return { h, ingest: ingest.core, env, token: issued.token };
   }
 
-  test("push to a lost shot is acknowledged as a discard and the mapping detached", async () => {
-    const { h, ingest, env, token } = await setup();
+  test("push to a lost shot is acknowledged as a discard", async () => {
+    const { h, env, token } = await setup();
     h.container.runningFlag = false;
     const resp = await handleRequest(
       new Request("https://burstel.example/ingest/v1/traces", {
@@ -221,10 +220,9 @@ describe("stable /ingest and stop with a lost shot", () => {
     );
     expect(resp.status).toBe(200);
     expect(resp.headers.get("x-burstel-disposition")).toBe("ignored-shot-lost");
-    expect((await ingest.active()).shot_id).toBeNull();
   });
 
-  test("admin stop of a lost shot returns shot_lost and frees the stable endpoint", async () => {
+  test("admin stop of a lost shot returns shot_lost and frees the recording slot", async () => {
     const { h, ingest, env } = await setup();
     h.container.runningFlag = false;
     const resp = await handleRequest(
@@ -236,6 +234,7 @@ describe("stable /ingest and stop with a lost shot", () => {
     );
     expect(resp.status).toBe(409);
     expect(((await resp.json()) as { code: string }).code).toBe("shot_lost");
-    expect((await ingest.active()).shot_id).toBeNull();
+    const status = (await ingest.status()) as { recording: number };
+    expect(status.recording).toBe(0);
   });
 });

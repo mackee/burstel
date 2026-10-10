@@ -1,23 +1,29 @@
-// Push-only OTLP ingest token + active-shot coordinator.
+// Per-shot push-only OTLP ingest credentials + shot registry (spec 013, Part A).
 //
 // This core is deliberately free of Cloudflare-specific globals so the exact
 // same logic runs in production (over `IngestDO` SQLite storage) and in unit
-// tests (over `bun:sqlite`). It owns two things:
+// tests (over `bun:sqlite`). It owns:
 //
-//   * one active, admin-issued push-only token, persisted only as a one-way
-//     SHA-256 digest with its exact 24h (`86_400s`) issue/expiry timestamps;
-//   * the installation's active shot mapping so the stable `/ingest` endpoint
-//     always routes to the shot that `shot_start` most recently activated.
+//   * the per-shot push-only ingest tokens: each is bound to exactly one shot
+//     id and persisted only as a one-way SHA-256 digest with its exact 24h
+//     (`86_400s`) issue/expiry timestamps. Several tokens may be valid at once
+//     and route independently (token -> shot);
+//   * the shot registry: which shots exist, their attribution-only `owner` and
+//     the set that is currently recording, so `POST /api/shots` can enforce the
+//     `MAX_CONCURRENT_RECORDING` cap and `GET /api/shots` can list shots.
 //
-// Design boundaries (see spec 006):
-//   * The push token authorizes *only* POST /ingest/v1/{traces,metrics,logs}.
-//     It is never compared against, or treated as, `BURSTEL_API_TOKEN`.
+// Design boundaries:
+//   * A push token authorizes *only* POST /ingest/v1/{traces,metrics,logs}. It
+//     is never compared against, or treated as, `BURSTEL_API_TOKEN`.
 //   * Expiry is evaluated per arriving request against an injectable clock and
 //     is never extended by shot creation, stop, queries or telemetry.
-//   * Expiry never calls `shot_stop`, deletes a shot or expires one; frozen
-//     artifacts outlive the token by design.
+//   * A token is revoked when its shot freezes, with a short grace so batches
+//     already admitted still drain (they reach a non-recording shot, which the
+//     stable `/ingest` forwarder consciously discards). Expiry never calls
+//     `shot_stop`, deletes a shot or expires one; frozen artifacts outlive the
+//     token by design.
 
-import { conflict, HttpError } from "./errors";
+import { capacityExhausted } from "./errors";
 import { errorResponse, json, readJson } from "./http";
 import { SIGNALS } from "./store";
 import type { Signal, SqlRow, SqlValue, SyncSql } from "./store";
@@ -26,38 +32,31 @@ import type { Signal, SqlRow, SqlValue, SyncSql } from "./store";
 export const INGEST_TOKEN_TTL_SECONDS = 86_400;
 export const INGEST_TOKEN_TTL_MS = INGEST_TOKEN_TTL_SECONDS * 1000;
 
+/**
+ * Grace after a shot freezes during which its ingest token is still admitted:
+ * late, previously admitted batches reach a non-recording shot (and are
+ * discarded) instead of being answered with a hard 401.
+ */
+export const INGEST_TOKEN_GRACE_MS = 60_000;
+
 /** Name of the singleton coordinator Durable Object. */
 export const INGEST_DO_NAME = "ingest-primary";
 
 export type IngestRejectReason = "missing" | "invalid" | "expired" | "revoked";
 
-export interface IngestTokenIssue {
+export interface ShotIngestTokenIssue {
   /** Raw secret. Returned exactly once, at issuance. */
   token: string;
+  shot_id: string;
   issued_at: string;
   expires_at: string;
   ttl_seconds: number;
 }
 
-export interface IngestTokenStatus {
-  configured: boolean;
-  active: boolean;
-  revoked: boolean;
-  issued_at?: string;
-  expires_at?: string;
-  ttl_seconds: number;
-  remaining_seconds?: number;
-  expired?: boolean;
-  /** Set when the remaining lifetime is under one hour, for proactive rotation. */
-  warning?: string;
-  active_shot_id: string | null;
-  active_state: string;
-  counters: Record<string, number>;
-}
-
 export interface IngestAdmitSuccess {
   ok: true;
-  active_shot_id: string | null;
+  /** The shot the presented token is bound to. */
+  shot_id: string;
   expires_at: number;
 }
 
@@ -68,6 +67,17 @@ export interface IngestAdmitFailure {
 
 export type IngestAdmitResult = IngestAdmitSuccess | IngestAdmitFailure;
 
+/** One registered shot, as persisted by the coordinator. */
+export interface RegisteredShot {
+  shot_id: string;
+  owner: string;
+  created_at: number;
+  state: string;
+  stopped_at: number | null;
+  size_bytes: number | null;
+  sha256: string | null;
+}
+
 export interface IngestCoreDeps {
   sql: SyncSql;
   /** Injectable clock (epoch ms) for deterministic tests. */
@@ -76,24 +86,30 @@ export interface IngestCoreDeps {
   generateToken?: () => string;
 }
 
-const ACTIVE_STATE_IDLE = "idle";
-const ACTIVE_STATE_RECORDING = "recording";
-
 const SCHEMA_STATEMENTS: string[] = [
-  // Exactly one active token per installation, enforced by `CHECK (id = 1)`.
-  `CREATE TABLE IF NOT EXISTS ingest_token (
-     id         INTEGER PRIMARY KEY CHECK (id = 1),
-     digest     TEXT NOT NULL,
-     issued_at  INTEGER NOT NULL,
-     expires_at INTEGER NOT NULL,
-     revoked    INTEGER NOT NULL DEFAULT 0
+  // Per-shot push tokens, bound to exactly one shot id. Only the digest is
+  // persisted; `grace_until` lets already-admitted batches drain after freeze.
+  `CREATE TABLE IF NOT EXISTS shot_ingest_token (
+     digest      TEXT PRIMARY KEY,
+     shot_id     TEXT NOT NULL,
+     issued_at   INTEGER NOT NULL,
+     expires_at  INTEGER NOT NULL,
+     revoked     INTEGER NOT NULL DEFAULT 0,
+     grace_until INTEGER
    )`,
-  // Exactly one active-shot mapping per installation.
-  `CREATE TABLE IF NOT EXISTS ingest_active (
-     id      INTEGER PRIMARY KEY CHECK (id = 1),
-     shot_id TEXT,
-     state   TEXT NOT NULL DEFAULT 'idle'
+  `CREATE INDEX IF NOT EXISTS shot_ingest_token_shot ON shot_ingest_token (shot_id)`,
+  // The shot registry: attribution-only owner plus enough state for the
+  // concurrency cap and `GET /api/shots` fallbacks.
+  `CREATE TABLE IF NOT EXISTS shot_registry (
+     shot_id    TEXT PRIMARY KEY,
+     owner      TEXT NOT NULL DEFAULT 'legacy',
+     created_at INTEGER NOT NULL,
+     state      TEXT NOT NULL DEFAULT 'recording',
+     stopped_at INTEGER,
+     size_bytes INTEGER,
+     sha256     TEXT
    )`,
+  `CREATE INDEX IF NOT EXISTS shot_registry_created ON shot_registry (created_at)`,
   // Safe structured diagnostics; never contains token material.
   `CREATE TABLE IF NOT EXISTS ingest_counters (
      name  TEXT PRIMARY KEY,
@@ -130,14 +146,10 @@ export function constantTimeEqual(a: string, b: string): boolean {
 
 interface TokenRow {
   digest: string;
-  issued_at: number;
+  shot_id: string;
   expires_at: number;
   revoked: number;
-}
-
-interface ActiveRow {
-  shot_id: string | null;
-  state: string;
+  grace_until: number | null;
 }
 
 export class IngestCore {
@@ -155,10 +167,6 @@ export class IngestCore {
 
   async load(): Promise<void> {
     for (const stmt of SCHEMA_STATEMENTS) this.sql.exec(stmt);
-    this.sql.exec(
-      `INSERT INTO ingest_active (id, shot_id, state) VALUES (1, NULL, 'idle')
-       ON CONFLICT (id) DO NOTHING`,
-    );
     this.loaded = true;
   }
 
@@ -168,100 +176,62 @@ export class IngestCore {
     await this.loading;
   }
 
-  // ---------------------------------------------------------------- token
+  // ----------------------------------------------------------- tokens
 
   /**
-   * Issues a fresh push token, atomically replacing any prior one.
-   *
-   * Rotation is refused while a shot is actively recording so an in-progress
-   * benchmark cannot be abruptly cut off (spec 006). There is no silent
-   * renewal: every issuance is an explicit admin request.
+   * Mints a fresh push token bound to `shotId`, persisted only as a digest.
+   * There is no silent renewal: every issuance is an explicit request and the
+   * token is disclosed exactly once.
    */
-  async issueToken(): Promise<IngestTokenIssue> {
+  async issueShotToken(shotId: string): Promise<ShotIngestTokenIssue> {
     await this.ensureLoaded();
-    const active = this.activeRow();
-    if (active.state === ACTIVE_STATE_RECORDING && active.shot_id) {
-      throw conflict("cannot rotate the ingest token while a shot is recording");
-    }
     const token = this.generateToken();
     const digest = await sha256Hex(token);
     const issuedAt = this.now();
     const expiresAt = issuedAt + INGEST_TOKEN_TTL_MS;
     this.sql.exec(
-      `INSERT INTO ingest_token (id, digest, issued_at, expires_at, revoked)
-       VALUES (1, ?, ?, ?, 0)
-       ON CONFLICT (id) DO UPDATE SET
-         digest = excluded.digest,
-         issued_at = excluded.issued_at,
-         expires_at = excluded.expires_at,
-         revoked = 0`,
+      `INSERT INTO shot_ingest_token (digest, shot_id, issued_at, expires_at, revoked, grace_until)
+       VALUES (?, ?, ?, ?, 0, NULL)`,
       digest,
+      shotId,
       issuedAt,
       expiresAt,
     );
     this.bump("issued");
     return {
       token,
+      shot_id: shotId,
       issued_at: new Date(issuedAt).toISOString(),
       expires_at: new Date(expiresAt).toISOString(),
       ttl_seconds: INGEST_TOKEN_TTL_SECONDS,
     };
   }
 
-  /** Management status. Never contains the raw token or its digest. */
-  async status(): Promise<IngestTokenStatus> {
+  /**
+   * Revokes every active token for a shot (at freeze), leaving a short grace so
+   * already-admitted batches drain into a non-recording shot.
+   */
+  async revokeShotTokens(shotId: string): Promise<{ revoked: number }> {
     await this.ensureLoaded();
-    const row = this.tokenRow();
-    const active = this.activeRow();
-    const now = this.now();
-    if (!row) {
-      return {
-        configured: false,
-        active: false,
-        revoked: false,
-        ttl_seconds: INGEST_TOKEN_TTL_SECONDS,
-        active_shot_id: active.shot_id,
-        active_state: active.state,
-        counters: this.counters(),
-      };
-    }
-    const expiresAt = row.expires_at;
-    const expired = now >= expiresAt;
-    const remainingSeconds = Math.floor((expiresAt - now) / 1000);
-    const status: IngestTokenStatus = {
-      configured: true,
-      active: !row.revoked && !expired,
-      revoked: row.revoked === 1,
-      issued_at: new Date(row.issued_at).toISOString(),
-      expires_at: new Date(expiresAt).toISOString(),
-      ttl_seconds: INGEST_TOKEN_TTL_SECONDS,
-      remaining_seconds: Math.max(0, remainingSeconds),
-      expired,
-      active_shot_id: active.shot_id,
-      active_state: active.state,
-      counters: this.counters(),
-    };
-    if (!row.revoked && !expired && remainingSeconds < 3600) {
-      status.warning = "ingest token expires in less than one hour; issue a replacement";
-    }
-    return status;
-  }
-
-  async revoke(): Promise<{ revoked: boolean; configured: boolean }> {
-    await this.ensureLoaded();
-    const row = this.tokenRow();
-    if (!row) return { revoked: false, configured: false };
-    this.sql.exec(`UPDATE ingest_token SET revoked = 1 WHERE id = 1`);
-    this.bump("revoked_count");
-    return { revoked: true, configured: true };
+    const grace = this.now() + INGEST_TOKEN_GRACE_MS;
+    const cursor = this.sql.exec(
+      `UPDATE shot_ingest_token SET revoked = 1, grace_until = ?
+       WHERE shot_id = ? AND revoked = 0`,
+      grace,
+      shotId,
+    );
+    const revoked = cursor.rowsWritten ?? 0;
+    if (revoked > 0) this.bump("revoked_count", revoked);
+    return { revoked };
   }
 
   /**
-   * Verifies a push token for one signal and resolves the active shot.
+   * Verifies a push token for one signal and resolves the shot it is bound to.
    *
    * Acceptance is exactly `now < expires_at`; at `expires_at` and later the
-   * request is rejected regardless of recording state. Revocation and mismatch
-   * never reveal token material.
+   * request is rejected regardless of recording state. Revocation fails closed
+   * after the freeze grace. Comparison against stored digests is constant-time
+   * and never reveals token material.
    */
   async admit(token: string | null, signal: Signal): Promise<IngestAdmitResult> {
     await this.ensureLoaded();
@@ -270,98 +240,145 @@ export class IngestCore {
       this.bump("missing");
       return { ok: false, reason: "missing" };
     }
-    const row = this.tokenRow();
-    if (!row) {
-      this.bump("invalid");
-      return { ok: false, reason: "invalid" };
-    }
     const digest = await sha256Hex(token);
-    if (!constantTimeEqual(digest, row.digest)) {
+    let match: TokenRow | undefined;
+    for (const row of this.tokenRows()) {
+      if (constantTimeEqual(digest, row.digest)) match = row;
+    }
+    if (!match) {
       this.bump("invalid");
       return { ok: false, reason: "invalid" };
     }
-    if (row.revoked === 1) {
+    const now = this.now();
+    const inGrace = match.grace_until !== null && now < match.grace_until;
+    if (match.revoked === 1 && !inGrace) {
       this.bump("revoked");
       return { ok: false, reason: "revoked" };
     }
-    if (this.now() >= row.expires_at) {
+    if (now >= match.expires_at) {
       this.bump("expired");
       return { ok: false, reason: "expired" };
     }
     this.bump("accepted");
     this.bump(`accepted:${signal}`);
-    const active = this.activeRow();
-    if (!active.shot_id || active.state !== ACTIVE_STATE_RECORDING) {
-      this.bump("discarded_no_active");
-      return { ok: true, active_shot_id: null, expires_at: row.expires_at };
-    }
-    return { ok: true, active_shot_id: active.shot_id, expires_at: row.expires_at };
+    return { ok: true, shot_id: match.shot_id, expires_at: match.expires_at };
   }
 
-  // ------------------------------------------------------------ active shot
+  // ----------------------------------------------------------- registry
 
   /**
-   * Marks a shot as the active ingest target. Refuses to silently displace a
-   * shot that is already recording.
+   * Atomically reserves a recording slot for a freshly created shot, enforcing
+   * the concurrency cap. Throws `503 capacity_exhausted` (retryable) without
+   * writing any state when the cap is reached.
    */
-  async activate(shotId: string): Promise<{ active_shot_id: string }> {
+  async reserveShot(shotId: string, owner: string, max: number): Promise<{ active: number }> {
     await this.ensureLoaded();
-    const active = this.activeRow();
-    if (active.state === ACTIVE_STATE_RECORDING && active.shot_id && active.shot_id !== shotId) {
-      this.bump("conflicts");
-      throw new HttpError(
-        409,
-        "another shot is already recording; stop it before starting a new one",
-        false,
-        "active_shot_recording",
-      );
+    const active = this.countRecording();
+    if (active >= max) {
+      this.bump("capacity_rejected");
+      throw capacityExhausted(max);
     }
     this.sql.exec(
-      `INSERT INTO ingest_active (id, shot_id, state) VALUES (1, ?, 'recording')
-       ON CONFLICT (id) DO UPDATE SET shot_id = excluded.shot_id, state = 'recording'`,
+      `INSERT INTO shot_registry (shot_id, owner, created_at, state)
+       VALUES (?, ?, ?, 'recording')
+       ON CONFLICT (shot_id) DO UPDATE SET owner = excluded.owner, state = 'recording'`,
       shotId,
+      owner,
+      this.now(),
     );
-    this.bump("activated");
-    return { active_shot_id: shotId };
+    this.bump("reserved");
+    return { active: active + 1 };
   }
 
   /**
-   * Detaches the active shot once it stops. `late` counts a request that raced
-   * the stop so it is never attributed to the next shot.
+   * Releases one or more reservations. Used to roll back a failed shot start
+   * (so the cap never leaks) and to reconcile stale `recording` entries whose
+   * ShotDO is gone.
    */
-  async detach(shotId: string, late = false): Promise<{ detached: boolean }> {
+  async releaseShots(shotIds: string[]): Promise<{ released: number }> {
     await this.ensureLoaded();
-    const active = this.activeRow();
-    if (active.shot_id !== shotId) return { detached: false };
-    if (late) this.bump("discarded_late");
-    this.sql.exec(`UPDATE ingest_active SET shot_id = NULL, state = 'idle' WHERE id = 1`);
-    this.bump("detached");
-    return { detached: true };
+    let released = 0;
+    for (const shotId of shotIds) {
+      const cursor = this.sql.exec(`DELETE FROM shot_registry WHERE shot_id = ? AND state = 'recording'`, shotId);
+      released += cursor.rowsWritten ?? 0;
+    }
+    if (released > 0) this.bump("released", released);
+    return { released };
   }
 
-  async active(): Promise<{ shot_id: string | null; state: string }> {
+  /** Records a shot's terminal/observed state so listing and the cap stay true. */
+  async setShotState(
+    shotId: string,
+    state: string,
+    extra: { stopped_at?: number; size_bytes?: number; sha256?: string } = {},
+  ): Promise<{ updated: boolean }> {
     await this.ensureLoaded();
-    return this.activeRow();
+    const cursor = this.sql.exec(
+      `UPDATE shot_registry
+          SET state = ?,
+              stopped_at = COALESCE(?, stopped_at),
+              size_bytes = COALESCE(?, size_bytes),
+              sha256 = COALESCE(?, sha256)
+        WHERE shot_id = ?`,
+      state,
+      extra.stopped_at ?? null,
+      extra.size_bytes ?? null,
+      extra.sha256 ?? null,
+      shotId,
+    );
+    return { updated: (cursor.rowsWritten ?? 0) > 0 };
   }
 
-  // --------------------------------------------------------------- internal
+  /** Shot ids currently registered as recording, for cap reconciliation. */
+  async listRecording(): Promise<{ shots: Array<{ shot_id: string }> }> {
+    await this.ensureLoaded();
+    const shots = this.sql
+      .exec(`SELECT shot_id FROM shot_registry WHERE state = 'recording' ORDER BY created_at ASC`)
+      .toArray()
+      .map((row) => ({ shot_id: String(row.shot_id) }));
+    return { shots };
+  }
+
+  /** Registered shots, newest first, optionally filtered by owner. */
+  async listShots(opts: { owner?: string; limit: number; offset: number }): Promise<{
+    shots: RegisteredShot[];
+    total: number;
+  }> {
+    await this.ensureLoaded();
+    const where = opts.owner ? `WHERE owner = ?` : "";
+    const args: SqlValue[] = opts.owner ? [opts.owner] : [];
+    const totalRows = this.sql.exec(`SELECT COUNT(*) AS n FROM shot_registry ${where}`, ...args).toArray();
+    const total = Number(totalRows[0]?.n ?? 0);
+    const rows = this.sql
+      .exec(
+        `SELECT shot_id, owner, created_at, state, stopped_at, size_bytes, sha256
+           FROM shot_registry ${where}
+          ORDER BY created_at DESC, shot_id DESC
+          LIMIT ? OFFSET ?`,
+        ...args,
+        opts.limit,
+        opts.offset,
+      )
+      .toArray();
+    return { shots: rows.map(registeredRow), total };
+  }
+
+  async status(): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    return {
+      tokens: this.tokenCount(),
+      recording: this.countRecording(),
+      shots: this.countShots(),
+      counters: this.counters(),
+    };
+  }
+
+  // ------------------------------------------------------------- internal
 
   async handleInternal(request: Request): Promise<Response> {
     await this.ensureLoaded();
     try {
       const path = new URL(request.url).pathname;
-      if (path === "/internal/token/issue") {
-        if (request.method !== "POST") return json(405, { error: "method not allowed" });
-        return json(200, await this.issueToken());
-      }
-      if (path === "/internal/token/status") {
-        if (request.method !== "GET") return json(405, { error: "method not allowed" });
-        return json(200, await this.status());
-      }
-      if (path === "/internal/token/revoke") {
-        if (request.method !== "DELETE") return json(405, { error: "method not allowed" });
-        return json(200, await this.revoke());
-      }
       if (path === "/internal/admit") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
         const body = await readJson<{ token?: string | null; signal?: string }>(request);
@@ -370,25 +387,70 @@ export class IngestCore {
         }
         return json(200, await this.admit(body.token ?? null, body.signal as Signal));
       }
-      if (path === "/internal/activate") {
+      if (path === "/internal/shot-token/issue") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
         const body = await readJson<{ shot_id?: string }>(request);
         if (typeof body.shot_id !== "string" || body.shot_id === "") {
           return json(400, { error: "shot_id is required", code: "bad_request" });
         }
-        return json(200, await this.activate(body.shot_id));
+        return json(200, await this.issueShotToken(body.shot_id));
       }
-      if (path === "/internal/detach") {
+      if (path === "/internal/shot-token/revoke") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
-        const body = await readJson<{ shot_id?: string; late?: boolean }>(request);
+        const body = await readJson<{ shot_id?: string }>(request);
         if (typeof body.shot_id !== "string" || body.shot_id === "") {
           return json(400, { error: "shot_id is required", code: "bad_request" });
         }
-        return json(200, await this.detach(body.shot_id, body.late === true));
+        return json(200, await this.revokeShotTokens(body.shot_id));
       }
-      if (path === "/internal/active") {
+      if (path === "/internal/shot/reserve") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ shot_id?: string; owner?: string; max?: number }>(request);
+        if (typeof body.shot_id !== "string" || body.shot_id === "") {
+          return json(400, { error: "shot_id is required", code: "bad_request" });
+        }
+        const max = typeof body.max === "number" && body.max > 0 ? body.max : Number.MAX_SAFE_INTEGER;
+        const owner = typeof body.owner === "string" && body.owner !== "" ? body.owner : "legacy";
+        return json(200, await this.reserveShot(body.shot_id, owner, max));
+      }
+      if (path === "/internal/shot/release") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ shot_id?: string; shot_ids?: string[] }>(request);
+        const ids = body.shot_ids ?? (body.shot_id ? [body.shot_id] : []);
+        if (ids.length === 0) return json(400, { error: "shot_id is required", code: "bad_request" });
+        return json(200, await this.releaseShots(ids));
+      }
+      if (path === "/internal/shot/state") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{
+          shot_id?: string;
+          state?: string;
+          stopped_at?: number;
+          size_bytes?: number;
+          sha256?: string;
+        }>(request);
+        if (typeof body.shot_id !== "string" || typeof body.state !== "string" || body.state === "") {
+          return json(400, { error: "shot_id and state are required", code: "bad_request" });
+        }
+        return json(
+          200,
+          await this.setShotState(body.shot_id, body.state, {
+            stopped_at: body.stopped_at,
+            size_bytes: body.size_bytes,
+            sha256: body.sha256,
+          }),
+        );
+      }
+      if (path === "/internal/shots/recording") {
         if (request.method !== "GET") return json(405, { error: "method not allowed" });
-        return json(200, await this.active());
+        return json(200, await this.listRecording());
+      }
+      if (path === "/internal/shots/list") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ owner?: string; limit?: number; offset?: number }>(request);
+        const limit = typeof body.limit === "number" && body.limit > 0 ? body.limit : 50;
+        const offset = typeof body.offset === "number" && body.offset > 0 ? body.offset : 0;
+        return json(200, await this.listShots({ owner: body.owner, limit, offset }));
       }
       if (path === "/internal/status") {
         if (request.method !== "GET") return json(405, { error: "method not allowed" });
@@ -402,28 +464,35 @@ export class IngestCore {
 
   // ---------------------------------------------------------------- helpers
 
-  private tokenRow(): TokenRow | undefined {
-    const rows = this.sql
-      .exec(`SELECT digest, issued_at, expires_at, revoked FROM ingest_token WHERE id = 1`)
-      .toArray();
-    if (rows.length === 0) return undefined;
-    const row = rows[0]!;
-    return {
-      digest: String(row.digest),
-      issued_at: Number(row.issued_at),
-      expires_at: Number(row.expires_at),
-      revoked: Number(row.revoked ?? 0),
-    };
+  private tokenRows(): TokenRow[] {
+    return this.sql
+      .exec(
+        `SELECT digest, shot_id, expires_at, revoked, grace_until
+           FROM shot_ingest_token`,
+      )
+      .toArray()
+      .map((row) => ({
+        digest: String(row.digest),
+        shot_id: String(row.shot_id),
+        expires_at: Number(row.expires_at),
+        revoked: Number(row.revoked ?? 0),
+        grace_until: row.grace_until == null ? null : Number(row.grace_until),
+      }));
   }
 
-  private activeRow(): ActiveRow {
-    const rows = this.sql.exec(`SELECT shot_id, state FROM ingest_active WHERE id = 1`).toArray();
-    if (rows.length === 0) return { shot_id: null, state: ACTIVE_STATE_IDLE };
-    const row: SqlRow = rows[0]!;
-    return {
-      shot_id: row.shot_id == null ? null : String(row.shot_id),
-      state: row.state == null ? ACTIVE_STATE_IDLE : String(row.state),
-    };
+  private countRecording(): number {
+    const rows = this.sql.exec(`SELECT COUNT(*) AS n FROM shot_registry WHERE state = 'recording'`).toArray();
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  private countShots(): number {
+    const rows = this.sql.exec(`SELECT COUNT(*) AS n FROM shot_registry`).toArray();
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  private tokenCount(): number {
+    const rows = this.sql.exec(`SELECT COUNT(*) AS n FROM shot_ingest_token WHERE revoked = 0`).toArray();
+    return Number(rows[0]?.n ?? 0);
   }
 
   private bump(name: string, delta = 1): void {
@@ -442,4 +511,16 @@ export class IngestCore {
     }
     return out;
   }
+}
+
+function registeredRow(row: SqlRow): RegisteredShot {
+  return {
+    shot_id: String(row.shot_id),
+    owner: row.owner == null ? "legacy" : String(row.owner),
+    created_at: Number(row.created_at),
+    state: String(row.state ?? "recording"),
+    stopped_at: row.stopped_at == null ? null : Number(row.stopped_at),
+    size_bytes: row.size_bytes == null ? null : Number(row.size_bytes),
+    sha256: row.sha256 == null ? null : String(row.sha256),
+  };
 }

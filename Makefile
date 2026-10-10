@@ -2,7 +2,7 @@ GO ?= go
 BUN ?= bun
 IMAGE ?= burstel:deploy
 
-.PHONY: build test vet fmt tidy run burstel-cli docker clean cf-typecheck cf-test cf-preflight cf-preflight-config cf-smoke cf-secret-put container-smoke trial trial-smoke
+.PHONY: build test vet fmt tidy run burstel-cli docker clean cf-typecheck cf-test cf-preflight cf-preflight-config cf-smoke cf-multishot-smoke cf-secret-put container-smoke trial trial-smoke
 
 build:
 	$(GO) build -o bin/burstel ./cmd/burstel
@@ -49,6 +49,10 @@ cf-preflight-config:
 
 cf-smoke:
 	scripts/cloudflare-smoke.sh
+
+# Spec 013 Part A: two concurrent shots with distinct per-shot tokens.
+cf-multishot-smoke:
+	scripts/cloudflare-multishot-smoke.sh
 
 # Generate a strong Worker secret with openssl and put it in one step.
 #   make cf-secret-put NAME=BURSTEL_API_TOKEN

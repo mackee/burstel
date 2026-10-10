@@ -6,8 +6,8 @@
 # It is deliberately small (two short shots, seconds not minutes) and exercises:
 #   * GET /healthz
 #   * anonymous/wrong admin auth is rejected
-#   * POST /api/shots, GET /api/shots/{id}, POST /api/shots/{id}/stop
-#   * POST /api/ingest-token (one-time secret disclosure, exactly 24h)
+#   * POST /api/shots, GET /api/shots, GET /api/shots/{id}, POST /api/shots/{id}/stop
+#   * per-shot ingest tokens disclosed once at shot creation (exactly 24h)
 #   * real OTLP traces + metrics + logs through the fixed /ingest endpoint
 #   * REST query/analyze/schema/compare on the frozen R2 snapshot
 #   * remote MCP tools/list + tools/call
@@ -95,22 +95,16 @@ expect_code 401 "anonymous admin"
 req POST /api/shots '{"metadata":{"source":"smoke"}}' "Authorization: Bearer wrong-token"
 expect_code 401 "wrong admin token"
 
-echo "== issue the push token once (24h) before any shot is recording ==" >&2
-req POST /api/ingest-token "" "$ADMIN"
-expect_code 201 "issue push token"
-PUSH="$(printf '%s' "$BODY" | jget "['token']")"
-TTL="$(printf '%s' "$BODY" | jget "['ttl_seconds']")"
-ISSUED="$(printf '%s' "$BODY" | jget "['issued_at']")"
-EXPIRES="$(printf '%s' "$BODY" | jget "['expires_at']")"
-[ -n "$PUSH" ] || die "push token was not disclosed once"
-[ "$TTL" = "86400" ] || die "push token ttl_seconds=$TTL, want 86400"
-
 echo "== shot A: create -> OTLP -> freeze ==" >&2
 req POST /api/shots "{\"metadata\":{\"source\":\"cloudflare-smoke\",\"ts\":\"$(date +%s)\"}}" "$ADMIN"
 expect_code 201 "create shot A"
 SHOT_A="$(printf '%s' "$BODY" | jget "['shot_id']")"
 OTLP_BASE="$(printf '%s' "$BODY" | jget "['otlp_base_url']")"
+PUSH="$(printf '%s' "$BODY" | jget "['ingest_token']")"
+TTL="$(printf '%s' "$BODY" | jget "['ingest_token_ttl_seconds']")"
 [ -n "$SHOT_A" ] || die "no shot_id returned"
+[ -n "$PUSH" ] || die "shot A did not disclose a per-shot ingest token"
+[ "$TTL" = "86400" ] || die "per-shot token ttl_seconds=$TTL, want 86400"
 case "$OTLP_BASE" in */ingest) ;; *) die "otlp_base_url=$OTLP_BASE is not the fixed /ingest endpoint" ;; esac
 
 # Send the three real fixtures to the fixed /ingest endpoint. The token goes
@@ -159,7 +153,10 @@ echo "== shot B + compare ==" >&2
 req POST /api/shots "{\"metadata\":{\"source\":\"cloudflare-smoke-b\",\"ts\":\"$(date +%s)\"}}" "$ADMIN"
 expect_code 201 "create shot B"
 SHOT_B="$(printf '%s' "$BODY" | jget "['shot_id']")"
-BURSTEL_PUSH_TOKEN="$PUSH" "$OTLPSEND_BIN" -ingest "$BASE" >/dev/null 2>"$WORK/otlpsend-b.err" \
+PUSH_B="$(printf '%s' "$BODY" | jget "['ingest_token']")"
+[ -n "$SHOT_B" ] || die "no shot B id returned"
+[ -n "$PUSH_B" ] || die "shot B did not disclose a per-shot ingest token"
+BURSTEL_PUSH_TOKEN="$PUSH_B" "$OTLPSEND_BIN" -ingest "$BASE" >/dev/null 2>"$WORK/otlpsend-b.err" \
   || die "otlpsend (shot B) failed: $(cat "$WORK/otlpsend-b.err")"
 req POST "/api/shots/$SHOT_B/stop" "" "$ADMIN"
 expect_code 200 "stop shot B"
@@ -181,13 +178,11 @@ mcp "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\
 expect_code 200 "MCP tools/call shot_get"
 printf '%s' "$BODY" | grep -q "$SHOT_A" || die "MCP shot_get did not return shot A"
 
-echo "== revoke push token ==" >&2
-req DELETE /api/ingest-token "" "$ADMIN"
-expect_code 200 "revoke push token"
-req POST /ingest/v1/logs '{}' "X-Burstel-Token: $PUSH"
-expect_code 401 "revoked push token"
+echo "== retired installation-wide token endpoint ==" >&2
+req POST /api/ingest-token "" "$ADMIN"
+expect_code 410 "retired ingest-token endpoint"
 
 cat <<JSON
-{"base_url":"$BASE","healthz":"ok","shot_a":"$SHOT_A","shot_b":"$SHOT_B","frozen_sha256_a":"$SHA_A","push_token_ttl_seconds":$TTL,"otlp_traces_metrics_logs":"sent","rest_query_analyze_compare":"ok","mcp_tools_list_and_call":"ok","scope_separation":"ok","push_token_revoked":true}
+{"base_url":"$BASE","healthz":"ok","shot_a":"$SHOT_A","shot_b":"$SHOT_B","frozen_sha256_a":"$SHA_A","per_shot_token_ttl_seconds":$TTL,"otlp_traces_metrics_logs":"sent","rest_query_analyze_compare":"ok","mcp_tools_list_and_call":"ok","scope_separation":"ok","installation_token_retired":true}
 JSON
 echo "== cloudflare smoke passed (no secret was printed) ==" >&2

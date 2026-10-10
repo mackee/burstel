@@ -1,11 +1,11 @@
-// Spec 008, finding F-2: the shot-stop race at the stable `/ingest` boundary.
+// Spec 013, Part A: the shot-stop race at the stable `/ingest` boundary.
 //
 // A request that is rejected *before* it reaches the recorder (shot stopping /
 // not recording) is provably uncommitted and must be acknowledged with a valid
 // OTLP ExportResponse and discarded. A genuine downstream 503 (storage failure,
 // down container, write timeout) is ambiguous and must be propagated so the
-// exporter retries. These tests pin both directions at the Worker boundary with
-// a canned ShotDO, a real IngestDO coordinator and a deterministic token.
+// exporter retries. The target shot is chosen by the per-shot token, so a
+// discard is never re-attributed to another shot.
 
 import { describe, expect, test } from "bun:test";
 
@@ -54,15 +54,13 @@ async function armed(make: () => Response) {
     PUBLIC_BASE_URL: "https://burstel.example",
     BURSTEL_API_TOKEN: ADMIN,
   };
-  // Issue before activating: rotation is refused while a shot records.
-  const issued = await ingest.core.issueToken();
-  await ingest.core.activate("shot-1");
+  const issued = await ingest.core.issueShotToken("shot-1");
   return { env, ingest: ingest.core, shots, token: issued.token };
 }
 
 describe("shot-stop race at the stable /ingest boundary", () => {
   test("a shot_stopping rejection is discarded with a valid OTLP response", async () => {
-    const { env, ingest, shots, token } = await armed(() =>
+    const { env, shots, token } = await armed(() =>
       json(
         409,
         { error: "shot is stopping", code: "shot_stopping", retryable: false },
@@ -73,23 +71,19 @@ describe("shot-stop race at the stable /ingest boundary", () => {
     const resp = await handleRequest(push(token), env);
     expect(resp.status).toBe(200);
     expect(resp.headers.get("x-burstel-disposition")).toBe("ignored-no-active-shot");
-    // The forwarder reconciles the stale active mapping so late data is never
-    // attributed to the next shot.
-    expect((await ingest.active()).shot_id).toBeNull();
+    expect(shots.calls).toBe(1);
   });
 
-  test("a genuine downstream 503 is propagated and keeps the shot active", async () => {
-    const { env, ingest, token } = await armed(() =>
+  test("a genuine downstream 503 is propagated and keeps routing to that shot", async () => {
+    const { env, shots, token } = await armed(() =>
       json(503, { error: "storage is unavailable", code: "unavailable", retryable: true }),
     );
 
     const resp = await handleRequest(push(token), env);
     expect(resp.status).toBe(503);
     expect(resp.headers.get("x-burstel-disposition")).toBeNull();
-    // No false success: the coordinator still points at the shot so the
-    // exporter's retry is routed correctly.
-    expect((await ingest.active()).shot_id).toBe("shot-1");
     expect(((await resp.json()) as { code: string }).code).toBe("unavailable");
+    expect(shots.calls).toBe(1);
   });
 
   test("a bare 409 (definite pre-commit) is discarded, a 500 is not", async () => {
@@ -106,10 +100,9 @@ describe("shot-stop race at the stable /ingest boundary", () => {
     const e = await handleRequest(push(serverError.token), serverError.env);
     expect(e.status).toBe(500);
     expect(e.headers.get("x-burstel-disposition")).toBeNull();
-    expect((await serverError.ingest.active()).shot_id).toBe("shot-1");
   });
 
-  test("after a discard the next shot receives the traffic, not the old one", async () => {
+  test("a token for another shot routes to its own shot, not the discarded one", async () => {
     const { env, ingest, shots, token } = await armed(() =>
       json(
         409,
@@ -121,18 +114,16 @@ describe("shot-stop race at the stable /ingest boundary", () => {
     expect((await handleRequest(push(token), env)).status).toBe(200);
     expect(shots.calls).toBe(1);
 
-    // A new shot starts recording and is now the stable target; the canned DO
-    // returns a real OTLP 200 so the request is committed to shot-2.
-    await ingest.activate("shot-2");
+    // A second per-shot token routes to shot-2, which accepts the batch.
+    const second = await ingest.issueShotToken("shot-2");
     shots.make = () =>
       new Response(new Uint8Array([0x0a, 0x00]), {
         status: 200,
         headers: { "content-type": "application/x-protobuf" },
       });
-    const routed = await handleRequest(push(token), env);
+    const routed = await handleRequest(push(second.token), env);
     expect(routed.status).toBe(200);
     expect(routed.headers.get("x-burstel-shot-id")).toBe("shot-2");
     expect(shots.calls).toBe(2);
-    expect((await ingest.active()).shot_id).toBe("shot-2");
   });
 });

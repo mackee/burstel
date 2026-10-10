@@ -1,7 +1,8 @@
 {
-  // burstel Phase 2: Worker + one ShotDO (SQLite-backed) + one Container per shot,
+  // burstel: Worker + one ShotDO (SQLite-backed) + one Container per shot,
   // freezing the DuckDB artifact into R2. A singleton SQLite-backed IngestDO
-  // coordinates the push-only /ingest token and the active shot mapping.
+  // coordinates per-shot push-only ingest tokens (token -> shot), the shot
+  // registry and the concurrent-recording cap (spec 013, Part A).
   //
   // The Container uses the well-supported `default` scheduling policy: the image
   // and instance size live here in Wrangler configuration, and the ShotDO starts
@@ -14,6 +15,12 @@
   // Required so `request.signal` reaches a Durable Object `fetch` handler; used
   // to stop forwarding ingest bodies when the client disconnects.
   "compatibility_flags": ["enable_request_signal"],
+
+  // Spec 013 (Part A): at most this many shots may record concurrently.
+  // Exceeding the cap yields a retryable 503 `capacity_exhausted`.
+  "vars": {
+    "MAX_CONCURRENT_RECORDING": "10"
+  },
 
   "containers": [
     {

@@ -40,6 +40,20 @@ export function unavailable(message: string, retryable = true): HttpError {
 }
 
 /**
+ * Concurrent-recording capacity is exhausted: at most `MAX_CONCURRENT_RECORDING`
+ * shots may record at once (spec 013, Part A). Retryable — instances free up as
+ * other shots stop — and produced before any shot/container state is created.
+ */
+export function capacityExhausted(limit: number): HttpError {
+  return new HttpError(
+    503,
+    `concurrent recording capacity exhausted (max ${limit}); retry after a shot stops`,
+    true,
+    "capacity_exhausted",
+  );
+}
+
+/**
  * The shot is stopping, so this request was rejected before it was forwarded
  * to the recorder. Nothing was committed: the caller may acknowledge the OTLP
  * export and consciously discard it.
