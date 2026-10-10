@@ -2,13 +2,14 @@ GO ?= go
 BUN ?= bun
 IMAGE ?= burstel:deploy
 
-.PHONY: build test vet fmt tidy run docker clean cf-typecheck cf-test cf-preflight cf-preflight-config cf-smoke cf-secret-put container-smoke trial trial-smoke
+.PHONY: build test vet fmt tidy run burstel-cli docker clean cf-typecheck cf-test cf-preflight cf-preflight-config cf-smoke cf-secret-put container-smoke trial trial-smoke
 
 build:
 	$(GO) build -o bin/burstel ./cmd/burstel
 	$(GO) build -o bin/burstel-trial ./cmd/burstel-trial
 	$(GO) build -o bin/burstel-inspect ./cmd/burstel-inspect
 	$(GO) build -o bin/otlpsend ./cmd/otlpsend
+	$(GO) build -o bin/burstel-cli ./cmd/burstel-cli
 
 test:
 	$(GO) test ./...
@@ -24,6 +25,10 @@ tidy:
 
 run:
 	$(GO) run ./cmd/burstel
+
+# Admin CLI for a deployed Worker (shot/token/analysis); see cmd/burstel-cli.
+burstel-cli:
+	$(GO) build -o bin/burstel-cli ./cmd/burstel-cli
 
 docker:
 	docker build -t burstel:dev .
