@@ -8,6 +8,7 @@ build:
 	$(GO) build -o bin/burstel ./cmd/burstel
 	$(GO) build -o bin/burstel-trial ./cmd/burstel-trial
 	$(GO) build -o bin/burstel-inspect ./cmd/burstel-inspect
+	$(GO) build -o bin/burstel-compact ./cmd/burstel-compact
 	$(GO) build -o bin/otlpsend ./cmd/otlpsend
 	$(GO) build -o bin/burstel-cli ./cmd/burstel-cli
 

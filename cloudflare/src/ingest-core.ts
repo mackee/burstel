@@ -20,6 +20,7 @@
 //     is never extended by shot creation, stop, queries or telemetry.
 //   * A frozen shot's artifact outlives its (former) credentials by design.
 
+import { badRequest } from "./errors";
 import { errorResponse, json, readJson } from "./http";
 import { InstanceCore, newInstanceToken } from "./instance-core";
 import type { InstanceCoreDeps } from "./instance-core";
@@ -58,6 +59,66 @@ export interface JournalEntry {
   received_at: number;
   /** Set by the coordinator when the row is committed. */
   committed_at?: number;
+}
+
+/** One journal object attributed to a segment by the compactor (spec 015). */
+export interface SegmentCoverageInput {
+  journal_key: string;
+  signal: string;
+  received_at: number;
+}
+
+/**
+ * A publish request from the bounded compactor. The compactor has already
+ * verified the R2 object's size and SHA-256; the coordinator only records the
+ * durable manifest row and its coverage atoms.
+ */
+export interface SegmentPublishInput {
+  segment_key: string;
+  instance_id: string;
+  object_key: string;
+  size_bytes: number;
+  sha256: string;
+  first_received_at: number;
+  last_received_at: number;
+  request_count: number;
+  record_count: number;
+  span_count?: number;
+  log_count?: number;
+  metric_count?: number;
+  event_min_ns?: number | null;
+  event_max_ns?: number | null;
+  late?: boolean;
+  coverage: SegmentCoverageInput[];
+}
+
+/** One durable, advertised segment. */
+export interface SegmentManifestRow {
+  segment_key: string;
+  instance_id: string;
+  object_key: string;
+  size_bytes: number;
+  sha256: string;
+  first_received_at: number;
+  last_received_at: number;
+  request_count: number;
+  record_count: number;
+  span_count: number;
+  log_count: number;
+  metric_count: number;
+  event_min_ns: number | null;
+  event_max_ns: number | null;
+  status: string;
+  late: boolean;
+  created_at: number;
+  verified_at: number | null;
+}
+
+export interface SegmentPublishResult {
+  committed: boolean;
+  duplicate: boolean;
+  covered_new: number;
+  covered_skipped: number;
 }
 
 export interface IngestCoreDeps {
@@ -105,6 +166,39 @@ const SCHEMA_STATEMENTS: string[] = [
      name  TEXT PRIMARY KEY,
      value INTEGER NOT NULL DEFAULT 0
    )`,
+  // Durable segment catalog (spec 015). A row is inserted only after the
+  // compactor has verified the R2 segment object's size and SHA-256.
+  `CREATE TABLE IF NOT EXISTS segment_manifest (
+     segment_key       TEXT PRIMARY KEY,
+     instance_id       TEXT NOT NULL,
+     object_key        TEXT NOT NULL,
+     size_bytes        INTEGER NOT NULL,
+     sha256            TEXT NOT NULL,
+     first_received_at INTEGER NOT NULL,
+     last_received_at  INTEGER NOT NULL,
+     request_count     INTEGER NOT NULL,
+     record_count      INTEGER NOT NULL,
+     span_count        INTEGER NOT NULL DEFAULT 0,
+     log_count         INTEGER NOT NULL DEFAULT 0,
+     metric_count      INTEGER NOT NULL DEFAULT 0,
+     event_min_ns      INTEGER,
+     event_max_ns      INTEGER,
+     status            TEXT NOT NULL,
+     late              INTEGER NOT NULL DEFAULT 0,
+     created_at        INTEGER NOT NULL,
+     verified_at       INTEGER
+   )`,
+  `CREATE INDEX IF NOT EXISTS segment_manifest_instance ON segment_manifest (instance_id, first_received_at)`,
+  // Exactly-once coverage: each raw journal object is attributed to one segment.
+  `CREATE TABLE IF NOT EXISTS segment_coverage (
+     journal_key TEXT PRIMARY KEY,
+     segment_key TEXT NOT NULL,
+     instance_id TEXT NOT NULL,
+     signal      TEXT NOT NULL,
+     received_at INTEGER NOT NULL,
+     covered_at  INTEGER NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS segment_coverage_segment ON segment_coverage (segment_key)`,
 ];
 
 export class IngestCore {
@@ -310,12 +404,140 @@ export class IngestCore {
     return { entries: rows.map(journalRow), total };
   }
 
+  // ------------------------------------------------------------- segments
+
+  /**
+   * Durably publishes a verified segment's manifest row and its coverage atoms.
+   *
+   * The caller (the bounded compactor) must have already re-verified the R2
+   * object's size and SHA-256. Publication is idempotent on `segment_key`: a
+   * repeated publish with the same checksum is a no-op duplicate and can never
+   * create duplicate coverage, because `segment_coverage.journal_key` is a
+   * primary key. A differing checksum for an existing key is a hard conflict.
+   */
+  async publishSegment(input: SegmentPublishInput): Promise<SegmentPublishResult> {
+    await this.ensureLoaded();
+    const validated = validateSegmentPublish(input);
+    if (!validated.ok) throw badRequest(validated.error);
+
+    const existing = this.sql
+      .exec(`SELECT sha256 FROM segment_manifest WHERE segment_key = ?`, validated.value.segment_key)
+      .toArray();
+    if (existing.length > 0) {
+      if (String(existing[0]!.sha256) !== validated.value.sha256) {
+        return Promise.reject(new Error("segment_key already exists with a different checksum"));
+      }
+      this.bump("segment_duplicate");
+      return { committed: false, duplicate: true, covered_new: 0, covered_skipped: 0 };
+    }
+
+    const now = this.now();
+    const seg = validated.value;
+    this.sql.exec(
+      `INSERT INTO segment_manifest
+         (segment_key, instance_id, object_key, size_bytes, sha256, first_received_at, last_received_at,
+          request_count, record_count, span_count, log_count, metric_count, event_min_ns, event_max_ns,
+          status, late, created_at, verified_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'verified', ?, ?, ?)`,
+      seg.segment_key,
+      seg.instance_id,
+      seg.object_key,
+      seg.size_bytes,
+      seg.sha256,
+      seg.first_received_at,
+      seg.last_received_at,
+      seg.request_count,
+      seg.record_count,
+      seg.span_count ?? 0,
+      seg.log_count ?? 0,
+      seg.metric_count ?? 0,
+      seg.event_min_ns ?? null,
+      seg.event_max_ns ?? null,
+      seg.late ? 1 : 0,
+      now,
+      now,
+    );
+
+    let coveredNew = 0;
+    let coveredSkipped = 0;
+    for (const cov of seg.coverage) {
+      const hit = this.sql
+        .exec(`SELECT 1 AS one FROM segment_coverage WHERE journal_key = ?`, cov.journal_key)
+        .toArray();
+      if (hit.length > 0) {
+        coveredSkipped += 1;
+        continue;
+      }
+      this.sql.exec(
+        `INSERT INTO segment_coverage (journal_key, segment_key, instance_id, signal, received_at, covered_at)
+         VALUES (?,?,?,?,?,?)`,
+        cov.journal_key,
+        seg.segment_key,
+        seg.instance_id,
+        cov.signal,
+        cov.received_at,
+        now,
+      );
+      coveredNew += 1;
+    }
+    this.bump("segment_published");
+    if (coveredNew > 0) this.bump("segment_covered", coveredNew);
+    if (seg.late) this.bump("segment_late");
+    return { committed: true, duplicate: false, covered_new: coveredNew, covered_skipped: coveredSkipped };
+  }
+
+  /** Advertised segments, oldest range first, optionally filtered by instance. */
+  async listSegments(opts: { instance_id?: string; limit: number; offset: number }): Promise<{
+    segments: SegmentManifestRow[];
+    total: number;
+  }> {
+    await this.ensureLoaded();
+    const where = opts.instance_id ? `WHERE instance_id = ?` : "";
+    const args: SqlValue[] = opts.instance_id ? [opts.instance_id] : [];
+    const totalRows = this.sql.exec(`SELECT COUNT(*) AS n FROM segment_manifest ${where}`, ...args).toArray();
+    const total = Number(totalRows[0]?.n ?? 0);
+    const rows = this.sql
+      .exec(
+        `SELECT segment_key, instance_id, object_key, size_bytes, sha256, first_received_at, last_received_at,
+                request_count, record_count, span_count, log_count, metric_count, event_min_ns, event_max_ns,
+                status, late, created_at, verified_at
+           FROM segment_manifest ${where}
+          ORDER BY first_received_at ASC, segment_key ASC
+          LIMIT ? OFFSET ?`,
+        ...args,
+        opts.limit,
+        opts.offset,
+      )
+      .toArray();
+    return { segments: rows.map(segmentRow), total };
+  }
+
+  /** Storage/health summary for the compaction subsystem. */
+  async segmentStatus(): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    return {
+      segments: this.countSegments(),
+      coverage: this.countCoverage(),
+      unverified: Number(
+        this.sql.exec(`SELECT COUNT(*) AS n FROM segment_manifest WHERE status != 'verified'`).toArray()[0]?.n ?? 0,
+      ),
+      late: Number(
+        this.sql.exec(`SELECT COUNT(*) AS n FROM segment_manifest WHERE late = 1`).toArray()[0]?.n ?? 0,
+      ),
+      counters: this.counters(),
+    };
+  }
+
   async status(): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
+    const instances = await this.instances.list();
     return {
       recording: this.countRecording(),
       shots: this.countShots(),
       journal: this.countJournal(),
+      segments: this.countSegments(),
+      coverage: this.countCoverage(),
+      instances: instances.instances.length,
       counters: this.counters(),
     };
   }
@@ -353,6 +575,22 @@ export class IngestCore {
         const limit = typeof body.limit === "number" && body.limit > 0 ? Math.min(body.limit, 200) : 50;
         const offset = typeof body.offset === "number" && body.offset > 0 ? body.offset : 0;
         return json(200, await this.listJournal({ instance_id: body.instance_id, limit, offset }));
+      }
+      if (path === "/internal/segment/publish") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<SegmentPublishInput>(request);
+        return json(201, await this.publishSegment(body));
+      }
+      if (path === "/internal/segment/list") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ instance_id?: string; limit?: number; offset?: number }>(request);
+        const limit = typeof body.limit === "number" && body.limit > 0 ? Math.min(body.limit, 200) : 50;
+        const offset = typeof body.offset === "number" && body.offset > 0 ? body.offset : 0;
+        return json(200, await this.listSegments({ instance_id: body.instance_id, limit, offset }));
+      }
+      if (path === "/internal/segment/status") {
+        if (request.method !== "GET") return json(405, { error: "method not allowed" });
+        return json(200, await this.segmentStatus());
       }
       if (path === "/internal/shot/register") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
@@ -426,6 +664,16 @@ export class IngestCore {
 
   private countJournal(): number {
     const rows = this.sql.exec(`SELECT COUNT(*) AS n FROM journal_ledger`).toArray();
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  private countSegments(): number {
+    const rows = this.sql.exec(`SELECT COUNT(*) AS n FROM segment_manifest`).toArray();
+    return Number(rows[0]?.n ?? 0);
+  }
+
+  private countCoverage(): number {
+    const rows = this.sql.exec(`SELECT COUNT(*) AS n FROM segment_coverage`).toArray();
     return Number(rows[0]?.n ?? 0);
   }
 
@@ -506,6 +754,104 @@ export function validateJournalEntry(raw: Partial<JournalEntry> | undefined): Jo
       content_encoding: typeof raw.content_encoding === "string" ? raw.content_encoding : "",
       received_at: raw.received_at,
     },
+  };
+}
+
+type SegmentValidation = { ok: true; value: SegmentPublishInput } | { ok: false; error: string };
+
+const SEGMENT_KEY_PATTERN = /^[A-Za-z0-9._/-]{1,512}$/;
+const MAX_SEGMENT_COVERAGE = 10000;
+
+/** Validates a compactor publish request. Only verified segments may be advertised. */
+export function validateSegmentPublish(raw: Partial<SegmentPublishInput> | undefined): SegmentValidation {
+  if (!raw || typeof raw.segment_key !== "string" || !SEGMENT_KEY_PATTERN.test(raw.segment_key)) {
+    return { ok: false, error: "segment_key is required and must be path-safe" };
+  }
+  if (typeof raw.instance_id !== "string" || raw.instance_id === "") {
+    return { ok: false, error: "instance_id is required" };
+  }
+  if (typeof raw.object_key !== "string" || raw.object_key === "") {
+    return { ok: false, error: "object_key is required" };
+  }
+  if (typeof raw.size_bytes !== "number" || !Number.isFinite(raw.size_bytes) || raw.size_bytes <= 0) {
+    return { ok: false, error: "size_bytes must be a positive number" };
+  }
+  if (typeof raw.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(raw.sha256)) {
+    return { ok: false, error: "sha256 must be lowercase hex" };
+  }
+  for (const field of ["first_received_at", "last_received_at", "request_count", "record_count"] as const) {
+    const v = raw[field];
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) {
+      return { ok: false, error: `${field} must be a non-negative number` };
+    }
+  }
+  if ((raw.last_received_at as number) < (raw.first_received_at as number)) {
+    return { ok: false, error: "last_received_at must not precede first_received_at" };
+  }
+  if (!Array.isArray(raw.coverage)) {
+    return { ok: false, error: "coverage is required" };
+  }
+  if (raw.coverage.length > MAX_SEGMENT_COVERAGE) {
+    return { ok: false, error: `coverage exceeds ${MAX_SEGMENT_COVERAGE} entries` };
+  }
+  const coverage: SegmentCoverageInput[] = [];
+  for (const entry of raw.coverage) {
+    if (!entry || typeof entry.journal_key !== "string" || entry.journal_key === "") {
+      return { ok: false, error: "coverage.journal_key is required" };
+    }
+    if (typeof entry.signal !== "string" || !SIGNALS.includes(entry.signal as Signal)) {
+      return { ok: false, error: "coverage.signal is required" };
+    }
+    if (typeof entry.received_at !== "number" || !Number.isFinite(entry.received_at)) {
+      return { ok: false, error: "coverage.received_at is required" };
+    }
+    coverage.push({ journal_key: entry.journal_key, signal: entry.signal, received_at: entry.received_at });
+  }
+  const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0);
+  const nullable = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
+  return {
+    ok: true,
+    value: {
+      segment_key: raw.segment_key,
+      instance_id: raw.instance_id,
+      object_key: raw.object_key,
+      size_bytes: raw.size_bytes,
+      sha256: raw.sha256,
+      first_received_at: raw.first_received_at as number,
+      last_received_at: raw.last_received_at as number,
+      request_count: raw.request_count as number,
+      record_count: raw.record_count as number,
+      span_count: num(raw.span_count),
+      log_count: num(raw.log_count),
+      metric_count: num(raw.metric_count),
+      event_min_ns: nullable(raw.event_min_ns),
+      event_max_ns: nullable(raw.event_max_ns),
+      late: raw.late === true,
+      coverage,
+    },
+  };
+}
+
+function segmentRow(row: SqlRow): SegmentManifestRow {
+  return {
+    segment_key: String(row.segment_key),
+    instance_id: String(row.instance_id),
+    object_key: String(row.object_key),
+    size_bytes: Number(row.size_bytes),
+    sha256: String(row.sha256),
+    first_received_at: Number(row.first_received_at),
+    last_received_at: Number(row.last_received_at),
+    request_count: Number(row.request_count),
+    record_count: Number(row.record_count),
+    span_count: Number(row.span_count ?? 0),
+    log_count: Number(row.log_count ?? 0),
+    metric_count: Number(row.metric_count ?? 0),
+    event_min_ns: row.event_min_ns == null ? null : Number(row.event_min_ns),
+    event_max_ns: row.event_max_ns == null ? null : Number(row.event_max_ns),
+    status: String(row.status),
+    late: Number(row.late ?? 0) === 1,
+    created_at: Number(row.created_at),
+    verified_at: row.verified_at == null ? null : Number(row.verified_at),
   };
 }
 
