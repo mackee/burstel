@@ -57,6 +57,17 @@ export function notRecording(reason = "shot is not recording"): HttpError {
 }
 
 /**
+ * The shot's recording container stopped, taking its ephemeral DuckDB with it.
+ * The shot can never record or freeze again, so this is terminal. The request
+ * at hand was rejected before reaching any recorder: definite non-commitment.
+ */
+export function shotLost(): HttpError {
+  return new HttpError(409, LOST_MESSAGE, false, "shot_lost", true);
+}
+
+export const LOST_MESSAGE = "recording container stopped; recorded telemetry was lost";
+
+/**
  * Production misconfiguration: the container's distinct internal bearer token
  * is missing or equal to the admin token. Refuse to boot an unguarded
  * container. Not retryable — an operator must fix the configuration.

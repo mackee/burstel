@@ -86,7 +86,17 @@ export async function stopShot(ctx: ToolContext, shotId: string): Promise<Record
       body: JSON.stringify({ shot_id: shotId }),
     }),
   );
-  const result = await parseJsonOrThrow(resp);
+  let result: Record<string, unknown>;
+  try {
+    result = await parseJsonOrThrow(resp);
+  } catch (error) {
+    // A lost shot will never record again: release the stable endpoint so the
+    // next shot can start, then surface the terminal failure.
+    if (error instanceof HttpError && error.code === "shot_lost") {
+      await ingestCall(ctx, "/internal/detach", "POST", { shot_id: shotId }).catch(() => undefined);
+    }
+    throw error;
+  }
   // Detach ingress only after the shot has frozen, so in-flight requests are
   // attributed to the old shot and late arrivals are discarded, not leaked into
   // the next shot.

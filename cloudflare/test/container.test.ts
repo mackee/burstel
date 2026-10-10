@@ -42,14 +42,34 @@ class FakeContainer implements ContainerLike {
 }
 
 describe("container control", () => {
-  test("starts once with env and keeps a long inactivity timeout", () => {
+  test("starts once with env and leaves the inactivity timeout to keepAlive", () => {
     const container = new FakeContainer();
     const control = createContainerControl(container, { port: 8080 });
     control.start({ BURSTEL_INTERNAL_TOKEN: "t" });
     control.start({ BURSTEL_INTERNAL_TOKEN: "t" });
 
     expect(container.startCalls).toBe(1);
+    expect(container.inactivityTimeout).toBeUndefined();
+  });
+
+  test("keepAlive awaits the platform and propagates its rejection", async () => {
+    const container = new FakeContainer();
+    const control = createContainerControl(container, { port: 8080 });
+    await control.keepAlive(6 * 60 * 60 * 1000);
     expect(container.inactivityTimeout).toBe(6 * 60 * 60 * 1000);
+
+    container.setInactivityTimeout = async () => {
+      throw new Error("timeout too long");
+    };
+    await expect(control.keepAlive(1)).rejects.toThrow(/timeout too long/);
+  });
+
+  test("keepAlive fails loudly when the runtime lacks the method", async () => {
+    const container = new FakeContainer() as ContainerLike & { setInactivityTimeout?: unknown };
+    delete (container as { setInactivityTimeout?: unknown }).setInactivityTimeout;
+    Object.defineProperty(container, "setInactivityTimeout", { value: undefined });
+    const control = createContainerControl(container as ContainerLike, { port: 8080 });
+    await expect(control.keepAlive(1)).rejects.toThrow(/not supported/);
   });
 
   test("ensureReady polls until the recorder answers 200", async () => {

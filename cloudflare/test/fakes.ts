@@ -8,7 +8,7 @@ import { Database } from "bun:sqlite";
 
 import type { ArtifactResult, ArtifactSink, ArtifactSource } from "../src/artifacts";
 import type { ContainerControl } from "../src/container";
-import type { ShotCoreDeps } from "../src/core";
+import type { HeartbeatScheduler, ShotCoreDeps } from "../src/core";
 import { ShotCore } from "../src/core";
 import type { DoStubLike, IngestNamespaceLike } from "../src/env";
 import { IngestCore } from "../src/ingest-core";
@@ -39,6 +39,7 @@ export interface FakeContainerOptions {
   otlpBody?: Uint8Array;
   otlpContentType?: string;
   readyError?: Error;
+  keepAliveError?: Error;
   /** Awaited by every /v1/* request; lets tests hold ingests open. */
   ingestGate?: () => Promise<void>;
   metadataDelayMs?: number;
@@ -66,6 +67,9 @@ export class FakeContainer implements ContainerControl {
   otlpContentType: string;
 
   readyError: Error | undefined;
+  keepAliveError: Error | undefined;
+  /** Every inactivity timeout applied, in order. */
+  readonly keepAlives: number[] = [];
   ingestGate: (() => Promise<void>) | undefined;
   metadataDelayMs: number;
 
@@ -93,6 +97,7 @@ export class FakeContainer implements ContainerControl {
     this.otlpBody = options.otlpBody ?? new Uint8Array([0x0a, 0x00]);
     this.otlpContentType = options.otlpContentType ?? "application/x-protobuf";
     this.readyError = options.readyError;
+    this.keepAliveError = options.keepAliveError;
     this.ingestGate = options.ingestGate;
     this.metadataDelayMs = options.metadataDelayMs ?? 0;
     this.queryResult = options.queryResult ?? {
@@ -142,6 +147,11 @@ export class FakeContainer implements ContainerControl {
   async ensureReady(): Promise<void> {
     if (this.readyError) throw this.readyError;
     this.runningFlag = true;
+  }
+
+  async keepAlive(durationMs: number): Promise<void> {
+    if (this.keepAliveError) throw this.keepAliveError;
+    this.keepAlives.push(durationMs);
   }
 
   async request(path: string, init?: RequestInit): Promise<Response> {
@@ -304,11 +314,23 @@ export class FakeArtifacts implements ArtifactSink {
   }
 }
 
+/** Records armed heartbeats instead of setting a DO alarm. */
+export class FakeScheduler implements HeartbeatScheduler {
+  readonly armed: number[] = [];
+  failWith: Error | undefined;
+
+  set(atMs: number): void {
+    if (this.failWith) throw this.failWith;
+    this.armed.push(atMs);
+  }
+}
+
 export interface TestHarness {
   core: ShotCore;
   sql: BunSql;
   container: FakeContainer;
   artifacts: FakeArtifacts;
+  scheduler: FakeScheduler;
 }
 
 export interface IngestHarness {
@@ -342,6 +364,8 @@ export function makeCore(
     sql?: BunSql;
     now?: () => number;
     drainTimeoutMs?: number;
+    scheduler?: FakeScheduler;
+    maxRecordingMs?: number;
     /** Override the resolved internal-token state (defaults to a valid one). */
     internals?: { token?: string; ready?: boolean; error?: "missing" | "not_distinct" };
   } = {},
@@ -349,6 +373,7 @@ export function makeCore(
   const sql = options.sql ?? new BunSql();
   const container = options.container ?? new FakeContainer();
   const artifacts = options.artifacts ?? new FakeArtifacts();
+  const scheduler = options.scheduler ?? new FakeScheduler();
   let tick = 0;
   const now = options.now ?? (() => 1_700_000_000_000 + tick++);
   const internals = options.internals;
@@ -363,9 +388,12 @@ export function makeCore(
     internalTokenError: internals?.error,
     containerEnv: { BURSTEL_ADDR: ":8080", BURSTEL_DATA_DIR: "/data" },
     drainTimeoutMs: options.drainTimeoutMs ?? 2000,
+    scheduler,
+    heartbeatIntervalMs: 60_000,
+    maxRecordingMs: options.maxRecordingMs,
   };
   const core = new ShotCore(deps);
-  return { core, sql, container, artifacts };
+  return { core, sql, container, artifacts, scheduler };
 }
 
 export async function sha256Hex(bytes: Uint8Array): Promise<string> {

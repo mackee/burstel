@@ -72,9 +72,13 @@ export class ShotDO extends DurableObject<Env> {
       internalTokenError: internal.ok ? undefined : internal.reason,
       containerEnv,
       artifactPrefix: env.ARTIFACT_PREFIX,
+      // The recording heartbeat runs on this DO's alarm.
+      scheduler: { set: (atMs) => ctx.storage.setAlarm(atMs) },
     });
 
-    // Restore persisted state before the first request is served.
+    // Restore persisted state before the first request is served. For a
+    // recording shot this also re-applies the container inactivity timeout
+    // (lost on every DO restart) and re-arms the heartbeat.
     ctx.blockConcurrencyWhile(async () => {
       await this.core.load();
     });
@@ -82,6 +86,10 @@ export class ShotDO extends DurableObject<Env> {
 
   override async fetch(request: Request): Promise<Response> {
     return this.core.handleInternal(request);
+  }
+
+  override async alarm(): Promise<void> {
+    await this.core.heartbeat();
   }
 }
 

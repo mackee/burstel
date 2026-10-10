@@ -55,8 +55,13 @@ wrangler secret put BURSTEL_INTERNAL_TOKEN
 * A request rejected because the shot is stopping/not-recording is *provably
   uncommitted*; the stable `/ingest` forwarder answers a valid OTLP
   `ExportResponse` `200` with `X-Burstel-Disposition: ignored-no-active-shot`.
-* Genuine failures — storage write error, unavailable/down container, request
-  write timeout, capacity exhaustion, crash, or any unknown outcome — stay a
-  retryable `503` and are **never** acknowledged as success.
+* Genuine failures — storage write error, request write timeout, capacity
+  exhaustion, crash, or any unknown outcome — stay a retryable `503` and are
+  **never** acknowledged as success.
+* Exception (spec 012): a recording shot whose container has **stopped** is
+  terminally lost (its ephemeral disk is gone, no retry can succeed). The
+  request at hand was never forwarded, so `/ingest` answers an OTLP `200` with
+  `X-Burstel-Disposition: ignored-shot-lost` and the shot becomes `failed`
+  (`lost: true`).
 * In-flight, previously admitted writes are drained before a shot is frozen; no
   accepted batch is lost and no late batch is attributed to the next shot.

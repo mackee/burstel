@@ -11,6 +11,13 @@
 //                                                   container is NOT destroyed
 //                                                   so the only copy of the
 //                                                   ephemeral DuckDB survives)
+//
+//   recording/failed(stop) --container stopped--> failed (lost; terminal: the
+//                                                 ephemeral DuckDB went with it)
+//
+// While recording, a heartbeat (a DO alarm) keeps the Durable Object active and
+// re-applies the container's inactivity timeout, which the platform forgets on
+// every DO restart.
 
 import type { ArtifactSink } from "./artifacts";
 import type { ContainerControl } from "./container";
@@ -21,10 +28,11 @@ import {
   errorMessage,
   HttpError,
   internalTokenUnconfigured,
+  LOST_MESSAGE,
   notFound,
   notRecording,
+  shotLost,
   shotStopping,
-  unavailable,
 } from "./errors";
 import { errorResponse, json, readJson } from "./http";
 
@@ -60,6 +68,12 @@ export interface ShotResult {
   counters: Counters;
 }
 
+/** Arms the per-shot heartbeat; in production this is the DO alarm. */
+export interface HeartbeatScheduler {
+  /** Schedules the next heartbeat at `atMs` (epoch ms), replacing any pending one. */
+  set(atMs: number): Promise<void> | void;
+}
+
 export interface ShotCoreDeps {
   shotId: string;
   sql: SyncSql;
@@ -86,9 +100,21 @@ export interface ShotCoreDeps {
   analysisMaxRows?: number;
   /** Default top-N for analysis sections; defaults to 20. */
   analysisTopN?: number;
+  /** Heartbeat scheduler; without one no heartbeat is armed. */
+  scheduler?: HeartbeatScheduler;
+  heartbeatIntervalMs?: number;
+  /** After this long in `recording`, the heartbeat stops re-arming. */
+  maxRecordingMs?: number;
 }
 
 const DEFAULT_DRAIN_TIMEOUT_MS = 60_000;
+/** Platform maximum; keeps the recording container through DO inactivity. */
+export const RECORDING_KEEPALIVE_MS = 6 * 60 * 60 * 1000;
+/** Long enough to reuse a warm analysis container, short enough to free it. */
+export const ANALYSIS_KEEPALIVE_MS = 10 * 60 * 1000;
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 60_000;
+/** Matches the ingest token lifetime; a forgotten shot cannot pin a container. */
+export const DEFAULT_MAX_RECORDING_MS = 24 * 60 * 60 * 1000;
 
 export class ShotCore {
   readonly shotId: string;
@@ -104,6 +130,9 @@ export class ShotCore {
   private readonly drainTimeoutMs: number;
   private readonly analysisMaxRows: number;
   private readonly analysisTopN: number;
+  private readonly scheduler?: HeartbeatScheduler;
+  private readonly heartbeatIntervalMs: number;
+  private readonly maxRecordingMs: number;
 
   private counters: Counters = emptyCounters();
   private inFlight = 0;
@@ -129,6 +158,9 @@ export class ShotCore {
     this.drainTimeoutMs = deps.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
     this.analysisMaxRows = deps.analysisMaxRows ?? 1000;
     this.analysisTopN = deps.analysisTopN ?? 20;
+    this.scheduler = deps.scheduler;
+    this.heartbeatIntervalMs = deps.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
+    this.maxRecordingMs = deps.maxRecordingMs ?? DEFAULT_MAX_RECORDING_MS;
   }
 
   /** Creates the schema and restores persisted state. */
@@ -136,6 +168,23 @@ export class ShotCore {
     this.store.migrate();
     this.counters = this.store.counters(this.shotId);
     this.loaded = true;
+    await this.resumeRecording();
+  }
+
+  /**
+   * After a DO restart the platform has forgotten the container's inactivity
+   * timeout. Re-apply it and re-arm the heartbeat, or record the loss if the
+   * container is already gone.
+   */
+  private async resumeRecording(): Promise<void> {
+    const row = this.store.get(this.shotId);
+    if (!row || row.state !== "recording") return;
+    if (!this.container.running) {
+      this.markLost();
+      return;
+    }
+    await this.applyRecordingKeepAlive();
+    await this.armHeartbeat();
   }
 
   async ensureLoaded(): Promise<void> {
@@ -192,6 +241,21 @@ export class ShotCore {
       throw new HttpError(503, `container start failed: ${errorMessage(error)}`, true, "container_start");
     }
 
+    // Without the inactivity timeout the platform stops the container (and
+    // its ephemeral DuckDB) shortly after this DO goes idle, so a shot must not
+    // enter recording unless the timeout is in place.
+    try {
+      await this.container.keepAlive(RECORDING_KEEPALIVE_MS);
+    } catch (error) {
+      this.markFailed("start", error);
+      throw new HttpError(
+        503,
+        `container keepalive failed: ${errorMessage(error)}`,
+        true,
+        "container_keepalive",
+      );
+    }
+
     try {
       const resp = await this.container.request("/internal/start", {
         method: "POST",
@@ -214,14 +278,58 @@ export class ShotCore {
       last_error: null,
       freeze_json: "{}",
     });
+    await this.armHeartbeat();
+  }
+
+  // ------------------------------------------------------------- heartbeat
+
+  /**
+   * Runs on the DO alarm while recording: detects a stopped container, keeps
+   * the inactivity timeout applied, and re-arms itself.
+   */
+  async heartbeat(): Promise<void> {
+    await this.ensureLoaded();
+    const row = this.store.get(this.shotId);
+    if (!row || row.state !== "recording") return;
+    if (!this.container.running) {
+      this.markLost();
+      return;
+    }
+    if (row.started_at !== null && this.now() - row.started_at >= this.maxRecordingMs) {
+      console.warn(`burstel: shot ${this.shotId} exceeded the max recording time; heartbeat stopped`);
+      return;
+    }
+    await this.applyRecordingKeepAlive();
+    await this.armHeartbeat();
+  }
+
+  private async armHeartbeat(): Promise<void> {
+    if (!this.scheduler) return;
+    try {
+      await this.scheduler.set(this.now() + this.heartbeatIntervalMs);
+    } catch (error) {
+      console.warn(`burstel: shot ${this.shotId} heartbeat could not be armed: ${errorMessage(error)}`);
+    }
+  }
+
+  private async applyRecordingKeepAlive(): Promise<void> {
+    try {
+      await this.container.keepAlive(RECORDING_KEEPALIVE_MS);
+    } catch (error) {
+      console.warn(`burstel: shot ${this.shotId} keepalive failed: ${errorMessage(error)}`);
+    }
   }
 
   // ---------------------------------------------------------------- status
 
   async status(): Promise<ShotInfo> {
     await this.ensureLoaded();
-    const row = this.store.get(this.shotId);
+    let row = this.store.get(this.shotId);
     if (!row) throw notFound(`unknown shot ${this.shotId}`);
+    if (row.state === "recording" && !this.container.running) {
+      this.markLost();
+      row = this.store.get(this.shotId) ?? row;
+    }
     if (row.state === "recording" && this.container.running) {
       await this.refreshCountersFromGo().catch(() => undefined);
       const refreshed = this.store.get(this.shotId);
@@ -247,13 +355,16 @@ export class ShotCore {
     // can answer with a valid OTLP ExportResponse and discard the payload.
     if (this.stopRequested) throw shotStopping();
     const row = this.store.get(this.shotId);
+    if (row && isLost(row)) throw shotLost();
     if (!row || row.state !== "recording") {
       throw notRecording();
     }
     if (!this.container.running) {
-      // The container may still hold in-flight/committed data or be mid-crash;
-      // the outcome is not knowable here, so this must stay a retryable 503.
-      throw unavailable("container is not running");
+      // A stopped container is never restarted with its old disk: the shot's
+      // data is gone and no retry can succeed. This request itself was not
+      // forwarded anywhere, so it is provably uncommitted.
+      this.markLost();
+      throw shotLost();
     }
 
     this.inFlight += 1;
@@ -297,6 +408,14 @@ export class ShotCore {
       if (!row) throw notFound(`unknown shot ${this.shotId}`);
       if (row.state === "frozen") return this.resultFromRow(row, this.counters);
       if (row.state === "created") throw conflict("shot has not started recording");
+      if (isLost(row)) throw shotLost();
+      const freezable = row.state === "recording" || (row.state === "failed" && this.retryable(row, "stop"));
+      if (freezable && !this.container.running) {
+        // Nothing to freeze: do not ask the platform for a (fresh, empty)
+        // container, record the loss instead.
+        this.markLost();
+        throw shotLost();
+      }
       if (row.state === "failed" && !this.retryable(row, "stop")) {
         throw conflict(`shot is failed: ${row.last_error ?? "unknown error"}`);
       }
@@ -490,6 +609,8 @@ export class ShotCore {
     if (!this.container.running) {
       this.container.start(this.analysisEnvironment());
       await this.container.ensureReady();
+      // Best effort: analysis containers are cheap to recreate from R2.
+      await this.container.keepAlive(ANALYSIS_KEEPALIVE_MS).catch(() => undefined);
       this.analysisRestored.clear();
     }
     await this.ensureRestored(this.shotId, selfFreeze);
@@ -680,6 +801,16 @@ export class ShotCore {
     });
   }
 
+  private markLost(): void {
+    console.warn(`burstel: shot ${this.shotId} lost its recording container`);
+    this.stopRequested = false;
+    this.store.update(this.shotId, {
+      state: "failed",
+      last_error: LOST_MESSAGE,
+      freeze_json: JSON.stringify({ phase: "recording", retryable: false, lost: true }),
+    });
+  }
+
   private retryable(row: StateRow, phase: "start" | "stop"): boolean {
     const freeze = parseFreeze(row);
     return freeze !== undefined && freeze["phase"] === phase && freeze["retryable"] === true;
@@ -735,6 +866,10 @@ function parseJSON(value: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function isLost(row: StateRow): boolean {
+  return row.state === "failed" && parseFreeze(row)?.["lost"] === true;
 }
 
 function parseFreeze(row: StateRow): Record<string, unknown> | undefined {

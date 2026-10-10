@@ -182,17 +182,18 @@ describe("ShotCore lifecycle", () => {
     expect(resp.headers.get("x-burstel-disposition")).toBeNull();
   });
 
-  test("an unavailable container stays a retryable 503", async () => {
+  test("a stopped recording container makes the shot terminally lost (spec 012)", async () => {
     const h = makeCore("shot-down");
     await h.core.create({});
     h.container.runningFlag = false;
 
     await expect(h.core.ingest("traces", otlpRequest())).rejects.toMatchObject({
-      status: 503,
-      code: "unavailable",
-      retryable: true,
-      definitelyUnaccepted: false,
+      status: 409,
+      code: "shot_lost",
+      retryable: false,
+      definitelyUnaccepted: true,
     });
+    expect((await h.core.status()).state).toBe("failed");
   });
 
   test("a missing or non-distinct internal token fails closed", async () => {

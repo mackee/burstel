@@ -21,7 +21,7 @@ export function errorResponse(error: unknown): Response {
     // OTLP discard; every other error, including a genuine 503, is propagated
     // unchanged so the exporter retries.
     const headers = error.definitelyUnaccepted
-      ? { "x-burstel-disposition": "ignored-no-active-shot" }
+      ? { "x-burstel-disposition": error.code === "shot_lost" ? "ignored-shot-lost" : "ignored-no-active-shot" }
       : undefined;
     return json(
       error.status,

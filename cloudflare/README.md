@@ -201,7 +201,8 @@ for the full decision record.
 
 ```
 created ──start──► recording ──stop──► stopping ──verified R2──► frozen
-                                   └── any error ──► failed (retryable)
+                       │           └── any error ──► failed (retryable)
+                       └── container stopped ──► failed (lost, terminal)
 ```
 
 * **Create** boots the Container (default scheduling policy), waits for
@@ -217,6 +218,28 @@ created ──start──► recording ──stop──► stopping ──verifi
   `frozen` and destroys the Container.
 * `created`, `recording`, `stopping`, `frozen`, and `failed` are persisted in
   the DO's SQLite storage, so a rehydrated DO restores its metadata and state.
+
+### Keeping the recording container alive (spec 012)
+
+* The platform stops a DO's container shortly after the DO goes idle unless an
+  inactivity timeout is set, and forgets that timeout on every DO restart.
+  Create therefore applies a 6h timeout (the platform maximum) **after**
+  `/readyz` and before `recording`; if the platform refuses it the start fails
+  (`503 container_keepalive`, retryable).
+* While `recording`, a DO alarm fires every 60s. It re-applies the timeout,
+  keeps the DO active and checks that the container still runs. A restarted DO
+  re-applies the timeout and re-arms the alarm from its constructor. The
+  heartbeat stops re-arming after 24h in `recording` so a forgotten shot cannot
+  pin a container forever.
+* **Container loss is terminal.** A stopped container is never restarted with
+  its old disk, so when a recording shot's container is found stopped (ingest,
+  status, stop, heartbeat or DO load), the shot becomes `failed` with
+  `{phase:"recording", lost:true, retryable:false}`. Ingest then answers
+  `409 shot_lost`, which the stable `/ingest` turns into an OTLP `200` discard
+  labelled `X-Burstel-Disposition: ignored-shot-lost` (so exporters stop
+  retrying), and `stop` answers `409 shot_lost` without touching any container
+  and frees the stable endpoint for the next shot.
+* Analysis containers use a 10 min timeout.
 
 ### Freeze durability and crash/retry semantics
 

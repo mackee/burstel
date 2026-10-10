@@ -182,9 +182,13 @@ async function handleIngest(
     // consciously discard; never attribute it to a different shot. A genuine
     // 503 (storage failure, a down container, a write timeout) carries no
     // marker and is propagated below so the exporter retries.
+    // A lost shot (its recording container stopped) is discarded the same way
+    // but with its own marker so operators can tell the two apart.
+    const disposition =
+      resp.headers.get("x-burstel-disposition") === "ignored-shot-lost" ? "ignored-shot-lost" : "ignored-no-active-shot";
     await resp.body?.cancel().catch(() => undefined);
     await ingestJson(ingest, "/internal/detach", "POST", { shot_id: shotId, late: true }).catch(() => undefined);
-    return discardResponse(request, "ignored-no-active-shot");
+    return discardResponse(request, disposition);
   }
   const out = new Response(resp.body, resp);
   out.headers.set("x-burstel-shot-id", shotId);
@@ -198,10 +202,8 @@ async function handleIngest(
  * notably a 503 storage/container error — must never be mistaken for this.
  */
 function isDefinitelyUnaccepted(resp: Response): boolean {
-  return (
-    resp.headers.get("x-burstel-disposition") === "ignored-no-active-shot" ||
-    resp.status === 409
-  );
+  const disposition = resp.headers.get("x-burstel-disposition");
+  return disposition === "ignored-no-active-shot" || disposition === "ignored-shot-lost" || resp.status === 409;
 }
 
 /** A valid OTLP/HTTP 200 that deliberately discards data with no active shot. */

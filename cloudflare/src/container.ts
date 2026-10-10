@@ -30,6 +30,12 @@ export interface ContainerControl {
   ensureReady(): Promise<void>;
   /** Proxies an HTTP request into the container via its TCP port. */
   request(path: string, init?: RequestInit): Promise<Response>;
+  /**
+   * Sets how long the container keeps running after the Durable Object goes
+   * inactive. The platform forgets it on every DO restart, so callers re-apply
+   * it. Rejects when the platform refuses the value.
+   */
+  keepAlive(durationMs: number): Promise<void>;
   /** Stops the container process. */
   destroy(): Promise<void>;
 }
@@ -38,11 +44,7 @@ export interface ContainerControlOptions {
   port: number;
   readyTimeoutMs?: number;
   pollIntervalMs?: number;
-  /** Inactivity timeout; kept long so an active shot's ephemeral disk survives. */
-  inactivityTimeoutMs?: number;
 }
-
-const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
 
 export function createContainerControl(
   container: ContainerLike,
@@ -50,7 +52,6 @@ export function createContainerControl(
 ): ContainerControl {
   const readyTimeoutMs = options.readyTimeoutMs ?? 30_000;
   const pollIntervalMs = options.pollIntervalMs ?? 200;
-  const inactivityTimeoutMs = options.inactivityTimeoutMs ?? SIX_HOURS_MS;
 
   const request = (path: string, init?: RequestInit): Promise<Response> =>
     container.getTcpPort(options.port).fetch(`http://container${path}`, init);
@@ -63,11 +64,13 @@ export function createContainerControl(
     start(env) {
       if (container.running) return;
       container.start({ enableInternet: false, env });
-      // Best effort: keep the container (and its ephemeral DuckDB) alive while
-      // the shot is recording. Old platform builds may not expose the method.
-      if (container.setInactivityTimeout) {
-        void container.setInactivityTimeout(inactivityTimeoutMs).catch(() => undefined);
+    },
+
+    async keepAlive(durationMs) {
+      if (!container.setInactivityTimeout) {
+        throw new Error("container inactivity timeout is not supported by this runtime");
       }
+      await container.setInactivityTimeout(durationMs);
     },
 
     async ensureReady() {
