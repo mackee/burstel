@@ -14,7 +14,12 @@
 //
 //	version
 //	health
-//	token issue <shot-id> [--out FILE]  mint the shot's 24h push-only ingest token
+//	instance create <name>              create/upsert a named logical instance
+//	instance list                       list instances (metadata only)
+//	instance token issue <name> [--rotate] [--overlap-seconds N] [--out FILE]
+//	                                    issue a 24h push-only instance token
+//	instance token list <name>          list an instance's token metadata
+//	instance token revoke <name> <id>   revoke an instance token immediately
 //	token mint --scope admin|member [--owner NAME] [--ttl-seconds N] [--out FILE]
 //	token list [--out FILE]             list per-person tokens (metadata only)
 //	token revoke <token-id>             revoke a per-person token immediately
@@ -95,6 +100,8 @@ func run(args []string) error {
 		return nil
 	case "health":
 		return client.getJSON("/healthz")
+	case "instance":
+		return client.instanceCommand(sub)
 	case "token":
 		return client.tokenCommand(sub)
 	case "shot":
@@ -300,37 +307,9 @@ func printJSON(v any) error {
 
 func (c *client) tokenCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("token: expected issue|mint|list|revoke")
+		return errors.New("token: expected mint|list|revoke")
 	}
 	switch args[0] {
-	case "issue":
-		pos, opts, err := parseOpts(args[1:], map[string]bool{"out": true})
-		if err != nil {
-			return err
-		}
-		shotID, err := oneShotID(pos)
-		if err != nil {
-			return err
-		}
-		var resp struct {
-			Token     string `json:"token"`
-			ShotID    string `json:"shot_id"`
-			IssuedAt  string `json:"issued_at"`
-			ExpiresAt string `json:"expires_at"`
-			TTL       int    `json:"ttl_seconds"`
-		}
-		if err := c.do(http.MethodPost, "/api/shots/"+shotID+"/ingest-token", nil, &resp); err != nil {
-			return err
-		}
-		if out := last(opts, "out"); out != "" {
-			if err := writeSecretFile(out, resp.Token); err != nil {
-				return err
-			}
-			fmt.Fprintf(os.Stderr, "wrote token to %s (mode 600)\n", out)
-		}
-		fmt.Fprintf(os.Stderr, "shot_id=%s issued_at=%s expires_at=%s ttl_seconds=%d\n", shotID, resp.IssuedAt, resp.ExpiresAt, resp.TTL)
-		fmt.Fprintln(os.Stdout, resp.Token)
-		return nil
 	case "mint":
 		pos, opts, err := parseOpts(args[1:], map[string]bool{"scope": true, "owner": true, "ttl-seconds": true, "out": true})
 		if err != nil {
@@ -398,6 +377,102 @@ func (c *client) tokenCommand(args []string) error {
 		return c.postJSON(http.MethodDelete, "/api/tokens/"+pos[0], nil)
 	default:
 		return fmt.Errorf("token: unknown action %q", args[0])
+	}
+}
+
+func (c *client) instanceCommand(args []string) error {
+	if len(args) == 0 {
+		return errors.New("instance: expected create|list|token")
+	}
+	switch args[0] {
+	case "create":
+		pos, _, err := parseOpts(args[1:], nil)
+		if err != nil {
+			return err
+		}
+		if len(pos) != 1 {
+			return fmt.Errorf("instance create: expected exactly one name, got %d", len(pos))
+		}
+		return c.postJSON(http.MethodPost, "/api/instances", map[string]any{"name": pos[0]})
+	case "list":
+		pos, _, err := parseOpts(args[1:], nil)
+		if err != nil {
+			return err
+		}
+		if len(pos) != 0 {
+			return fmt.Errorf("instance list: unexpected argument %q", pos[0])
+		}
+		return c.getJSON("/api/instances")
+	case "token":
+		return c.instanceTokenCommand(args[1:])
+	default:
+		return fmt.Errorf("instance: unknown action %q", args[0])
+	}
+}
+
+func (c *client) instanceTokenCommand(args []string) error {
+	if len(args) == 0 {
+		return errors.New("instance token: expected issue|list|revoke")
+	}
+	switch args[0] {
+	case "issue":
+		pos, opts, err := parseOpts(args[1:], map[string]bool{"overlap-seconds": true, "out": true})
+		if err != nil {
+			return err
+		}
+		if len(pos) != 1 {
+			return fmt.Errorf("instance token issue: expected exactly one instance name, got %d", len(pos))
+		}
+		name := pos[0]
+		body := map[string]any{}
+		if _, ok := opts["rotate"]; ok {
+			body["rotate"] = true
+		}
+		if n, ok, err := optInt(opts, "overlap-seconds"); err != nil {
+			return err
+		} else if ok {
+			body["overlap_seconds"] = n
+		}
+		var resp struct {
+			Token     string `json:"token"`
+			ID        string `json:"id"`
+			Instance  string `json:"instance"`
+			IssuedAt  string `json:"issued_at"`
+			ExpiresAt string `json:"expires_at"`
+			TTL       int    `json:"ttl_seconds"`
+		}
+		if err := c.do(http.MethodPost, "/api/instances/"+name+"/tokens", body, &resp); err != nil {
+			return err
+		}
+		if out := last(opts, "out"); out != "" {
+			if err := writeSecretFile(out, resp.Token); err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "wrote token to %s (mode 600)\n", out)
+		}
+		fmt.Fprintf(os.Stderr, "id=%s instance=%s issued_at=%s expires_at=%s ttl_seconds=%d\n", resp.ID, resp.Instance, resp.IssuedAt, resp.ExpiresAt, resp.TTL)
+		fmt.Fprintln(os.Stdout, resp.Token)
+		return nil
+	case "list":
+		pos, _, err := parseOpts(args[1:], nil)
+		if err != nil {
+			return err
+		}
+		if len(pos) != 1 {
+			return fmt.Errorf("instance token list: expected exactly one instance name, got %d", len(pos))
+		}
+		return c.getJSON("/api/instances/" + pos[0] + "/tokens")
+	case "revoke":
+		pos, _, err := parseOpts(args[1:], nil)
+		if err != nil {
+			return err
+		}
+		if len(pos) != 2 {
+			return fmt.Errorf("instance token revoke: expected <name> <token-id>, got %d arguments", len(pos))
+		}
+		return c.postJSON(http.MethodDelete, "/api/instances/"+pos[0]+"/tokens/"+pos[1], nil)
+	default:
+		return fmt.Errorf("instance token: unknown action %q", args[0])
 	}
 }
 
@@ -564,7 +639,12 @@ Global flags (may appear anywhere):
 Commands:
   version
   health
-  token issue <shot-id> [--out FILE]  mint the shot's 24h push-only ingest token (prints the token)
+  instance create <name>              create/upsert a named logical instance
+  instance list                       list instances (metadata only)
+  instance token issue <name> [--rotate] [--overlap-seconds N] [--out FILE]
+                                      issue a 24h push-only OTLP instance token (prints it once)
+  instance token list <name>          list an instance's token metadata (never values)
+  instance token revoke <name> <id>   revoke an instance token immediately
   token mint --scope admin|member [--owner NAME] [--ttl-seconds N] [--out FILE]
                                       mint a per-person token (prints the token once)
   token list                          list per-person token metadata (never values)
@@ -580,9 +660,10 @@ Commands:
 
 Examples:
   export BURSTEL_BASE_URL=https://burstel.example.workers.dev
+  burstel-cli instance create web-1
+  PUSH=$(burstel-cli instance token issue web-1)
   burstel-cli shot start --owner alice --metadata source=isucon
   burstel-cli shot list --owner alice
-  TOKEN=$(burstel-cli token issue <shot-id>)
   burstel-cli token mint --scope member --owner alice --out .secrets/member-alice
   burstel-cli token list
   burstel-cli token revoke <token-id>

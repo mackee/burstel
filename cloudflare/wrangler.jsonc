@@ -17,10 +17,11 @@
   // to stop forwarding ingest bodies when the client disconnects.
   "compatibility_flags": ["enable_request_signal"],
 
-  // Spec 013 (Part A): at most this many shots may record concurrently.
-  // Exceeding the cap yields a retryable 503 `capacity_exhausted`.
+  // Spec 014: named instances with push-only tokens. There is no
+  // application-level concurrent-recording cap; backend capacity is bounded by
+  // the container `max_instances` control below.
   "vars": {
-    "MAX_CONCURRENT_RECORDING": "10"
+    "MAX_INGEST_BYTES": "8388608"
   },
 
   "containers": [

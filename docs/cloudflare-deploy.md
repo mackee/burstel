@@ -32,14 +32,13 @@ runs as the nonroot user `burstel` (uid 10001).
 | --- | --- | --- |
 | `BURSTEL_API_TOKEN` | admin: `/api/*`, `/mcp`, legacy per-shot path | Worker secret |
 | `BURSTEL_INTERNAL_TOKEN` | recorder `/internal/*` defense-in-depth | Worker secret, injected into the container by the `ShotDO` |
-| per-shot push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its shot | minted at runtime by `POST /api/shots` (or `POST /api/shots/{id}/ingest-token`), shown **once** |
+| instance push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its named instance | minted at runtime by `POST /api/instances/{name}/tokens` (admin\|member), shown **once**; only its digest is stored in `IngestDO` |
 | per-person token | `/api/*` + `/mcp` as `admin` or `member` (member = full operational, no registry) | minted at runtime by `POST /api/tokens` (admin only), shown **once**; only its digest is stored in `AuthDO` |
 
 Rules (all fail closed): the internal token must be non-empty and **different**
 from the admin token; the admin token is never forwarded to the container; the
 push token is never used as either. `.dev.vars` is gitignored and must never be
 committed. `wrangler secret put` prompts without echoing the value:
-
 ```bash
 wrangler secret put BURSTEL_API_TOKEN
 wrangler secret put BURSTEL_INTERNAL_TOKEN
@@ -144,15 +143,16 @@ scripts/cloudflare-smoke.sh
 ```
 
 `scripts/cloudflare-smoke.sh` is a **small, bounded** E2E (two short shots —
-never a 60/180s benchmark). It checks health, auth boundaries, creates a shot,
-reads the per-shot 24h push token disclosed at creation, sends real OTLP
-traces/metrics/logs through the fixed `/ingest` endpoint, freezes, then runs REST
+never a 60/180s benchmark). It checks health, auth boundaries, creates a named
+instance and issues its 24h token, sends real OTLP traces/metrics/logs through
+the stable `/ingest` endpoint, freezes a shot, then runs REST
 query/analyze/schema/compare and MCP `tools/list`/`tools/call`, verifies
-admin/push scope separation, and asserts the retired `/api/ingest-token` endpoint
-returns `410`. `scripts/cloudflare-multishot-smoke.sh` additionally runs two
-**concurrent** shots with distinct tokens, proves per-shot data isolation, and
+admin/instance scope separation, and asserts the retired `/api/ingest-token` and
+`/api/shots/{id}/ingest-token` endpoints return `410`. `scripts/cloudflare-multishot-smoke.sh`
+additionally runs two **concurrent** shots, proves instance data isolation, and
 (spec 013, Part B) mints two `member` tokens, cross-operates on each other's
-shots, denies the registry, revokes one immediately and lists MCP tools.
+shots, denies the person-token registry, revokes one immediately and lists MCP
+tools.
 Tokens are read from the environment, passed to curl through `--config` process
 substitution (never argv) and to `cmd/otlpsend` through `BURSTEL_PUSH_TOKEN`;
 they are never echoed, written to the repo, logged, put in URLs or CI artifacts.
@@ -161,14 +161,15 @@ not executed by the offline test suites.
 
 ### Installing the collector token on the ISUCON host (manual)
 
-1. Create the shot (`POST /api/shots`, admin auth); the response discloses its
-   per-shot push token **once** (or mint a replacement at
-   `POST /api/shots/{id}/ingest-token`).
+1. Create the named instance (`POST /api/instances`, admin|member auth) and issue
+   its token (`POST /api/instances/{name}/tokens`); the response discloses the
+   token **once**.
 2. On the benchmark host, set it in the shell/unit environment only:
    `export OTEL_EXPORTER_OTLP_HEADERS="X-Burstel-Token=<token>"` with
    `OTEL_EXPORTER_OTLP_ENDPOINT=https://<host>/ingest`.
 3. Never paste the token into a command line, commit it, or upload it
-   automatically; it expires exactly 24h after issuance.
+   automatically; it expires exactly 24h after issuance. Ingestion is continuous
+   and independent of shots, so reconfigure only once per day.
 
 ## 7. Rollback
 
@@ -186,8 +187,9 @@ Containers are ephemeral and are destroyed on freeze/idle.
   account-level limit overrun surfaces to clients as a retryable `503`.
 * `instance_type` is `standard-1`.
 * Stop shots promptly; a recording Container holds an ephemeral disk.
-* Add an R2 lifecycle rule for old `shots/*` objects if long-term retention is
-  not required.
+* The durable raw journal writes one R2 object per accepted export under
+  `journal/*`; add an R2 lifecycle rule for old `shots/*` **and** `journal/*`
+  objects if long-term retention is not required.
 * Containers require Workers Paid; do not leave test Containers running.
 
 ## 9. Non-goals

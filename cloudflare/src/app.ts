@@ -6,46 +6,55 @@
 // TCP port.
 //
 //   GET    /healthz                         (public)
-//   POST   /api/ingest-token                (authenticated) retired; 410 Gone
+//   POST   /api/ingest-token                retired; 410 Gone
+//   POST   /api/instances                   (admin|member) create/upsert an instance
+//   GET    /api/instances                   (admin|member) list instance metadata
+//   POST   /api/instances/{name}/tokens     (admin|member) issue/rotate an instance token
+//   GET    /api/instances/{name}/tokens      (admin|member) list instance token metadata
+//   DELETE /api/instances/{name}/tokens/{id} (admin|member) revoke an instance token
 //   POST   /api/tokens                      (admin) mint a per-person token
-//   GET    /api/tokens                      (admin) list token metadata
-//   DELETE /api/tokens/{id}                 (admin) revoke a token
+//   GET    /api/tokens                      (admin) list per-person token metadata
+//   DELETE /api/tokens/{id}                 (admin) revoke a per-person token
 //   POST   /api/shots                       (admin|member)
 //   GET    /api/shots                       (admin|member) list, optional ?owner=
 //   GET    /api/shots/{id}                  (admin|member)
-//   POST   /api/shots/{id}/ingest-token     (admin|member) mint per-shot push token
 //   POST   /api/shots/{id}/stop             (admin|member)
 //   POST   /api/shots/{id}/query            (admin|member)
 //   POST   /api/shots/{id}/analyze          (admin|member)
 //   GET    /api/shots/{id}/schema           (admin|member)
 //   POST   /api/shots/{id}/compare          (admin|member)
-//   POST   /ingest/v1/{traces,metrics,logs} (per-shot push token)
+//   POST   /ingest/v1/{traces,metrics,logs}  (push-only instance token)
 //   POST   /shots/{id}/v1/{traces,metrics,logs} (admin|member, legacy per-shot path)
 //   POST   /mcp                             (admin|member)
 //
-// Spec 013, Part B: `/api/*` and `/mcp` authenticate with `BURSTEL_API_TOKEN`
-// (admin) or a registered per-person token (`admin` | `member`). Only `admin`
-// may manage the token registry.
+// Spec 014: `/ingest/v1/*` authenticates a push-only *instance* token and
+// durably journals the raw export to R2 before acknowledging it. Instance
+// credentials are managed by `admin` or `member`; only `admin` may manage
+// *person* tokens. Neither the admin credential nor an instance token may
+// cross the other boundary.
 
-import { extractToken } from "./auth";
 import { resolvePrincipal, isRegistryAdmin } from "./authz";
-import { DO_ORIGIN, maxConcurrentRecording, pagination } from "./env";
-import type { AppEnv, DoStubLike, IngestNamespaceLike, ShotNamespaceLike } from "./env";
-import { badRequest, forbidden, HttpError, notFound, unauthorized } from "./errors";
+import { DO_ORIGIN, pagination } from "./env";
+import type { AppEnv, DoStubLike, ShotNamespaceLike } from "./env";
+import { badRequest, forbidden, notFound, unauthorized } from "./errors";
 import { errorResponse, json, readJson } from "./http";
-import { INGEST_DO_NAME } from "./ingest-core";
-import type { IngestAdmitResult } from "./ingest-core";
+import { handleInstanceIngest } from "./intake";
 import { isShotId } from "./ids";
 import { handleMcp } from "./mcp";
+import type { Signal } from "./store";
 import {
   analyzeShot,
   compareShots,
+  createInstance,
   getShot,
+  issueInstanceToken,
+  listInstanceTokens,
+  listInstances,
   listShots,
   listTokens,
-  mintShotIngestToken,
   mintToken,
   queryShot,
+  revokeInstanceToken,
   revokeToken,
   schemaShot,
   startShot,
@@ -64,12 +73,12 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
       return json(200, { status: "ok", service: "burstel" });
     }
 
-    // Stable OTLP ingest: authenticated by the push-only token, never by the
-    // admin token.
+    // Stable OTLP ingest: authenticated by a push-only instance token, never by
+    // the admin credential. Durable journaling happens before the 200.
     const signal = ingestSignal(path);
     if (signal) {
       if (request.method !== "POST") throw badRequest("method not allowed");
-      return await handleIngest(request, env, signal);
+      return await handleInstanceIngest(request, env, signal);
     }
 
     // Everything below is scoped to an authenticated principal and fails
@@ -83,20 +92,59 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
       return await handleMcp(request, env, principal);
     }
 
-    // Retired in spec 013: the installation-wide 24h push token is gone. Point
-    // collectors at the per-shot endpoint so the change is explicit.
+    // Retired installation-wide token. Point operators at named instances.
     if (path === "/api/ingest-token") {
       return json(410, {
         error:
-          "the installation-wide ingest token was removed; mint a per-shot token with POST /api/shots/{id}/ingest-token",
+          "the installation-wide ingest token was removed; create a named instance with POST /api/instances and issue a token with POST /api/instances/{name}/tokens",
         code: "gone",
       });
     }
 
     const ctx = toolContext(env, url);
 
-    // Token registry: admin-only (spec 013, Part B). A member token is denied
-    // here with 403 before any DO work.
+    // -------------------------------------------------- instance registry
+    // admin and member may manage operational instance credentials.
+    if (path === "/api/instances") {
+      if (request.method === "POST") {
+        const body = await readJson<{ name?: unknown }>(request);
+        if (typeof body.name !== "string" || body.name.trim() === "") throw badRequest("name is required");
+        return json(201, await createInstance(ctx, body.name));
+      }
+      if (request.method === "GET") return json(200, await listInstances(ctx));
+      throw badRequest("method not allowed");
+    }
+
+    const instanceTokensMatch = /^\/api\/instances\/([^/]+)\/tokens$/.exec(path);
+    if (instanceTokensMatch) {
+      const name = decodeURIComponent(instanceTokensMatch[1]!);
+      if (request.method === "POST") {
+        const body = await readJson<{ rotate?: unknown; overlap_seconds?: unknown }>(request);
+        return json(
+          201,
+          await issueInstanceToken(ctx, name, {
+            rotate: body.rotate === true,
+            overlap_seconds: typeof body.overlap_seconds === "number" ? body.overlap_seconds : undefined,
+          }),
+        );
+      }
+      if (request.method === "GET") return json(200, await listInstanceTokens(ctx, name));
+      throw badRequest("method not allowed");
+    }
+
+    const instanceTokenMatch = /^\/api\/instances\/([^/]+)\/tokens\/([^/]+)$/.exec(path);
+    if (instanceTokenMatch) {
+      if (request.method !== "DELETE") throw badRequest("method not allowed");
+      const name = decodeURIComponent(instanceTokenMatch[1]!);
+      const id = decodeURIComponent(instanceTokenMatch[2]!);
+      const result = await revokeInstanceToken(ctx, name, id);
+      if (!result.revoked) throw notFound("token not found");
+      return json(200, { revoked: true, id: result.id });
+    }
+
+    // ---------------------------------------------- person token registry
+    // Admin-only (spec 013, Part B). A member token is denied here with 403
+    // before any DO work.
     if (path === "/api/tokens") {
       if (!isRegistryAdmin(principal)) throw forbidden();
       if (request.method === "POST") {
@@ -143,10 +191,14 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
       throw badRequest("method not allowed");
     }
 
-    const ingestTokenMatch = /^\/api\/shots\/([^/]+)\/ingest-token$/.exec(path);
-    if (ingestTokenMatch) {
-      if (request.method !== "POST") throw badRequest("method not allowed");
-      return json(201, await mintShotIngestToken(ctx, requireShotId(ingestTokenMatch[1]!)));
+    // Superseded per-shot ingest token (spec 013) — explicit 410 Gone.
+    const legacyIngestTokenMatch = /^\/api\/shots\/([^/]+)\/ingest-token$/.exec(path);
+    if (legacyIngestTokenMatch) {
+      return json(410, {
+        error:
+          "per-shot ingest tokens were removed; configure one named instance token for POST /ingest/v1/{traces,metrics,logs}",
+        code: "gone",
+      });
     }
 
     const statusMatch = /^\/api\/shots\/([^/]+)$/.exec(path);
@@ -206,10 +258,10 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
   }
 }
 
-function ingestSignal(path: string): "traces" | "metrics" | "logs" | null {
+function ingestSignal(path: string): Signal | null {
   const match = /^\/ingest\/v1\/(traces|metrics|logs)$/.exec(path);
   if (!match) return null;
-  return match[1] as "traces" | "metrics" | "logs";
+  return match[1] as Signal;
 }
 
 function toolContext(env: AppEnv, url: URL): ToolContext {
@@ -219,79 +271,19 @@ function toolContext(env: AppEnv, url: URL): ToolContext {
     auth: env.AUTH_DO,
     origin: url.origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
-    maxConcurrentRecording: maxConcurrentRecording(env),
   };
 }
 
-// ------------------------------------------------------------ push ingest
-
-async function handleIngest(
-  request: Request,
+async function forwardLegacyIngest(
   env: AppEnv,
-  signal: "traces" | "metrics" | "logs",
+  shotId: string,
+  signal: string,
+  request: Request,
 ): Promise<Response> {
-  const ingest = ingestStub(env);
-  const token = extractToken(request);
-  const admitted = await ingestJson<IngestAdmitResult>(ingest, "/internal/admit", "POST", { token, signal });
-  if (!admitted.ok) {
-    return json(401, {
-      error: `ingest token ${admitted.reason}`,
-      code: `ingest_token_${admitted.reason}`,
-      reason: admitted.reason,
-    });
-  }
-  // The token is bound to exactly one shot, so it routes there directly.
-  const shotId = admitted.shot_id;
-  if (!shotId) {
-    return discardResponse(request, "ignored-no-active-shot");
-  }
-  const stub = env.SHOT_DO.getByName(shotId);
-  const resp = await forwardIngest(stub, signal, request);
-  if (isDefinitelyUnaccepted(resp)) {
-    // The ShotDO rejected the request *before* forwarding any bytes to the
-    // recorder (stop won the race, or the shot is no longer recording). That is
-    // provably uncommitted, so acknowledge with a valid OTLP ExportResponse and
-    // consciously discard; never attribute it to a different shot. A genuine
-    // 503 (storage failure, a down container, a write timeout) carries no
-    // marker and is propagated below so the exporter retries.
-    // A lost shot (its recording container stopped) is discarded the same way
-    // but with its own marker so operators can tell the two apart.
-    const disposition =
-      resp.headers.get("x-burstel-disposition") === "ignored-shot-lost" ? "ignored-shot-lost" : "ignored-no-active-shot";
-    await resp.body?.cancel().catch(() => undefined);
-    return discardResponse(request, disposition);
-  }
+  const resp = await forwardIngest(env.SHOT_DO.getByName(shotId), signal, request);
   const out = new Response(resp.body, resp);
   out.headers.set("x-burstel-shot-id", shotId);
   return out;
-}
-
-/**
- * True only for a definite, pre-commit rejection from the ShotDO boundary: it
- * carries the disposition marker, or is a 409 (every 409 the boundary emits for
- * ingest is produced before any recorder write). Genuine downstream failures —
- * notably a 503 storage/container error — must never be mistaken for this.
- */
-function isDefinitelyUnaccepted(resp: Response): boolean {
-  const disposition = resp.headers.get("x-burstel-disposition");
-  return disposition === "ignored-no-active-shot" || disposition === "ignored-shot-lost" || resp.status === 409;
-}
-
-/** A valid OTLP/HTTP 200 that deliberately discards data with no active shot. */
-export function discardResponse(request: Request, disposition: string): Response {
-  const contentType = request.headers.get("content-type") ?? "";
-  const headers: Record<string, string> = {
-    "x-burstel-disposition": disposition,
-    "cache-control": "no-store",
-  };
-  if (contentType.includes("application/json")) {
-    return new Response("{}", { status: 200, headers: { ...headers, "content-type": "application/json" } });
-  }
-  // An empty proto message is a valid Export{Trace,Metric,Log}ServiceResponse.
-  return new Response(new Uint8Array(0), {
-    status: 200,
-    headers: { ...headers, "content-type": "application/x-protobuf" },
-  });
 }
 
 async function forwardIngest(stub: DoStubLike, signal: string, request: Request): Promise<Response> {
@@ -308,53 +300,6 @@ async function forwardIngest(stub: DoStubLike, signal: string, request: Request)
     duplex: "half",
   } as RequestInit;
   return stub.fetch(new Request(`${DO_ORIGIN}/internal/ingest/${signal}`, init));
-}
-
-async function forwardLegacyIngest(
-  env: AppEnv,
-  shotId: string,
-  signal: string,
-  request: Request,
-): Promise<Response> {
-  const resp = await forwardIngest(env.SHOT_DO.getByName(shotId), signal, request);
-  const out = new Response(resp.body, resp);
-  out.headers.set("x-burstel-shot-id", shotId);
-  return out;
-}
-
-// ---------------------------------------------------------------- helpers
-
-function ingestStub(env: AppEnv): DoStubLike {
-  return env.INGEST_DO.getByName(INGEST_DO_NAME);
-}
-
-async function ingestJson<T>(
-  stub: DoStubLike,
-  path: string,
-  method: string,
-  body?: unknown,
-): Promise<T> {
-  const init: RequestInit = { method };
-  if (body !== undefined) {
-    init.headers = { "content-type": "application/json" };
-    init.body = JSON.stringify(body);
-  }
-  const resp = await stub.fetch(new Request(`${DO_ORIGIN}${path}`, init));
-  if (resp.status >= 200 && resp.status < 300) {
-    return (await resp.json()) as T;
-  }
-  let message = `ingest coordinator request failed with status ${resp.status}`;
-  let code = "error";
-  let retryable = false;
-  try {
-    const parsed = (await resp.json()) as { error?: string; code?: string; retryable?: boolean };
-    if (parsed.error) message = parsed.error;
-    if (parsed.code) code = parsed.code;
-    retryable = parsed.retryable === true;
-  } catch {
-    // keep defaults
-  }
-  throw new HttpError(resp.status, message, retryable, code);
 }
 
 function requireShotId(raw: string): string {

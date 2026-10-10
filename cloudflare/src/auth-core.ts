@@ -21,7 +21,7 @@
 //   * `owner` is attribution/audit only. It is never consulted for
 //     authorization, so a `member` token may operate on any shot.
 
-import { constantTimeEqual, sha256Hex } from "./ingest-core";
+import { constantTimeEqual, sha256Hex } from "./crypto";
 import { errorResponse, json, readJson } from "./http";
 import type { SqlRow, SqlValue, SyncSql } from "./store";
 

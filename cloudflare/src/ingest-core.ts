@@ -1,71 +1,35 @@
-// Per-shot push-only OTLP ingest credentials + shot registry (spec 013, Part A).
+// Ingestion coordinator core (spec 014).
 //
 // This core is deliberately free of Cloudflare-specific globals so the exact
 // same logic runs in production (over `IngestDO` SQLite storage) and in unit
 // tests (over `bun:sqlite`). It owns:
 //
-//   * the per-shot push-only ingest tokens: each is bound to exactly one shot
-//     id and persisted only as a one-way SHA-256 digest with its exact 24h
-//     (`86_400s`) issue/expiry timestamps. Several tokens may be valid at once
-//     and route independently (token -> shot);
-//   * the shot registry: which shots exist, their attribution-only `owner` and
-//     the set that is currently recording, so `POST /api/shots` can enforce the
-//     `MAX_CONCURRENT_RECORDING` cap and `GET /api/shots` can list shots.
+//   * the named-instance registry and push-only instance credentials, delegated
+//     to {@link InstanceCore} over the same SQLite storage (spec 014);
+//   * the durable raw-journal ledger: one row per *acknowledged* OTLP export,
+//     written after the raw bytes are durable in R2 and before the OTLP 200;
+//   * the shot registry: which shots exist and their attribution-only `owner`,
+//     so `GET /api/shots` can list shots. The former
+//     `MAX_CONCURRENT_RECORDING` cap is gone (spec 014): shots may record
+//     concurrently, bounded only by explicit backend capacity controls.
 //
 // Design boundaries:
-//   * A push token authorizes *only* POST /ingest/v1/{traces,metrics,logs}. It
-//     is never compared against, or treated as, `BURSTEL_API_TOKEN`.
+//   * An instance token authorizes *only* POST /ingest/v1/{traces,metrics,logs}
+//     and resolves to an instance, never to a shot or a segment.
 //   * Expiry is evaluated per arriving request against an injectable clock and
 //     is never extended by shot creation, stop, queries or telemetry.
-//   * A token is revoked when its shot freezes, with a short grace so batches
-//     already admitted still drain (they reach a non-recording shot, which the
-//     stable `/ingest` forwarder consciously discards). Expiry never calls
-//     `shot_stop`, deletes a shot or expires one; frozen artifacts outlive the
-//     token by design.
+//   * A frozen shot's artifact outlives its (former) credentials by design.
 
-import { capacityExhausted } from "./errors";
 import { errorResponse, json, readJson } from "./http";
+import { InstanceCore, newInstanceToken } from "./instance-core";
+import type { InstanceCoreDeps } from "./instance-core";
 import { SIGNALS } from "./store";
 import type { Signal, SqlRow, SqlValue, SyncSql } from "./store";
 
-/** Exact token lifetime mandated by the spec. */
-export const INGEST_TOKEN_TTL_SECONDS = 86_400;
-export const INGEST_TOKEN_TTL_MS = INGEST_TOKEN_TTL_SECONDS * 1000;
-
-/**
- * Grace after a shot freezes during which its ingest token is still admitted:
- * late, previously admitted batches reach a non-recording shot (and are
- * discarded) instead of being answered with a hard 401.
- */
-export const INGEST_TOKEN_GRACE_MS = 60_000;
+export { constantTimeEqual, sha256Hex } from "./crypto";
 
 /** Name of the singleton coordinator Durable Object. */
 export const INGEST_DO_NAME = "ingest-primary";
-
-export type IngestRejectReason = "missing" | "invalid" | "expired" | "revoked";
-
-export interface ShotIngestTokenIssue {
-  /** Raw secret. Returned exactly once, at issuance. */
-  token: string;
-  shot_id: string;
-  issued_at: string;
-  expires_at: string;
-  ttl_seconds: number;
-}
-
-export interface IngestAdmitSuccess {
-  ok: true;
-  /** The shot the presented token is bound to. */
-  shot_id: string;
-  expires_at: number;
-}
-
-export interface IngestAdmitFailure {
-  ok: false;
-  reason: IngestRejectReason;
-}
-
-export type IngestAdmitResult = IngestAdmitSuccess | IngestAdmitFailure;
 
 /** One registered shot, as persisted by the coordinator. */
 export interface RegisteredShot {
@@ -78,28 +42,39 @@ export interface RegisteredShot {
   sha256: string | null;
 }
 
+/** One acknowledged OTLP export in the durable raw-journal ledger. */
+export interface JournalEntry {
+  /** R2 object key holding the immutable raw OTLP bytes. */
+  key: string;
+  instance_id: string;
+  instance: string;
+  signal: string;
+  size: number;
+  /** Lowercase hex SHA-256 of the stored (possibly gzip) bytes. */
+  sha256: string;
+  content_type: string;
+  content_encoding: string;
+  /** Original `request received_at`, epoch ms. */
+  received_at: number;
+  /** Set by the coordinator when the row is committed. */
+  committed_at?: number;
+}
+
 export interface IngestCoreDeps {
   sql: SyncSql;
   /** Injectable clock (epoch ms) for deterministic tests. */
   now?: () => number;
   /** Injectable CSPRNG token generator for deterministic tests. */
   generateToken?: () => string;
+  /** Injectable instance-id generator for deterministic tests. */
+  generateInstanceId?: () => string;
+  /** Injectable token-id generator for deterministic tests. */
+  generateTokenId?: () => string;
 }
 
 const SCHEMA_STATEMENTS: string[] = [
-  // Per-shot push tokens, bound to exactly one shot id. Only the digest is
-  // persisted; `grace_until` lets already-admitted batches drain after freeze.
-  `CREATE TABLE IF NOT EXISTS shot_ingest_token (
-     digest      TEXT PRIMARY KEY,
-     shot_id     TEXT NOT NULL,
-     issued_at   INTEGER NOT NULL,
-     expires_at  INTEGER NOT NULL,
-     revoked     INTEGER NOT NULL DEFAULT 0,
-     grace_until INTEGER
-   )`,
-  `CREATE INDEX IF NOT EXISTS shot_ingest_token_shot ON shot_ingest_token (shot_id)`,
-  // The shot registry: attribution-only owner plus enough state for the
-  // concurrency cap and `GET /api/shots` fallbacks.
+  // The shot registry: attribution-only owner plus enough state for
+  // `GET /api/shots` fallbacks. Recording is no longer capped by this table.
   `CREATE TABLE IF NOT EXISTS shot_registry (
      shot_id    TEXT PRIMARY KEY,
      owner      TEXT NOT NULL DEFAULT 'legacy',
@@ -110,6 +85,21 @@ const SCHEMA_STATEMENTS: string[] = [
      sha256     TEXT
    )`,
   `CREATE INDEX IF NOT EXISTS shot_registry_created ON shot_registry (created_at)`,
+  // Durable raw-journal index: one row per acknowledged OTLP export. The raw
+  // bytes live in R2; this row is the durable ledger the ACK depends on.
+  `CREATE TABLE IF NOT EXISTS journal_ledger (
+     object_key       TEXT PRIMARY KEY,
+     instance_id      TEXT NOT NULL,
+     instance         TEXT NOT NULL,
+     signal           TEXT NOT NULL,
+     size             INTEGER NOT NULL,
+     sha256           TEXT NOT NULL,
+     content_type     TEXT NOT NULL DEFAULT '',
+     content_encoding TEXT NOT NULL DEFAULT '',
+     received_at      INTEGER NOT NULL,
+     committed_at     INTEGER NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS journal_ledger_instance ON journal_ledger (instance_id, received_at)`,
   // Safe structured diagnostics; never contains token material.
   `CREATE TABLE IF NOT EXISTS ingest_counters (
      name  TEXT PRIMARY KEY,
@@ -117,56 +107,28 @@ const SCHEMA_STATEMENTS: string[] = [
    )`,
 ];
 
-/** 256 bits of CSPRNG entropy, URL-safe. Prefix aids operator identification. */
-export function newIngestToken(): string {
-  const bytes = new Uint8Array(32);
-  crypto.getRandomValues(bytes);
-  let binary = "";
-  for (const b of bytes) binary += String.fromCharCode(b);
-  const encoded = btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-  return `blt_${encoded}`;
-}
-
-/** Lowercase hex SHA-256 digest of a UTF-8 string. */
-export async function sha256Hex(text: string): Promise<string> {
-  const data = new TextEncoder().encode(text);
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/** Constant-time-ish string comparison folded over both lengths. */
-export function constantTimeEqual(a: string, b: string): boolean {
-  const len = Math.max(a.length, b.length);
-  let diff = a.length ^ b.length;
-  for (let i = 0; i < len; i++) {
-    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
-  }
-  return diff === 0;
-}
-
-interface TokenRow {
-  digest: string;
-  shot_id: string;
-  expires_at: number;
-  revoked: number;
-  grace_until: number | null;
-}
-
 export class IngestCore {
   private readonly sql: SyncSql;
   private readonly now: () => number;
-  private readonly generateToken: () => string;
+  private readonly instances: InstanceCore;
   private loaded = false;
   private loading?: Promise<void>;
 
   constructor(deps: IngestCoreDeps) {
     this.sql = deps.sql;
     this.now = deps.now ?? (() => Date.now());
-    this.generateToken = deps.generateToken ?? newIngestToken;
+    this.instances = new InstanceCore({
+      sql: deps.sql,
+      now: deps.now,
+      generateToken: deps.generateToken ?? newInstanceToken,
+      generateInstanceId: deps.generateInstanceId,
+      generateTokenId: deps.generateTokenId,
+    });
   }
 
   async load(): Promise<void> {
     for (const stmt of SCHEMA_STATEMENTS) this.sql.exec(stmt);
+    await this.instances.load();
     this.loaded = true;
   }
 
@@ -176,109 +138,21 @@ export class IngestCore {
     await this.loading;
   }
 
-  // ----------------------------------------------------------- tokens
-
-  /**
-   * Mints a fresh push token bound to `shotId`, persisted only as a digest.
-   * There is no silent renewal: every issuance is an explicit request and the
-   * token is disclosed exactly once.
-   */
-  async issueShotToken(shotId: string): Promise<ShotIngestTokenIssue> {
-    await this.ensureLoaded();
-    const token = this.generateToken();
-    const digest = await sha256Hex(token);
-    const issuedAt = this.now();
-    const expiresAt = issuedAt + INGEST_TOKEN_TTL_MS;
-    this.sql.exec(
-      `INSERT INTO shot_ingest_token (digest, shot_id, issued_at, expires_at, revoked, grace_until)
-       VALUES (?, ?, ?, ?, 0, NULL)`,
-      digest,
-      shotId,
-      issuedAt,
-      expiresAt,
-    );
-    this.bump("issued");
-    return {
-      token,
-      shot_id: shotId,
-      issued_at: new Date(issuedAt).toISOString(),
-      expires_at: new Date(expiresAt).toISOString(),
-      ttl_seconds: INGEST_TOKEN_TTL_SECONDS,
-    };
-  }
-
-  /**
-   * Revokes every active token for a shot (at freeze), leaving a short grace so
-   * already-admitted batches drain into a non-recording shot.
-   */
-  async revokeShotTokens(shotId: string): Promise<{ revoked: number }> {
-    await this.ensureLoaded();
-    const grace = this.now() + INGEST_TOKEN_GRACE_MS;
-    const cursor = this.sql.exec(
-      `UPDATE shot_ingest_token SET revoked = 1, grace_until = ?
-       WHERE shot_id = ? AND revoked = 0`,
-      grace,
-      shotId,
-    );
-    const revoked = cursor.rowsWritten ?? 0;
-    if (revoked > 0) this.bump("revoked_count", revoked);
-    return { revoked };
-  }
-
-  /**
-   * Verifies a push token for one signal and resolves the shot it is bound to.
-   *
-   * Acceptance is exactly `now < expires_at`; at `expires_at` and later the
-   * request is rejected regardless of recording state. Revocation fails closed
-   * after the freeze grace. Comparison against stored digests is constant-time
-   * and never reveals token material.
-   */
-  async admit(token: string | null, signal: Signal): Promise<IngestAdmitResult> {
-    await this.ensureLoaded();
-    this.bump("requests");
-    if (!token) {
-      this.bump("missing");
-      return { ok: false, reason: "missing" };
-    }
-    const digest = await sha256Hex(token);
-    let match: TokenRow | undefined;
-    for (const row of this.tokenRows()) {
-      if (constantTimeEqual(digest, row.digest)) match = row;
-    }
-    if (!match) {
-      this.bump("invalid");
-      return { ok: false, reason: "invalid" };
-    }
-    const now = this.now();
-    const inGrace = match.grace_until !== null && now < match.grace_until;
-    if (match.revoked === 1 && !inGrace) {
-      this.bump("revoked");
-      return { ok: false, reason: "revoked" };
-    }
-    if (now >= match.expires_at) {
-      this.bump("expired");
-      return { ok: false, reason: "expired" };
-    }
-    this.bump("accepted");
-    this.bump(`accepted:${signal}`);
-    return { ok: true, shot_id: match.shot_id, expires_at: match.expires_at };
+  /** The named-instance registry and credential store over the same storage. */
+  get instanceRegistry(): InstanceCore {
+    return this.instances;
   }
 
   // ----------------------------------------------------------- registry
 
   /**
-   * Atomically reserves a recording slot for a freshly created shot, enforcing
-   * the concurrency cap. Throws `503 capacity_exhausted` (retryable) without
-   * writing any state when the cap is reached.
+   * Registers a freshly created shot for listing and the owner filter. There is
+   * no concurrency cap (spec 014): recording is bounded by the explicit backend
+   * container capacity controls, not by an application-level rule.
    */
-  async reserveShot(shotId: string, owner: string, max: number): Promise<{ active: number }> {
+  async registerShot(shotId: string, owner: string): Promise<{ registered: boolean }> {
     await this.ensureLoaded();
-    const active = this.countRecording();
-    if (active >= max) {
-      this.bump("capacity_rejected");
-      throw capacityExhausted(max);
-    }
-    this.sql.exec(
+    const cursor = this.sql.exec(
       `INSERT INTO shot_registry (shot_id, owner, created_at, state)
        VALUES (?, ?, ?, 'recording')
        ON CONFLICT (shot_id) DO UPDATE SET owner = excluded.owner, state = 'recording'`,
@@ -286,14 +160,13 @@ export class IngestCore {
       owner,
       this.now(),
     );
-    this.bump("reserved");
-    return { active: active + 1 };
+    this.bump("registered");
+    return { registered: (cursor.rowsWritten ?? 0) > 0 };
   }
 
   /**
-   * Releases one or more reservations. Used to roll back a failed shot start
-   * (so the cap never leaks) and to reconcile stale `recording` entries whose
-   * ShotDO is gone.
+   * Releases one or more registrations. Used to roll back a failed shot start
+   * and to reconcile stale `recording` entries whose ShotDO is gone.
    */
   async releaseShots(shotIds: string[]): Promise<{ released: number }> {
     await this.ensureLoaded();
@@ -306,7 +179,7 @@ export class IngestCore {
     return { released };
   }
 
-  /** Records a shot's terminal/observed state so listing and the cap stay true. */
+  /** Records a shot's terminal/observed state so listing stays true. */
   async setShotState(
     shotId: string,
     state: string,
@@ -329,7 +202,7 @@ export class IngestCore {
     return { updated: (cursor.rowsWritten ?? 0) > 0 };
   }
 
-  /** Shot ids currently registered as recording, for cap reconciliation. */
+  /** Shot ids currently registered as recording (reconciliation fallback). */
   async listRecording(): Promise<{ shots: Array<{ shot_id: string }> }> {
     await this.ensureLoaded();
     const shots = this.sql
@@ -363,12 +236,86 @@ export class IngestCore {
     return { shots: rows.map(registeredRow), total };
   }
 
+  // ------------------------------------------------------------- journal
+
+  /**
+   * Durably indexes one acknowledged OTLP export. Idempotent on the object key
+   * so a reconciliation replay cannot double-count. Must succeed before the
+   * Worker answers the exporter with OTLP 200.
+   */
+  async commitJournal(entry: JournalEntry): Promise<{ committed: boolean }> {
+    await this.ensureLoaded();
+    const cursor = this.sql.exec(
+      `INSERT INTO journal_ledger
+         (object_key, instance_id, instance, signal, size, sha256, content_type, content_encoding, received_at, committed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (object_key) DO NOTHING`,
+      entry.key,
+      entry.instance_id,
+      entry.instance,
+      entry.signal,
+      entry.size,
+      entry.sha256,
+      entry.content_type ?? "",
+      entry.content_encoding ?? "",
+      entry.received_at,
+      this.now(),
+    );
+    const committed = (cursor.rowsWritten ?? 0) > 0;
+    this.bump(committed ? "journal_committed" : "journal_duplicate");
+    this.bump(`journal_committed:${entry.signal}`);
+    return { committed };
+  }
+
+  /**
+   * Reconciles one or more candidate R2 objects into the ledger. Used after a
+   * partial failure (raw bytes durable, ledger write lost) so an unindexed
+   * object is recovered without re-writing the payload.
+   */
+  async reconcileJournal(entries: JournalEntry[]): Promise<{ reconciled: number; skipped: number }> {
+    await this.ensureLoaded();
+    let reconciled = 0;
+    let skipped = 0;
+    for (const entry of entries) {
+      const result = await this.commitJournal(entry);
+      if (result.committed) reconciled += 1;
+      else skipped += 1;
+    }
+    if (reconciled > 0) this.bump("journal_reconciled", reconciled);
+    return { reconciled, skipped };
+  }
+
+  /** Ledger rows, newest first, optionally scoped to one instance. */
+  async listJournal(opts: { instance_id?: string; limit: number; offset: number }): Promise<{
+    entries: JournalEntry[];
+    total: number;
+  }> {
+    await this.ensureLoaded();
+    const where = opts.instance_id ? `WHERE instance_id = ?` : "";
+    const args: SqlValue[] = opts.instance_id ? [opts.instance_id] : [];
+    const totalRows = this.sql.exec(`SELECT COUNT(*) AS n FROM journal_ledger ${where}`, ...args).toArray();
+    const total = Number(totalRows[0]?.n ?? 0);
+    const rows = this.sql
+      .exec(
+        `SELECT object_key, instance_id, instance, signal, size, sha256,
+                content_type, content_encoding, received_at, committed_at
+           FROM journal_ledger ${where}
+          ORDER BY received_at DESC, object_key DESC
+          LIMIT ? OFFSET ?`,
+        ...args,
+        opts.limit,
+        opts.offset,
+      )
+      .toArray();
+    return { entries: rows.map(journalRow), total };
+  }
+
   async status(): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
     return {
-      tokens: this.tokenCount(),
       recording: this.countRecording(),
       shots: this.countShots(),
+      journal: this.countJournal(),
       counters: this.counters(),
     };
   }
@@ -379,39 +326,42 @@ export class IngestCore {
     await this.ensureLoaded();
     try {
       const path = new URL(request.url).pathname;
-      if (path === "/internal/admit") {
-        if (request.method !== "POST") return json(405, { error: "method not allowed" });
-        const body = await readJson<{ token?: string | null; signal?: string }>(request);
-        if (typeof body.signal !== "string" || !SIGNALS.includes(body.signal as Signal)) {
-          return json(400, { error: "signal is required", code: "bad_request" });
-        }
-        return json(200, await this.admit(body.token ?? null, body.signal as Signal));
+      if (path.startsWith("/internal/instance/")) {
+        return await this.instances.handleInternal(request);
       }
-      if (path === "/internal/shot-token/issue") {
+      if (path === "/internal/journal/commit") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
-        const body = await readJson<{ shot_id?: string }>(request);
+        const entry = await readJson<Partial<JournalEntry>>(request);
+        const validated = validateJournalEntry(entry);
+        if (!validated.ok) return json(400, { error: validated.error, code: "bad_request" });
+        return json(200, await this.commitJournal(validated.entry));
+      }
+      if (path === "/internal/journal/reconcile") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ entries?: Partial<JournalEntry>[] }>(request);
+        const entries: JournalEntry[] = [];
+        for (const raw of body.entries ?? []) {
+          const validated = validateJournalEntry(raw);
+          if (!validated.ok) return json(400, { error: validated.error, code: "bad_request" });
+          entries.push(validated.entry);
+        }
+        return json(200, await this.reconcileJournal(entries));
+      }
+      if (path === "/internal/journal/list") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ instance_id?: string; limit?: number; offset?: number }>(request);
+        const limit = typeof body.limit === "number" && body.limit > 0 ? Math.min(body.limit, 200) : 50;
+        const offset = typeof body.offset === "number" && body.offset > 0 ? body.offset : 0;
+        return json(200, await this.listJournal({ instance_id: body.instance_id, limit, offset }));
+      }
+      if (path === "/internal/shot/register") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ shot_id?: string; owner?: string }>(request);
         if (typeof body.shot_id !== "string" || body.shot_id === "") {
           return json(400, { error: "shot_id is required", code: "bad_request" });
         }
-        return json(200, await this.issueShotToken(body.shot_id));
-      }
-      if (path === "/internal/shot-token/revoke") {
-        if (request.method !== "POST") return json(405, { error: "method not allowed" });
-        const body = await readJson<{ shot_id?: string }>(request);
-        if (typeof body.shot_id !== "string" || body.shot_id === "") {
-          return json(400, { error: "shot_id is required", code: "bad_request" });
-        }
-        return json(200, await this.revokeShotTokens(body.shot_id));
-      }
-      if (path === "/internal/shot/reserve") {
-        if (request.method !== "POST") return json(405, { error: "method not allowed" });
-        const body = await readJson<{ shot_id?: string; owner?: string; max?: number }>(request);
-        if (typeof body.shot_id !== "string" || body.shot_id === "") {
-          return json(400, { error: "shot_id is required", code: "bad_request" });
-        }
-        const max = typeof body.max === "number" && body.max > 0 ? body.max : Number.MAX_SAFE_INTEGER;
         const owner = typeof body.owner === "string" && body.owner !== "" ? body.owner : "legacy";
-        return json(200, await this.reserveShot(body.shot_id, owner, max));
+        return json(200, await this.registerShot(body.shot_id, owner));
       }
       if (path === "/internal/shot/release") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
@@ -464,22 +414,6 @@ export class IngestCore {
 
   // ---------------------------------------------------------------- helpers
 
-  private tokenRows(): TokenRow[] {
-    return this.sql
-      .exec(
-        `SELECT digest, shot_id, expires_at, revoked, grace_until
-           FROM shot_ingest_token`,
-      )
-      .toArray()
-      .map((row) => ({
-        digest: String(row.digest),
-        shot_id: String(row.shot_id),
-        expires_at: Number(row.expires_at),
-        revoked: Number(row.revoked ?? 0),
-        grace_until: row.grace_until == null ? null : Number(row.grace_until),
-      }));
-  }
-
   private countRecording(): number {
     const rows = this.sql.exec(`SELECT COUNT(*) AS n FROM shot_registry WHERE state = 'recording'`).toArray();
     return Number(rows[0]?.n ?? 0);
@@ -490,8 +424,8 @@ export class IngestCore {
     return Number(rows[0]?.n ?? 0);
   }
 
-  private tokenCount(): number {
-    const rows = this.sql.exec(`SELECT COUNT(*) AS n FROM shot_ingest_token WHERE revoked = 0`).toArray();
+  private countJournal(): number {
+    const rows = this.sql.exec(`SELECT COUNT(*) AS n FROM journal_ledger`).toArray();
     return Number(rows[0]?.n ?? 0);
   }
 
@@ -524,3 +458,73 @@ function registeredRow(row: SqlRow): RegisteredShot {
     sha256: row.sha256 == null ? null : String(row.sha256),
   };
 }
+
+function journalRow(row: SqlRow): JournalEntry {
+  return {
+    key: String(row.object_key),
+    instance_id: String(row.instance_id),
+    instance: String(row.instance),
+    signal: String(row.signal),
+    size: Number(row.size),
+    sha256: String(row.sha256),
+    content_type: String(row.content_type ?? ""),
+    content_encoding: String(row.content_encoding ?? ""),
+    received_at: Number(row.received_at),
+    committed_at: Number(row.committed_at),
+  };
+}
+
+type JournalValidation = { ok: true; entry: JournalEntry } | { ok: false; error: string };
+
+export function validateJournalEntry(raw: Partial<JournalEntry> | undefined): JournalValidation {
+  if (!raw || typeof raw.key !== "string" || raw.key === "") return { ok: false, error: "key is required" };
+  if (typeof raw.instance_id !== "string" || raw.instance_id === "") {
+    return { ok: false, error: "instance_id is required" };
+  }
+  if (typeof raw.signal !== "string" || !SIGNALS.includes(raw.signal as Signal)) {
+    return { ok: false, error: "signal is required" };
+  }
+  if (typeof raw.size !== "number" || !Number.isFinite(raw.size) || raw.size < 0) {
+    return { ok: false, error: "size must be a non-negative number" };
+  }
+  if (typeof raw.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(raw.sha256)) {
+    return { ok: false, error: "sha256 must be lowercase hex" };
+  }
+  if (typeof raw.received_at !== "number" || !Number.isFinite(raw.received_at)) {
+    return { ok: false, error: "received_at is required" };
+  }
+  return {
+    ok: true,
+    entry: {
+      key: raw.key,
+      instance_id: raw.instance_id,
+      instance: typeof raw.instance === "string" ? raw.instance : "",
+      signal: raw.signal,
+      size: raw.size,
+      sha256: raw.sha256,
+      content_type: typeof raw.content_type === "string" ? raw.content_type : "",
+      content_encoding: typeof raw.content_encoding === "string" ? raw.content_encoding : "",
+      received_at: raw.received_at,
+    },
+  };
+}
+
+// Re-export the instance registry primitives so callers can build a standalone
+// registry over the same storage (used by tests).
+export {
+  INSTANCE_TOKEN_TTL_SECONDS,
+  INSTANCE_TOKEN_TTL_MS,
+  InstanceCore,
+  isValidInstanceName,
+  MAX_INSTANCE_ROTATION_OVERLAP_SECONDS,
+  newInstanceId,
+  newInstanceToken,
+  normalizeInstanceName,
+} from "./instance-core";
+export type {
+  InstanceAdmitResult,
+  InstanceMetadata,
+  InstanceTokenIssue,
+  InstanceTokenMetadata,
+} from "./instance-core";
+export type { InstanceCoreDeps };

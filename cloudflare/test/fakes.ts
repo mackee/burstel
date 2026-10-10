@@ -6,7 +6,15 @@
 
 import { Database } from "bun:sqlite";
 
-import type { ArtifactResult, ArtifactSink, ArtifactSource } from "../src/artifacts";
+import type {
+  ArtifactResult,
+  ArtifactSink,
+  ArtifactSource,
+  R2BucketLike,
+  R2ObjectBodyLike,
+  R2ObjectLike,
+  R2PutOptionsLike,
+} from "../src/artifacts";
 import { AuthCore } from "../src/auth-core";
 import type { ContainerControl } from "../src/container";
 import type { HeartbeatScheduler, ShotCoreDeps } from "../src/core";
@@ -321,6 +329,55 @@ export class FakeArtifacts implements ArtifactSink {
   }
 }
 
+/** In-memory R2 bucket for the durable raw-journal intake tests. */
+export class FakeBucket implements R2BucketLike {
+  readonly objects = new Map<
+    string,
+    { bytes: Uint8Array; contentType?: string; customMetadata?: Record<string, string>; sha256?: string }
+  >();
+  putCalls = 0;
+  failPut: Error | undefined;
+
+  async put(key: string, value: unknown, options?: R2PutOptionsLike): Promise<R2ObjectLike | null> {
+    this.putCalls += 1;
+    if (this.failPut) throw this.failPut;
+    const bytes = await coerceBytes(value);
+    this.objects.set(key, {
+      bytes,
+      contentType: options?.httpMetadata?.contentType,
+      customMetadata: options?.customMetadata,
+      sha256: options?.sha256,
+    });
+    return { key, size: bytes.byteLength, etag: `"${key}"` };
+  }
+
+  async get(key: string): Promise<R2ObjectBodyLike | null> {
+    const object = this.objects.get(key);
+    if (!object) return null;
+    const copy = new Uint8Array(object.bytes.byteLength);
+    copy.set(object.bytes);
+    return {
+      key,
+      size: copy.byteLength,
+      body: new Response(copy).body as ReadableStream<Uint8Array>,
+      text: async () => new TextDecoder().decode(object.bytes),
+      customMetadata: object.customMetadata,
+    };
+  }
+
+  async createMultipartUpload(): Promise<never> {
+    throw new Error("multipart upload is not implemented by FakeBucket");
+  }
+}
+
+async function coerceBytes(value: unknown): Promise<Uint8Array> {
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (typeof value === "string") return new TextEncoder().encode(value);
+  if (value == null) return new Uint8Array();
+  return new Uint8Array(await new Response(value as ReadableStream<Uint8Array>).arrayBuffer());
+}
+
 /** Records armed heartbeats instead of setting a DO alarm. */
 export class FakeScheduler implements HeartbeatScheduler {
   readonly armed: number[] = [];
@@ -347,10 +404,22 @@ export interface IngestHarness {
 
 /** Builds an {@link IngestCore} over real in-process SQLite with a fake clock. */
 export function makeIngest(
-  options: { now?: () => number; generateToken?: () => string; sql?: BunSql } = {},
+  options: {
+    now?: () => number;
+    generateToken?: () => string;
+    generateInstanceId?: () => string;
+    generateTokenId?: () => string;
+    sql?: BunSql;
+  } = {},
 ): IngestHarness {
   const sql = options.sql ?? new BunSql();
-  const core = new IngestCore({ sql, now: options.now, generateToken: options.generateToken });
+  const core = new IngestCore({
+    sql,
+    now: options.now,
+    generateToken: options.generateToken,
+    generateInstanceId: options.generateInstanceId,
+    generateTokenId: options.generateTokenId,
+  });
   return { core, sql };
 }
 

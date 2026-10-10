@@ -1,5 +1,7 @@
 // Shared Worker/DO types used by the HTTP app, the MCP server and the tools.
 
+import type { R2BucketLike } from "./artifacts";
+
 /** Structural subset of `DurableObjectStub`. */
 export interface DoStubLike {
   fetch(request: Request): Promise<Response>;
@@ -29,6 +31,12 @@ export interface AppEnv {
    * non-admin bearer token fails closed (`401`).
    */
   AUTH_DO?: AuthNamespaceLike;
+  /**
+   * Durable raw-journal bucket for continuous OTLP intake (spec 014). The
+   * trusted R2 bucket binding; every acknowledged export is committed here
+   * before the OTLP 200 is returned. Optional so pure unit tests can omit it.
+   */
+  BUCKET?: R2BucketLike;
   BURSTEL_API_TOKEN?: string;
   /**
    * Trusted local-development escape hatch. When set to `1`/`true`, admin
@@ -38,25 +46,27 @@ export interface AppEnv {
   BURSTEL_DEV_INSECURE_AUTH?: string;
   PUBLIC_BASE_URL?: string;
   /**
-   * Maximum number of shots that may record concurrently (spec 013, Part A).
-   * A Worker var; defaults to {@link DEFAULT_MAX_CONCURRENT_RECORDING} when
-   * unset or invalid. Exceeding it yields a retryable `503 capacity_exhausted`.
+   * Maximum accepted OTLP body size in bytes for a single export (spec 014).
+   * Over-limit requests are rejected with `413` before any durable write.
    */
-  MAX_CONCURRENT_RECORDING?: string;
+  MAX_INGEST_BYTES?: string;
 }
 
 /** Internal origin used for requests the Worker makes to a ShotDO/IngestDO. */
 export const DO_ORIGIN = "https://shot-do.internal";
 
-/** Default cap when `MAX_CONCURRENT_RECORDING` is absent or invalid. */
-export const DEFAULT_MAX_CONCURRENT_RECORDING = 10;
+/** R2 key prefix for the durable raw OTLP journal (never the shot archive). */
+export const JOURNAL_PREFIX = "journal";
 
-/** Parses the `MAX_CONCURRENT_RECORDING` Worker var, falling back to the default. */
-export function maxConcurrentRecording(env: { MAX_CONCURRENT_RECORDING?: string }): number {
-  const raw = env.MAX_CONCURRENT_RECORDING?.trim();
-  if (!raw) return DEFAULT_MAX_CONCURRENT_RECORDING;
+/** Default maximum accepted OTLP body size (8 MiB). */
+export const DEFAULT_MAX_INGEST_BYTES = 8 * 1024 * 1024;
+
+/** Parses `MAX_INGEST_BYTES`, falling back to the default. */
+export function maxIngestBytes(env: { MAX_INGEST_BYTES?: string }): number {
+  const raw = env.MAX_INGEST_BYTES?.trim();
+  if (!raw) return DEFAULT_MAX_INGEST_BYTES;
   const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_CONCURRENT_RECORDING;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_MAX_INGEST_BYTES;
 }
 
 /** Bounds for `GET /api/shots` pagination. */

@@ -1,10 +1,11 @@
 # ADR-002: Stable OTLP `/ingest` with a 24h push-only token
 
-Status: accepted (spec 006); **superseded by spec 013, Parts A+B** (the
-installation-wide token is replaced by per-shot tokens; the stable URL and the
-token→shot routing are retained; shared multi-user access is added via the
-digest-only `AuthDO` registry). The context below records the original decision;
-the "24h push-only token" and "active-shot mapping" it describes no longer exist.
+Status: accepted (spec 006); **superseded by spec 013, Parts A+B** and then by
+**spec 014** (ADR-003). Spec 014 removes the installation-wide *and* per-shot
+ingest tokens in favor of named-instance tokens (token → instance, never →
+shot) and a durable R2 raw journal. The context below records the original
+decision; the "24h push-only token" and "active-shot mapping" it describes no
+longer exist. The stable `/ingest` URL is retained.
 
 ## Context
 

@@ -1,34 +1,33 @@
-// Shot tools shared by the REST API and the MCP server.
+// Shot, instance and token tools shared by the REST API and the MCP server.
 //
-// Every tool is a thin, authenticated proxy to a per-shot ShotDO. The DO owns
-// the R2 artifact, the analysis container and the read-only DuckDB session, so
-// MCP callers cannot bypass the same boundary the REST API uses.
+// Every tool is a thin, authenticated proxy to a Durable Object. The ShotDO owns
+// the R2 artifact, the analysis container and the read-only DuckDB session; the
+// IngestDO owns the named-instance registry, instance credentials and the
+// durable raw-journal ledger. MCP callers cannot bypass the same boundaries the
+// REST API uses.
 //
-// Spec 013 Part A: shots record concurrently. The stable `/ingest` endpoint no
-// longer targets a single active shot; each per-shot ingest token routes to its
-// own shot. The coordinator (`IngestDO`) holds the shot registry, enforces the
-// `MAX_CONCURRENT_RECORDING` cap and persists per-shot token digests.
+// Spec 014: named instances with 256-bit push-only tokens replaced the per-shot
+// ingest tokens and the recording cap. `/ingest/v1/*` now journals raw OTLP
+// durably for an instance and never targets a shot.
 
 import { AUTH_DO_NAME, isScope } from "./auth-core";
 import type { AuthTokenIssue, AuthTokenMetadata } from "./auth-core";
 import { DO_ORIGIN } from "./env";
 import type { AuthNamespaceLike, DoStubLike, IngestNamespaceLike, ShotNamespaceLike } from "./env";
-import { badRequest, capacityExhausted, conflict, HttpError } from "./errors";
-import { INGEST_DO_NAME } from "./ingest-core";
-import type { ShotIngestTokenIssue } from "./ingest-core";
+import { badRequest, conflict, HttpError } from "./errors";
+import { INGEST_DO_NAME, isValidInstanceName, normalizeInstanceName } from "./ingest-core";
+import type { InstanceMetadata, InstanceTokenIssue, InstanceTokenMetadata } from "./ingest-core";
 import { isShotId, newShotId } from "./ids";
 
 export interface ToolContext {
   namespace: ShotNamespaceLike;
-  /** Installation-wide coordinator: shot registry, per-shot tokens and cap. */
+  /** Installation-wide coordinator: instance registry, journal ledger, shots. */
   ingest: IngestNamespaceLike;
   /** Multi-user token registry (spec 013, Part B); optional in pure unit tests. */
   auth?: AuthNamespaceLike;
   /** Origin of the incoming request, used to advertise OTLP endpoints. */
   origin: string;
   publicBaseUrl?: string;
-  /** Maximum number of shots that may record at once (spec 013, Part A). */
-  maxConcurrentRecording: number;
 }
 
 export interface FreezeRef {
@@ -74,10 +73,15 @@ export function createTools(ctx: ToolContext) {
     schema: (shotId: string) => schemaShot(ctx, shotId),
     compare: (leftId: string, rightId: string, topN?: number) => compareShots(ctx, leftId, rightId, topN),
     list: (opts: { owner?: string; limit?: number; offset?: number } = {}) => listShots(ctx, opts),
-    issueIngestToken: (shotId: string) => mintShotIngestToken(ctx, shotId),
     mintToken: (input: MintTokenInput) => mintToken(ctx, input),
     listTokens: () => listTokens(ctx),
     revokeToken: (id: string) => revokeToken(ctx, id),
+    createInstance: (name: string) => createInstance(ctx, name),
+    listInstances: () => listInstances(ctx),
+    issueInstanceToken: (name: string, opts?: { rotate?: boolean; overlap_seconds?: number }) =>
+      issueInstanceToken(ctx, name, opts),
+    listInstanceTokens: (name: string) => listInstanceTokens(ctx, name),
+    revokeInstanceToken: (name: string, id: string) => revokeInstanceToken(ctx, name, id),
   };
 }
 
@@ -94,10 +98,9 @@ export interface MintTokenInput {
 // ---------------------------------------------------------------- start/stop
 
 /**
- * Creates and starts a shot, reserving a concurrency slot first so exceeding
- * `MAX_CONCURRENT_RECORDING` returns a retryable `503 capacity_exhausted`
- * before any ShotDO or container state exists, and mints its per-shot ingest
- * token (disclosed once).
+ * Creates and starts a shot. Spec 014 removed the application-level recording
+ * cap, so this always registers the shot and starts recording; concurrency is
+ * bounded only by the explicit backend container capacity controls.
  */
 export async function startShot(
   ctx: ToolContext,
@@ -107,19 +110,18 @@ export async function startShot(
   const shotId = newShotId();
   const principal = normalizeOwner(owner);
 
-  await reserveRecordingSlot(ctx, shotId, principal);
+  await ingestCall(ctx, "/internal/shot/register", "POST", { shot_id: shotId, owner: principal });
 
   let info: Record<string, unknown>;
   try {
     info = await createShot(ctx, shotId, metadata, principal);
   } catch (error) {
-    // Roll the reservation back so a failed start never leaks capacity.
+    // Roll the registration back so a failed start never leaves a phantom row.
     await ingestCall(ctx, "/internal/shot/release", "POST", { shot_id: shotId }).catch(() => undefined);
     throw error;
   }
 
-  const issued = await issueShotToken(ctx, shotId);
-  return withIngestEndpoints(info, ctx, shotId, issued);
+  return withIngestEndpoints(info, ctx);
 }
 
 export async function stopShot(ctx: ToolContext, shotId: string): Promise<Record<string, unknown>> {
@@ -136,20 +138,16 @@ export async function stopShot(ctx: ToolContext, shotId: string): Promise<Record
   try {
     result = await parseJsonOrThrow(resp);
   } catch (error) {
-    // A lost shot will never record again: release its slot and revoke its
-    // token so the next shot can start.
+    // A lost shot will never record again: mark its registry row terminal.
     if (error instanceof HttpError && error.code === "shot_lost") {
-      await ingestCall(ctx, "/internal/shot-token/revoke", "POST", { shot_id: shotId }).catch(() => undefined);
       await ingestCall(ctx, "/internal/shot/state", "POST", { shot_id: shotId, state: "failed" }).catch(
         () => undefined,
       );
     }
     throw error;
   }
-  // Revoke the per-shot token (with a short grace) and record the terminal
-  // state only after the shot has frozen, so late but already-admitted batches
-  // are attributed to this shot and consciously discarded, never leaked.
-  await ingestCall(ctx, "/internal/shot-token/revoke", "POST", { shot_id: shotId }).catch(() => undefined);
+  // Record the terminal state only after the shot has frozen, so listing stays
+  // true. Ingestion is independent of the shot lifecycle (spec 014).
   await ingestCall(ctx, "/internal/shot/state", "POST", {
     shot_id: shotId,
     state: String(result.state ?? "frozen"),
@@ -193,13 +191,64 @@ export async function listShots(
   return { shots, total: page.total, limit, offset };
 }
 
-/** Mints a per-shot ingest token (disclosed once) after confirming the shot exists. */
-export async function mintShotIngestToken(
+// -------------------------------------------------------- instance registry
+
+/** Creates or returns the named logical instance. Requires admin|member. */
+export async function createInstance(ctx: ToolContext, name: string): Promise<InstanceMetadata> {
+  const normalized = normalizeInstanceName(name);
+  if (!isValidInstanceName(normalized)) throw badRequest("invalid instance name");
+  return ingestCall<InstanceMetadata>(ctx, "/internal/instance/upsert", "POST", { name: normalized });
+}
+
+/** Lists instance metadata/status (never secrets). */
+export async function listInstances(ctx: ToolContext): Promise<{ instances: InstanceMetadata[] }> {
+  return ingestCall<{ instances: InstanceMetadata[] }>(ctx, "/internal/instance/list", "GET");
+}
+
+/**
+ * Issues a 24h push-only instance token (disclosed once). With `rotate` the
+ * previous active token(s) for *this* instance are revoked with a bounded
+ * overlap; other instances are never touched.
+ */
+export async function issueInstanceToken(
   ctx: ToolContext,
-  shotId: string,
-): Promise<ShotIngestTokenIssue> {
-  await getShot(ctx, shotId);
-  return issueShotToken(ctx, shotId);
+  name: string,
+  opts: { rotate?: boolean; overlap_seconds?: number } = {},
+): Promise<InstanceTokenIssue> {
+  const normalized = normalizeInstanceName(name);
+  if (!isValidInstanceName(normalized)) throw badRequest("invalid instance name");
+  return ingestCall<InstanceTokenIssue>(ctx, "/internal/instance/token/issue", "POST", {
+    name: normalized,
+    rotate: opts.rotate === true,
+    overlap_seconds: opts.overlap_seconds,
+  });
+}
+
+/** Lists instance token metadata (never values). */
+export async function listInstanceTokens(
+  ctx: ToolContext,
+  name: string,
+): Promise<{ tokens: InstanceTokenMetadata[] }> {
+  const normalized = normalizeInstanceName(name);
+  if (!isValidInstanceName(normalized)) throw badRequest("invalid instance name");
+  return ingestCall<{ tokens: InstanceTokenMetadata[] }>(ctx, "/internal/instance/token/list", "POST", {
+    name: normalized,
+  });
+}
+
+/** Revokes one instance token immediately (idempotent). */
+export async function revokeInstanceToken(
+  ctx: ToolContext,
+  name: string,
+  id: string,
+): Promise<{ revoked: boolean; id: string }> {
+  const normalized = normalizeInstanceName(name);
+  if (!isValidInstanceName(normalized)) throw badRequest("invalid instance name");
+  if (typeof id !== "string" || id.trim() === "") throw badRequest("token id is required");
+  return ingestCall<{ revoked: boolean; id: string }>(ctx, "/internal/instance/token/revoke", "POST", {
+    name: normalized,
+    id,
+  });
 }
 
 // -------------------------------------------------------- token registry
@@ -292,7 +341,7 @@ async function ingestCall<T>(
     init.body = JSON.stringify(body);
   }
   const resp = await ingestStub(ctx).fetch(new Request(`${DO_ORIGIN}${path}`, init));
-  return (await parseJsonOrThrow(resp)) as T;
+  return (await parseJsonOrThrow(resp)) as unknown as T;
 }
 
 function authStub(ctx: ToolContext): DoStubLike {
@@ -317,25 +366,6 @@ async function authCall<T>(
   return (await parseJsonOrThrow(resp)) as unknown as T;
 }
 
-async function reserveRecordingSlot(ctx: ToolContext, shotId: string, owner: string): Promise<void> {
-  const max = ctx.maxConcurrentRecording;
-  // Reconcile stale `recording` entries only when the registry is at/over the
-  // cap, so the common path is a single coordinator call.
-  const { shots } = await ingestCall<{ shots: Array<{ shot_id: string }> }>(ctx, "/internal/shots/recording", "GET");
-  if (shots.length >= max) {
-    const stale: string[] = [];
-    for (const { shot_id } of shots) {
-      const info = await peekShot(ctx, shot_id);
-      if (!info || info.state !== "recording") stale.push(shot_id);
-    }
-    if (stale.length > 0) {
-      await ingestCall(ctx, "/internal/shot/release", "POST", { shot_ids: stale });
-    }
-  }
-  // The coordinator enforces the cap atomically (single-threaded per DO).
-  await ingestCall(ctx, "/internal/shot/reserve", "POST", { shot_id: shotId, owner, max });
-}
-
 async function createShot(
   ctx: ToolContext,
   shotId: string,
@@ -351,10 +381,6 @@ async function createShot(
     }),
   );
   return parseJsonOrThrow(resp);
-}
-
-async function issueShotToken(ctx: ToolContext, shotId: string): Promise<ShotIngestTokenIssue> {
-  return ingestCall<ShotIngestTokenIssue>(ctx, "/internal/shot-token/issue", "POST", { shot_id: shotId });
 }
 
 async function peekShot(ctx: ToolContext, shotId: string): Promise<ShotInfo | null> {
@@ -454,18 +480,14 @@ function clamp(value: number, min: number, max: number): number {
 }
 
 /**
- * Advertises the stable `/ingest` base URL plus the deprecated per-shot admin
- * path. The per-shot push token, when freshly minted, is disclosed here exactly
- * once; the raw token is never included in any other response.
+ * Advertises the stable instance ingest endpoints and the deprecated per-shot
+ * admin path. The per-shot push token is gone (spec 014): one named instance
+ * token configures OTLP for a whole day regardless of shots.
  */
-export function withIngestEndpoints(
-  info: Record<string, unknown>,
-  ctx: ToolContext,
-  shotId: string,
-  issued?: ShotIngestTokenIssue,
-): Record<string, unknown> {
+export function withIngestEndpoints(info: Record<string, unknown>, ctx: ToolContext): Record<string, unknown> {
   const base = (ctx.publicBaseUrl ?? ctx.origin).replace(/\/+$/, "");
   const ingest = `${base}/ingest`;
+  const shotId = String(info.shot_id ?? "");
   const legacy = `${base}/shots/${shotId}`;
   return {
     ...info,
@@ -481,15 +503,8 @@ export function withIngestEndpoints(
       metrics: `${legacy}/v1/metrics`,
       logs: `${legacy}/v1/logs`,
     },
-    ingest_token_endpoint: `${base}/api/shots/${shotId}/ingest-token`,
-    ...(issued
-      ? {
-          ingest_token: issued.token,
-          ingest_token_shot_id: issued.shot_id,
-          ingest_token_issued_at: issued.issued_at,
-          ingest_token_expires_at: issued.expires_at,
-          ingest_token_ttl_seconds: issued.ttl_seconds,
-        }
-      : {}),
+    instance_endpoint: `${base}/api/instances`,
+    ingest_note:
+      "configure one named instance token for the stable /ingest endpoints; ingestion is continuous and not tied to this shot",
   };
 }

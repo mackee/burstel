@@ -10,7 +10,7 @@ change that introduced it.
 | --- | --- | --- | --- |
 | `BURSTEL_API_TOKEN` | admin: `/api/*`, `/mcp`, legacy per-shot `/shots/{id}` | Worker secret | sent to a container, logged, committed |
 | `BURSTEL_INTERNAL_TOKEN` | recorder `/internal/*` only (defense in depth) | Worker secret **and** injected into the container env by the DO | reused as the admin token, logged, committed |
-| per-shot push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its shot | minted by `POST /api/shots` (or `POST /api/shots/{id}/ingest-token`), returned once | stored raw, logged, used for admin routes |
+| instance push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its named instance | minted by `POST /api/instances/{name}/tokens` (admin\|member), returned once | stored raw (only its digest lives in `IngestDO`), logged, used for admin routes |
 | per-person token (`admin`/`member`) | `/api/*` and `/mcp`; `member` is full operational but never registry; `admin` may manage the registry | minted by `POST /api/tokens` (admin only), returned once | stored raw (only its digest lives in `AuthDO`), logged, used as a push/internal token |
 
 Requirements, all **fail closed** when violated:
@@ -20,8 +20,11 @@ Requirements, all **fail closed** when violated:
 2. A missing internal token is refused (`internal_token_missing`). There is no
    `BURSTEL_API_TOKEN` fallback: the admin token is never forwarded into the
    container environment or its request headers.
-3. The push-only token is independent, random (>= 256 bits), and never used as
-   either the admin or the internal token.
+3. The instance push-only token is independent, random (>= 256 bits), and never
+   used as either the admin or the internal token. Ingestion authenticates it
+   before any disk/bucket write and only acknowledges (`200`) after the raw
+   bytes are durable in R2 **and** a ledger row is committed; a durable-write
+   failure is a retryable `5xx`.
 4. The recorder itself refuses `/internal/*` when `BURSTEL_INTERNAL_TOKEN` is
    empty, so a directly-reachable container is not left open.
 
@@ -40,7 +43,7 @@ wrangler secret put BURSTEL_INTERNAL_TOKEN
 * There are no hardcoded credential defaults anywhere in the Worker, the DO, the
   recorder or the image.
 * Tokens are compared in constant time and never logged. The DO stores only the
-  push token's one-way SHA-256 digest.
+  one-way SHA-256 digest of an instance push token.
 * Per-person registry tokens (spec 013, Part B) store only a SHA-256 digest in
   `AuthDO`; `GET /api/tokens` never returns a value, and a revoked/expired token
   fails immediately (`401`). Token issuance is the trust boundary: hand out one
@@ -50,24 +53,26 @@ wrangler secret put BURSTEL_INTERNAL_TOKEN
 ## Legacy admin per-shot endpoint
 
 * `POST /shots/{id}/v1/{traces,metrics,logs}` is **deprecated** and remains
-  admin-scoped only (`BURSTEL_API_TOKEN`); the push token is rejected there.
-* Prefer the stable `POST /ingest/v1/{traces,metrics,logs}` with a 24h push
-  token. Reconfigure exporters once per day, not once per shot.
+  admin-scoped only (`BURSTEL_API_TOKEN`); an instance push token is rejected
+  there.
+* Prefer the stable `POST /ingest/v1/{traces,metrics,logs}` with a 24h
+  **instance** token. Reconfigure exporters once per day, not once per shot.
 * A shot id is a capability: it grants access to that shot only, and every
   request still requires the admin token.
 
-## Stop race and retry semantics
+## Durable intake and retry semantics
 
-* A request rejected because the shot is stopping/not-recording is *provably
-  uncommitted*; the stable `/ingest` forwarder answers a valid OTLP
-  `ExportResponse` `200` with `X-Burstel-Disposition: ignored-no-active-shot`.
-* Genuine failures — storage write error, request write timeout, capacity
-  exhaustion, crash, or any unknown outcome — stay a retryable `503` and are
-  **never** acknowledged as success.
-* Exception (spec 012): a recording shot whose container has **stopped** is
-  terminally lost (its ephemeral disk is gone, no retry can succeed). The
-  request at hand was never forwarded, so `/ingest` answers an OTLP `200` with
-  `X-Burstel-Disposition: ignored-shot-lost` and the shot becomes `failed`
-  (`lost: true`).
+* The stable instance endpoint authenticates first, writes the original bytes to
+  a unique R2 object, commits a durable ledger row, and only then answers OTLP
+  `200`. A valid export is **never** discarded for lack of an active shot, and an
+  R2 or ledger failure is a retryable `5xx`.
+* The legacy per-shot path (`/shots/{id}/v1/*`) has no durability guarantee of
+  its own: it proxies to the shot's recorder, so a request rejected because the
+  shot is stopping/not-recording may be answered with a valid OTLP `200` and
+  `X-Burstel-Disposition: ignored-no-active-shot`, while genuine failures stay a
+  retryable `503`.
+* A recording shot whose container has **stopped** is terminally lost (spec 012):
+  the shot becomes `failed` (`lost: true`). This affects only the legacy path; it
+  has no effect on instance intake.
 * In-flight, previously admitted writes are drained before a shot is frozen; no
   accepted batch is lost and no late batch is attributed to the next shot.

@@ -18,7 +18,6 @@ import { z } from "zod";
 
 import type { AuthPrincipal } from "./auth-core";
 import { resolvePrincipal, isRegistryAdmin } from "./authz";
-import { maxConcurrentRecording } from "./env";
 import type { AppEnv } from "./env";
 import { forbidden, unauthorized } from "./errors";
 import { errorMessage } from "./errors";
@@ -26,7 +25,7 @@ import { errorResponse } from "./http";
 import { createTools } from "./tools";
 
 export const MCP_SERVER_NAME = "burstel";
-export const MCP_SERVER_VERSION = "0.4.0";
+export const MCP_SERVER_VERSION = "0.5.0";
 
 interface ToolOutput {
   [key: string]: unknown;
@@ -62,7 +61,6 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
     auth: env.AUTH_DO,
     origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
-    maxConcurrentRecording: maxConcurrentRecording(env),
   });
   const isAdmin = isRegistryAdmin(principal);
 
@@ -92,7 +90,7 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
     {
       title: "Start a shot",
       description:
-        "Create a new recording shot and return its id plus the stable OTLP/HTTP ingest URL and a per-shot push token (disclosed once). metadata may carry the commit SHA, benchmark/scenario and a note; owner is an optional attribution label.",
+        "Create a new recording shot and return its id plus the stable OTLP/HTTP ingest URL. Configure one named instance token for /ingest; ingestion is continuous and independent of shots. metadata may carry the commit SHA, benchmark/scenario and a note; owner is an optional attribution label.",
       inputSchema: {
         metadata: z.record(z.string(), z.any()).optional(),
         owner: z.string().optional().describe("Attribution-only owner label; never an authorization boundary"),
@@ -108,16 +106,85 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
   );
 
   server.registerTool(
-    "shot_ingest_token",
+    "instance_create",
     {
-      title: "Mint a per-shot ingest token",
+      title: "Create or get a named instance",
       description:
-        "Mint (or rotate) the push-only OTLP ingest token for a shot and return it once. The token routes /ingest to this shot only.",
-      inputSchema: { shot_id: z.string().describe("Shot id returned by shot_start") },
+        "Create/upsert a named logical instance (e.g. web-1, db-1) and return its immutable instance_id. admin|member.",
+      inputSchema: { name: z.string().describe("Instance name: lowercase alphanumerics and hyphens") },
     },
-    async ({ shot_id }) => {
+    async ({ name }) => {
       try {
-        return ok(await tools.issueIngestToken(shot_id));
+        return ok(await tools.createInstance(name));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "instance_list",
+    {
+      title: "List instances",
+      description: "List named instances with metadata and token counts (never secrets). admin|member.",
+      inputSchema: {},
+    },
+    async () => {
+      try {
+        return ok(await tools.listInstances());
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "instance_token_issue",
+    {
+      title: "Issue or rotate an instance token",
+      description:
+        "Issue a 256-bit push-only OTLP instance token valid for exactly 24h (disclosed once). With rotate, the previous token for this instance is revoked after a bounded overlap; other instances are untouched. admin|member.",
+      inputSchema: {
+        name: z.string().describe("Instance name"),
+        rotate: z.boolean().optional().describe("Revoke the previous active token(s) with a bounded overlap"),
+        overlap_seconds: z.number().int().positive().optional().describe("Rotation overlap seconds (bounded)"),
+      },
+    },
+    async ({ name, rotate, overlap_seconds }) => {
+      try {
+        return ok(await tools.issueInstanceToken(name, { rotate, overlap_seconds }));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "instance_token_list",
+    {
+      title: "List instance token metadata",
+      description: "List an instance's token metadata (id, timestamps, revoked). Values are never returned. admin|member.",
+      inputSchema: { name: z.string() },
+    },
+    async ({ name }) => {
+      try {
+        return ok(await tools.listInstanceTokens(name));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "instance_token_revoke",
+    {
+      title: "Revoke an instance token",
+      description: "Revoke one instance token immediately without rotating the others. admin|member.",
+      inputSchema: { name: z.string(), id: z.string().describe("Token id from instance_token_list") },
+    },
+    async ({ name, id }) => {
+      try {
+        return ok(await tools.revokeInstanceToken(name, id));
       } catch (error) {
         return fail(error);
       }

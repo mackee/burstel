@@ -185,7 +185,7 @@ describe("container loss is terminal", () => {
   });
 });
 
-describe("stable /ingest and stop with a lost shot", () => {
+describe("legacy /shots path and stop with a lost shot", () => {
   class CoreNamespace implements ShotNamespaceLike {
     constructor(readonly h: TestHarness) {}
     getByName(): DoStubLike {
@@ -196,33 +196,33 @@ describe("stable /ingest and stop with a lost shot", () => {
   async function setup() {
     const h = makeCore("shotLostE2eAbcdef01");
     await h.core.create({});
-    const ingest = makeIngest({ now: () => 1_700_000_000_000, generateToken: () => "blt_lost" });
-    const issued = await ingest.core.issueShotToken("shotLostE2eAbcdef01");
+    const ingest = makeIngest({ now: () => 1_700_000_000_000 });
+    await ingest.core.registerShot("shotLostE2eAbcdef01", "legacy");
     const env: AppEnv = {
       SHOT_DO: new CoreNamespace(h),
       INGEST_DO: new FakeIngestNamespace(ingest.core),
       PUBLIC_BASE_URL: "https://burstel.example",
       BURSTEL_API_TOKEN: "admin-token",
     };
-    return { h, ingest: ingest.core, env, token: issued.token };
+    return { h, ingest: ingest.core, env };
   }
 
-  test("push to a lost shot is acknowledged as a discard", async () => {
-    const { h, env, token } = await setup();
+  test("the legacy per-shot path propagates shot_lost for a lost shot", async () => {
+    const { h, env } = await setup();
     h.container.runningFlag = false;
     const resp = await handleRequest(
-      new Request("https://burstel.example/ingest/v1/traces", {
+      new Request("https://burstel.example/shots/shotLostE2eAbcdef01/v1/traces", {
         method: "POST",
-        headers: { "content-type": "application/x-protobuf", "x-burstel-token": token },
+        headers: { "content-type": "application/x-protobuf", authorization: "Bearer admin-token" },
         body: new Uint8Array([0x0a, 0x00]),
       }),
       env,
     );
-    expect(resp.status).toBe(200);
-    expect(resp.headers.get("x-burstel-disposition")).toBe("ignored-shot-lost");
+    expect(resp.status).toBe(409);
+    expect(((await resp.json()) as { code: string }).code).toBe("shot_lost");
   });
 
-  test("admin stop of a lost shot returns shot_lost and frees the recording slot", async () => {
+  test("admin stop of a lost shot returns shot_lost and releases the registration", async () => {
     const { h, ingest, env } = await setup();
     h.container.runningFlag = false;
     const resp = await handleRequest(

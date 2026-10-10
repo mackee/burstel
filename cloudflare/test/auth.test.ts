@@ -14,7 +14,7 @@ import type { AuthCore, AuthTokenIssue } from "../src/auth-core";
 import type { IngestCore } from "../src/ingest-core";
 import { constantTimeEqual, sha256Hex } from "../src/ingest-core";
 import { handleMcp } from "../src/mcp";
-import { BunSql, FakeArtifacts, FakeAuthNamespace, FakeIngestNamespace, makeAuth, makeCore, makeIngest } from "./fakes";
+import { BunSql, FakeArtifacts, FakeAuthNamespace, FakeBucket, FakeIngestNamespace, makeAuth, makeCore, makeIngest } from "./fakes";
 import type { TestHarness } from "./fakes";
 import { ShotStore } from "../src/store";
 
@@ -65,6 +65,7 @@ function setup(): Setup {
     SHOT_DO: shots,
     INGEST_DO: new FakeIngestNamespace(ingest.core),
     AUTH_DO: new FakeAuthNamespace(auth.core),
+    BUCKET: new FakeBucket(),
     BURSTEL_API_TOKEN: ENV_ADMIN,
     PUBLIC_BASE_URL: "https://burstel.example",
   };
@@ -110,13 +111,25 @@ async function createShot(
   env: AppEnv,
   token = ENV_ADMIN,
   owner?: string,
-): Promise<{ id: string; token: string; body: Record<string, unknown> }> {
+): Promise<{ id: string; body: Record<string, unknown> }> {
   const payload: Record<string, unknown> = { metadata: { scenario: "shared" } };
   if (owner !== undefined) payload.owner = owner;
   const resp = await handleRequest(req("POST", "/api/shots", { body: payload, token }), env);
   if (resp.status !== 201) throw new Error(`create failed: ${resp.status} ${await resp.text()}`);
   const body = (await resp.json()) as Record<string, unknown>;
-  return { id: String(body.shot_id), token: String(body.ingest_token), body };
+  return { id: String(body.shot_id), body };
+}
+
+async function createInstance(env: AppEnv, name: string, token = ENV_ADMIN): Promise<string> {
+  const resp = await handleRequest(req("POST", "/api/instances", { body: { name }, token }), env);
+  if (resp.status !== 201) throw new Error(`instance create failed: ${resp.status} ${await resp.text()}`);
+  return String(((await resp.json()) as { instance_id: string }).instance_id);
+}
+
+async function issueInstanceToken(env: AppEnv, name: string, token = ENV_ADMIN): Promise<string> {
+  const resp = await handleRequest(req("POST", `/api/instances/${name}/tokens`, { body: {}, token }), env);
+  if (resp.status !== 201) throw new Error(`instance token failed: ${resp.status} ${await resp.text()}`);
+  return String(((await resp.json()) as { token: string }).token);
 }
 
 interface RpcResponse {
@@ -280,11 +293,12 @@ describe("capability matrix (REST)", () => {
     };
     expect(listed.shots.map((s) => s.shot_id).sort()).toEqual([shotA.id, shotB.id].sort());
 
-    // Alice mints an ingest token for Bob's shot and stops it; Bob queries and
-    // analyzes Alice's shot. Both must succeed.
-    const issued = await handleRequest(req("POST", `/api/shots/${shotB.id}/ingest-token`, { token: alice.token }), env);
-    expect(issued.status).toBe(201);
-    expect(String(((await issued.json()) as { shot_id: string }).shot_id)).toBe(shotB.id);
+    // Alice manages operational instance credentials and stops Bob's shot;
+    // Bob queries and analyzes Alice's shot. Both must succeed.
+    await createInstance(env, "web-1", alice.token);
+    const issuedToken = await issueInstanceToken(env, "web-1", alice.token);
+    expect(issuedToken.startsWith("bit_")).toBe(true);
+    expect((await handleRequest(req("GET", "/api/instances/web-1/tokens", { token: bob.token }), env)).status).toBe(200);
 
     expect((await handleRequest(req("POST", `/api/shots/${shotB.id}/stop`, { body: {}, token: alice.token }), env)).status).toBe(200);
     expect((await handleRequest(req("POST", `/api/shots/${shotA.id}/stop`, { body: {}, token: bob.token }), env)).status).toBe(200);
@@ -299,16 +313,17 @@ describe("capability matrix (REST)", () => {
     expect((await handleRequest(req("GET", "/api/tokens", { token: bob.token }), env)).status).toBe(403);
   });
 
-  test("scope separation: per-shot tokens cannot reach /api or /mcp", async () => {
+  test("scope separation: instance tokens cannot reach /api or /mcp", async () => {
     const { env } = setup();
-    const shot = await createShot(env, ENV_ADMIN);
-    expect((await handleRequest(req("GET", "/api/shots", { token: shot.token }), env)).status).toBe(401);
-    expect((await handleRequest(req("GET", `/api/shots/${shot.id}`, { token: shot.token }), env)).status).toBe(401);
-    expect((await handleRequest(req("GET", "/api/tokens", { token: shot.token }), env)).status).toBe(401);
+    await createInstance(env, "web-1");
+    const token = await issueInstanceToken(env, "web-1");
+    expect((await handleRequest(req("GET", "/api/shots", { token }), env)).status).toBe(401);
+    expect((await handleRequest(req("GET", "/api/instances", { token }), env)).status).toBe(401);
+    expect((await handleRequest(req("GET", "/api/tokens", { token }), env)).status).toBe(401);
     const mcp = await handleMcp(
       new Request("https://burstel.example/mcp", {
         method: "POST",
-        headers: { "content-type": "application/json", authorization: `Bearer ${shot.token}` },
+        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
       }),
       env,
@@ -327,13 +342,17 @@ describe("MCP surface", () => {
     for (const name of [
       "shots_list",
       "shot_start",
-      "shot_ingest_token",
       "shot_stop",
       "shot_get",
       "shot_query",
       "shot_analyze",
       "shot_schema",
       "shot_compare",
+      "instance_create",
+      "instance_list",
+      "instance_token_issue",
+      "instance_token_list",
+      "instance_token_revoke",
       "token_mint",
       "token_list",
       "token_revoke",
@@ -345,16 +364,20 @@ describe("MCP surface", () => {
     expect(started.isError).toBe(false);
     const shotId = String(started.data["shot_id"]);
 
-    const ingest = await mcpCall(env, "shot_ingest_token", { shot_id: shotId }, member.token);
+    const created = await mcpCall(env, "instance_create", { name: "web-1" }, member.token);
+    expect(created.isError).toBe(false);
+    const ingest = await mcpCall(env, "instance_token_issue", { name: "web-1" }, member.token);
     expect(ingest.isError).toBe(false);
-    expect(String(ingest.data["token"])).toMatch(/^blt_/);
+    expect(String(ingest.data["token"])).toMatch(/^bit_/);
 
     const list = await mcpCall(env, "shots_list", {}, member.token);
     expect(list.isError).toBe(false);
     expect((list.data["shots"] as unknown[]).length).toBeGreaterThan(0);
 
-    // Push with the minted per-shot token to prove it routes.
-    expect((await handleRequest(push("/ingest/v1/traces", String(ingest.data["token"])), env)).headers.get("x-burstel-shot-id")).toBe(shotId);
+    // Continuous ingest with the instance token is journalled (no shot routing).
+    const pushed = await handleRequest(push("/ingest/v1/traces", String(ingest.data["token"])), env);
+    expect(pushed.status).toBe(200);
+    expect(pushed.headers.get("x-burstel-instance")).toBe("web-1");
 
     await mcpCall(env, "shot_stop", { shot_id: shotId }, member.token);
     expect((await mcpCall(env, "shot_get", { shot_id: shotId }, member.token)).data["state"]).toBe("frozen");

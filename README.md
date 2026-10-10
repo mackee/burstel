@@ -18,23 +18,28 @@ R2 / MCP はまだ含まない。収集した DuckDB ファイルを後から SQ
 > 詳細は [`cloudflare/README.md`](./cloudflare/README.md) と
 > [`cloudflare/docs/adr-001-analysis-query-safety.md`](./cloudflare/docs/adr-001-analysis-query-safety.md)。
 >
-> **Stable ingest (spec 006 / spec 013 Part A)** は、shot ごとに exporter を再設定する
-> 従来フローをやめ、固定の `https://<host>/ingest` を使う。管理者が shot 作成時に
-> **shot ごとの** push 専用トークン (24 時間、`POST /api/shots` または
-> `POST /api/shots/{id}/ingest-token` で発行) を一度だけ開示し、トークンがどの shot に
-> 届くかを決めるため複数 shot を同時収集できる。24 時間の期限は **トークン** のもので
-> shot ではない。SQLite バックエンドの `IngestDO` が token の digest、shot registry、
-> 同時 recording 上限 (`MAX_CONCURRENT_RECORDING`) を管理する。旧来の全社トークン
-> `POST /api/ingest-token` は廃止され `410 Gone` を返す。詳細は
-> [`cloudflare/README.md`](./cloudflare/README.md)。
+> **Stable ingest / continuous intake (spec 014)** は、shot 単位の exporter 再設定を
+> やめ、固定の `https://<host>/ingest/v1/{traces,metrics,logs}` を使う。名前付き
+> **instance** (`web-1`, `db-1` など) ごとに 256-bit の push 専用トークンを
+> `POST /api/instances/{name}/tokens` で発行し (正確に 24 時間、一度だけ開示)、
+> トークンは instance にのみ対応する (shot には決して対応しない)。有効な OTLP は
+> shot が無くても **durable** に保持される。Worker は instance トークンを認証した
+> うえで元のバイト列を一意な R2 オブジェクト (`journal/{instance_id}/…`) に書き、
+> `IngestDO` の台帳に commit した **後** にのみ OTLP `200` を返す (durable write が
+> 失敗すれば retry 可能な 5xx)。複数 instance が同時・独立に収集できる。旧来の
+> 全社トークン (`POST /api/ingest-token`) と shot 単位トークン
+> (`POST /api/shots/{id}/ingest-token`) は廃止され `410 Gone` を返す。詳細は
+> [`cloudflare/README.md`](./cloudflare/README.md) と
+> [`cloudflare/docs/adr-003-instance-credentials-and-durable-intake.md`](./cloudflare/docs/adr-003-instance-credentials-and-durable-intake.md)。
 >
 > **Shared multi-user (spec 013 Part B)** は、1 つのデプロイを複数人で共有する。
 > admin が `POST /api/tokens` で **人ごとの**トークン (scope `admin` | `member`) を
-> 発行し、`member` は全 shot に対する操作権限 (作成/停止、per-shot token 発行、
-> query/analyze/compare) を持つがレジストリ管理はできない。token は digest のみを
-> SQLite の `AuthDO` に保存し、`GET /api/tokens` は値を返さない。`DELETE
-> /api/tokens/{id}` で個人単位に即時失効できる。`owner` は帰属表示専用で認可境界では
-> ない。MCP (`/mcp`) も admin|member で利用でき、レジストリ操作は admin 専用。
+> 発行し、`member` は全 shot に対する操作権限 (作成/停止、instance 資格情報の管理、
+> query/analyze/compare) を持つが人トークンのレジストリ管理はできない。token は
+> digest のみを SQLite の `AuthDO` に保存し、`GET /api/tokens` は値を返さない。
+> `DELETE /api/tokens/{id}` で個人単位に即時失効できる。`owner` は帰属表示専用で
+> 認可境界ではない。MCP (`/mcp`) も admin|member で利用でき、人トークンのレジストリ
+> 操作は admin 専用。
 > 詳細は [`cloudflare/README.md`](./cloudflare/README.md)。
 
 ## できること
@@ -166,13 +171,16 @@ chmod 600 ~/.config/burstel/token
 
 burstel-cli health
 
-# shot を作成し、その shot 専用の push トークンを発行する
-SHOT=$(burstel-cli shot start --metadata commit=abc123 --metadata scenario=bench)
-SHOT_ID=$(printf '%s' "$SHOT" | jq -r .shot_id)
-PUSH=$(printf '%s' "$SHOT" | jq -r .ingest_token)
+# 名前付き instance を作成し、24h の push トークンを一度だけ発行する
+burstel-cli instance create web-1
+PUSH=$(burstel-cli instance token issue web-1)
 export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_EXPORTER_OTLP_ENDPOINT=$BURSTEL_BASE_URL/ingest
 export OTEL_EXPORTER_OTLP_HEADERS="X-Burstel-Token=$PUSH"
+
+# shot は計測ウィンドウの周りで開始/停止する (取り込みは shot に依存しない)
+SHOT=$(burstel-cli shot start --metadata commit=abc123 --metadata scenario=bench)
+SHOT_ID=$(printf '%s' "$SHOT" | jq -r .shot_id)
 
 # ベンチマーク実行後、freeze する
 burstel-cli shot stop "$SHOT_ID"

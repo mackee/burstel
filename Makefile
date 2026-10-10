@@ -50,8 +50,8 @@ cf-preflight-config:
 cf-smoke:
 	scripts/cloudflare-smoke.sh
 
-# Spec 013 Parts A+B: two concurrent shots with distinct per-shot tokens plus a
-# shared multi-user (member token) section.
+# Spec 014: named-instance continuous ingest plus a shared multi-user section.
+# (Requires a live deploy host; not part of the offline gates.)
 cf-multishot-smoke:
 	scripts/cloudflare-multishot-smoke.sh
 
