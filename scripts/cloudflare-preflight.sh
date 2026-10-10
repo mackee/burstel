@@ -170,7 +170,12 @@ if command -v docker >/dev/null 2>&1; then
   if docker info >/dev/null 2>&1; then DOCKER_DAEMON=1; fi
   if docker buildx version >/dev/null 2>&1; then
     DOCKER_BUILDX=1
-    if docker buildx inspect --bootstrap 2>/dev/null | grep -q 'linux/amd64'; then DOCKER_PLATFORM=1; fi
+    # Capture buildx output before grepping. Piping buildx directly into
+    # `grep -q` lets grep close the pipe early, which kills buildx with SIGPIPE
+    # and, under `set -o pipefail`, fails this check even though linux/amd64 is
+    # supported (a verified false negative on a working Docker+QEMU host).
+    buildx_platforms="$(docker buildx inspect --bootstrap 2>/dev/null || true)"
+    if printf '%s' "$buildx_platforms" | grep -q 'linux/amd64'; then DOCKER_PLATFORM=1; fi
   fi
 fi
 

@@ -44,6 +44,16 @@ wrangler secret put BURSTEL_API_TOKEN
 wrangler secret put BURSTEL_INTERNAL_TOKEN
 ```
 
+Or generate and put a strong secret in one step — the value is generated with
+`openssl rand -hex 32`, sent to `wrangler secret put` over stdin (never argv),
+and saved to a mode-600 file under `.secrets/` because a Worker secret cannot be
+read back after it is set:
+
+```bash
+scripts/secret-put.sh BURSTEL_API_TOKEN       # or: make cf-secret-put NAME=BURSTEL_API_TOKEN
+scripts/secret-put.sh BURSTEL_INTERNAL_TOKEN  # pass --show to print it once
+```
+
 ## 3. Build and prove the image first
 
 The exact image the Container runs must build and pass a smoke test **before**
