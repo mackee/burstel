@@ -6,8 +6,10 @@
 
 import { describe, expect, test } from "bun:test";
 
+import { IngestCore } from "../src/ingest-core";
 import type { SegmentPublishInput } from "../src/ingest-core";
-import { makeIngest } from "./fakes";
+import type { SyncSql } from "../src/store";
+import { BunSql, makeIngest } from "./fakes";
 
 const SHA_A = "a".repeat(64);
 const SHA_B = "b".repeat(64);
@@ -122,6 +124,34 @@ describe("segment manifest publication", () => {
     const status = await core.segmentStatus();
     expect(status.late).toBe(1);
     expect((status.counters as Record<string, number>).segment_late).toBe(1);
+  });
+
+  test("an injected failure between manifest and coverage inserts leaves neither visible; retry publishes (R2)", async () => {
+    const base = new BunSql();
+    let failCoverageInsert = true;
+    const sql: SyncSql = {
+      exec(query, ...bindings) {
+        if (failCoverageInsert && /INSERT INTO segment_coverage/i.test(query)) {
+          throw new Error("injected coverage insert failure");
+        }
+        return base.exec(query, ...bindings);
+      },
+      transaction: (fn) => base.transaction(fn),
+    };
+    const core = new IngestCore({ sql, now: () => 5000 });
+
+    await expect(core.publishSegment(publishInput())).rejects.toThrow(/injected coverage insert failure/);
+
+    // Neither half of the publication survived the rollback.
+    expect((await core.listSegments({ limit: 10, offset: 0 })).total).toBe(0);
+    expect(base.exec("SELECT COUNT(*) AS n FROM segment_coverage").toArray()[0]!.n).toBe(0);
+    expect(base.exec("SELECT COUNT(*) AS n FROM segment_manifest").toArray()[0]!.n).toBe(0);
+
+    failCoverageInsert = false;
+    const retry = await core.publishSegment(publishInput());
+    expect(retry).toEqual({ committed: true, duplicate: false, covered_new: 3, covered_skipped: 0 });
+    expect((await core.listSegments({ limit: 10, offset: 0 })).total).toBe(1);
+    expect(base.exec("SELECT COUNT(*) AS n FROM segment_coverage").toArray()[0]!.n).toBe(3);
   });
 
   test("restart preserves the manifest and coverage", async () => {

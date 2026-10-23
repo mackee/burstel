@@ -51,6 +51,23 @@ export class BunSql implements SyncSql {
     const result = this.db.query(query).run(...(bindings as unknown as never[]));
     return { toArray: () => [], rowsWritten: result.changes ?? 0 };
   }
+
+  /** Mirrors the Durable Object `transactionSync` boundary (spec 025, R2). */
+  transaction<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = fn();
+      this.db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // Already rolled back by SQLite (e.g. a constraint aborted the txn).
+      }
+      throw error;
+    }
+  }
 }
 
 export interface FakeContainerOptions {

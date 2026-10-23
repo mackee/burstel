@@ -36,7 +36,7 @@ export class IngestDO extends DurableObject<Env> {
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
-    const sql = createSqlAdapter(ctx.storage.sql);
+    const sql = createSqlAdapter(ctx.storage);
     this.core = new IngestCore({
       sql,
       now: () => Date.now(),
@@ -56,12 +56,21 @@ export class IngestDO extends DurableObject<Env> {
 /** Code-level alias for the control-plane role; the exported class stays `IngestDO`. */
 export { IngestDO as ControlDO };
 
-/** Adapts the synchronous DO SQLite API to the store's `SyncSql` interface. */
-function createSqlAdapter(sql: SqlStorage): SyncSql {
+/**
+ * Adapts the synchronous DO SQLite API to the store's `SyncSql` interface.
+ *
+ * `transactionSync` is the storage-level atomic primitive (spec 025, R2): the
+ * manifest row and every coverage atom of one segment commit or roll back
+ * together, so a crash can never advertise a partially published segment.
+ */
+function createSqlAdapter(storage: DurableObjectStorage): SyncSql {
   return {
     exec(query: string, ...bindings: SqlValue[]): SqlCursor {
-      const cursor = sql.exec(query, ...(bindings as unknown[]));
+      const cursor = storage.sql.exec(query, ...(bindings as unknown[]));
       return cursor as unknown as SqlCursor;
+    },
+    transaction<T>(fn: () => T): T {
+      return storage.transactionSync(fn);
     },
   };
 }

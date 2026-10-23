@@ -30,11 +30,12 @@ import { admitInstanceToken } from "./admission";
 import { recordIngestPoint } from "./analytics";
 import { extractToken } from "./auth";
 import { sha256HexBytes } from "./crypto";
-import { JOURNAL_PREFIX, lateWriteLimitMs, maxIngestBytes } from "./env";
+import { DO_ORIGIN, JOURNAL_PREFIX, lateWriteLimitMs, maxIngestBytes } from "./env";
 import type { AppEnv } from "./env";
 import { badRequest, HttpError } from "./errors";
 import { json } from "./http";
 import { randomHexId } from "./crypto";
+import { INGEST_DO_NAME } from "./ingest-core";
 import type { Signal } from "./store";
 
 const PROTOBUF_TYPES = new Set(["application/x-protobuf", "application/protobuf", "application/vnd.google.protobuf"]);
@@ -122,9 +123,21 @@ export async function handleInstanceIngest(
     // Late-write guard: a very slow PUT may land after the compactor could have
     // finalized (and later re-listed) the time bucket. Delete it and let the
     // exporter retry, so every acknowledged object is safely inside grace.
+    //
+    // Spec 025 R1: the DELETE can fail (or the process can crash around it), so
+    // the rejection is first recorded durably as an exclusion row. Discovery
+    // then removes it exactly like a revoked object: excluded, never pending and
+    // never part of a segment, retained under the revoked-retention rule.
     const completedAt = clock();
     const lateLimit = lateWriteLimitMs(env);
     if (lateLimit > 0 && completedAt - receivedAt > lateLimit) {
+      await recordLateWriteRejection(env, {
+        key,
+        token_id: admitted.token_id,
+        instance_id: admitted.instance_id,
+        received_at: receivedAt,
+        size: bytes.byteLength,
+      });
       await env.BUCKET.delete?.(key).catch(() => undefined);
       throw new HttpError(
         503,
@@ -165,6 +178,37 @@ export async function handleInstanceIngest(
     });
     throw error;
   }
+}
+
+/**
+ * Records a rejected late write in the control-plane exclusion table (spec 025,
+ * R1). Best effort with a single retry: the request is already answered with a
+ * retryable 503, and the exclusion only has to outlive the object's presence in
+ * R2. If the control plane is unreachable we still try the DELETE.
+ */
+async function recordLateWriteRejection(
+  env: AppEnv,
+  entry: { key: string; token_id: string; instance_id: string; received_at: number; size: number },
+): Promise<boolean> {
+  if (!env.INGEST_DO) return false;
+  const body = JSON.stringify({
+    entries: [{ ...entry, reason: "late_write" }],
+  });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const resp = await env.INGEST_DO.getByName(INGEST_DO_NAME).fetch(
+        new Request(`${DO_ORIGIN}/internal/compaction/excluded`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body,
+        }),
+      );
+      if (resp.ok) return true;
+    } catch {
+      // Retry once; a missing DO binding or transient outage falls through.
+    }
+  }
+  return false;
 }
 
 /** Server-generated, unique, path-safe R2 key for one accepted export. */

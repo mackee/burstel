@@ -7,6 +7,7 @@ import {
   FakeAuthNamespace,
   FakeBucket,
   FakeCompactorContainer,
+  FakeCompactorNamespace,
   FakeIngestNamespace,
   makeAuth,
   makeCore,
@@ -333,6 +334,87 @@ describe("MCP window analysis over segments", () => {
     const coverage = got["coverage"] as Record<string, unknown>;
     expect(coverage["complete"]).toBe(false);
     expect(coverage["pending_journal"]).toBe(1);
+  });
+
+  test("a truncated lookback keeps window coverage incomplete until the backlog drains (R3)", async () => {
+    const now = Date.now();
+    const clock = { now };
+    const bucket = new FakeBucket();
+    const ingest = makeIngest({ now: () => clock.now, bucket });
+    const instance = await ingest.core.instanceRegistry.upsert("web-1");
+
+    const putJournal = async (receivedAt: number, name: string): Promise<void> => {
+      const bytes = new TextEncoder().encode(name);
+      const sha = await sha256Hex(bytes);
+      await bucket.put(`journal/${instance.instance_id}/traces/${receivedAt}-${name}.bin`, bytes, {
+        sha256: sha,
+        customMetadata: {
+          sha256: sha,
+          signal: "traces",
+          instance_id: instance.instance_id,
+          instance: "web-1",
+          received_at: String(receivedAt),
+          token_id: "tok-mcp",
+          content_encoding: "",
+          content_type: "application/x-protobuf",
+        },
+      });
+    };
+
+    const compactor = new CompactorCore({
+      ingest: new FakeIngestNamespace(ingest.core),
+      bucket,
+      container: new FakeCompactorContainer(),
+      holder: "r3",
+      now: () => clock.now,
+      config: {
+        graceMs: 90_000,
+        lookbackMs: 180_000,
+        batchObjects: 1,
+        maxBatchesPerTick: 4,
+        gcEnabled: true,
+        retentionMs: 1000,
+      },
+    });
+
+    // One pinned keeper establishes the discovery cursor and stays in R2.
+    await putJournal(now - 130_000, "keeper");
+    await ingest.core.addPin("keep-1", instance.instance_id, now - 130_000, now - 130_000);
+    await compactor.tick();
+
+    // More objects than one lookback scan can hold (4).
+    for (let i = 0; i < 3; i += 1) await putJournal(now - 175_000 + i, `backlog-${i}`);
+    const truncated = await compactor.tick();
+    expect(truncated.lookback_truncated).toBe(true);
+    expect((await ingest.core.compactionStatus()).lookback_truncated).toBe(true);
+
+    const env = makeEnv({ COMPACTOR_DO: new FakeCompactorNamespace(compactor) }, ingest, bucket);
+    const created = await callTool(env, "shot_create", {
+      started_at: new Date(now - 170_000).toISOString(),
+      ended_at: new Date(now - 169_000).toISOString(),
+      instances: ["web-1"],
+    });
+    const shotId = String(created["shot_id"]);
+
+    // Nothing is pending in this empty slice, but the truncated lookback still
+    // makes a "complete" analysis unsafe.
+    await callTool(env, "shot_query", { shot_id: shotId, sql: "SELECT 1" });
+    const during = await callTool(env, "shot_get", { shot_id: shotId });
+    const duringCoverage = during["coverage"] as Record<string, unknown>;
+    expect(duringCoverage["pending_journal"]).toBe(0);
+    expect(duringCoverage["lookback_truncated"]).toBe(true);
+    expect(duringCoverage["lookback_floor_ms"]).toBe(now - 180_000);
+    expect(duringCoverage["complete"]).toBe(false);
+
+    // The truncated tick published and GC'd the backlog; the next scan fits
+    // inside the budget and clears the warning.
+    const drained = await compactor.tick();
+    expect(drained.lookback_truncated).toBe(false);
+    await callTool(env, "shot_query", { shot_id: shotId, sql: "SELECT 1" });
+    const after = await callTool(env, "shot_get", { shot_id: shotId });
+    const afterCoverage = after["coverage"] as Record<string, unknown>;
+    expect(afterCoverage["lookback_truncated"]).toBe(false);
+    expect(afterCoverage["complete"]).toBe(true);
   });
 
   test("rejects a window query when a candidate segment is not available", async () => {

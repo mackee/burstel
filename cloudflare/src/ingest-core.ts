@@ -100,6 +100,14 @@ export interface WindowCoverage {
    * the window explicitly incomplete, never silently empty/complete (spec 018).
    */
   pending_journal?: number;
+  /**
+   * True when a truncated compaction lookback overlaps this window, so the
+   * window can never be reported complete even when nothing is pending yet
+   * (spec 025, R3).
+   */
+  lookback_truncated?: boolean;
+  /** Floor (inclusive start) of the last truncated lookback scan. */
+  lookback_floor_ms?: number | null;
   complete: boolean;
 }
 
@@ -142,13 +150,19 @@ export interface JournalEntry {
   committed_at?: number;
 }
 
-/** One journal object excluded because its token was revoked before receipt. */
+/** One journal object excluded from every segment. */
 export interface ExcludedJournalInput {
   key: string;
   token_id: string;
   instance_id: string;
   received_at: number;
   size: number;
+  /**
+   * Why the object must never be compacted: a revoked token (spec 023 D3.2) or
+   * a rejected late write whose R2 DELETE failed (spec 025, R1). Both follow the
+   * same durable exclusion and revoked-retention rule.
+   */
+  reason?: "revoked" | "late_write";
 }
 
 /** Aggregated journal occupancy straight from the R2 listing (spec 023). */
@@ -305,6 +319,14 @@ export interface CompactionResultInput {
   bytes_published?: number;
   excluded_revoked?: number;
   error?: string | null;
+  /** Set when the tick did no work for a non-error reason (spec 025, R4). */
+  skipped?: string | null;
+  /** Lookback health observed by this tick (spec 025, R3). */
+  lookback?: {
+    truncated: boolean;
+    floor_ms: number | null;
+    until_ms: number | null;
+  } | null;
 }
 
 export interface IngestCoreDeps {
@@ -399,15 +421,21 @@ const SCHEMA_STATEMENTS: string[] = [
    )`,
   `CREATE INDEX IF NOT EXISTS segment_coverage_segment ON segment_coverage (segment_key)`,
   // Spec 023: journal objects written with a token revoked before receipt are
-  // excluded from every segment. The row is durable proof of exclusion and
-  // makes the object GC-eligible even when coverage is empty.
+  // excluded from every segment. Spec 025 R1 reuses the same durable row for a
+  // late write whose R2 DELETE failed, so neither can ever be compacted.
   `CREATE TABLE IF NOT EXISTS excluded_journal (
      journal_key TEXT PRIMARY KEY,
      token_id    TEXT NOT NULL,
      instance_id TEXT NOT NULL,
      received_at INTEGER NOT NULL,
      size        INTEGER NOT NULL,
-     excluded_at INTEGER NOT NULL
+     excluded_at INTEGER NOT NULL,
+     reason      TEXT NOT NULL DEFAULT 'revoked'
+   )`,
+  // Free-form compaction health that is not an integer counter (skip reasons).
+  `CREATE TABLE IF NOT EXISTS compaction_meta_text (
+     name  TEXT PRIMARY KEY,
+     value TEXT NOT NULL
    )`,
   `CREATE INDEX IF NOT EXISTS excluded_journal_time ON excluded_journal (received_at)`,
   // Spec 018: single-active lease per compaction partition. At-least-once
@@ -473,6 +501,8 @@ export class IngestCore {
       `ALTER TABLE segment_pins ADD COLUMN expires_at INTEGER`,
       // Additive migration for coverage rows created before spec 023 GC markers.
       `ALTER TABLE segment_coverage ADD COLUMN deleted_from_r2 INTEGER NOT NULL DEFAULT 0`,
+      // Additive migration for exclusions created before spec 025 R1 reasons.
+      `ALTER TABLE excluded_journal ADD COLUMN reason TEXT NOT NULL DEFAULT 'revoked'`,
     ]) {
       try {
         this.sql.exec(stmt);
@@ -843,77 +873,103 @@ export class IngestCore {
       if (!verified.ok) throw new Error(verified.error);
     }
 
-    const existing = this.sql
-      .exec(`SELECT sha256 FROM segment_manifest WHERE segment_key = ?`, validated.value.segment_key)
-      .toArray();
-    const duplicate = existing.length > 0;
-    if (duplicate && String(existing[0]!.sha256) !== validated.value.sha256) {
-      return Promise.reject(new Error("segment_key already exists with a different checksum"));
-    }
-
     const now = this.now();
     const seg = validated.value;
-    if (!duplicate) {
-      this.sql.exec(
-        `INSERT INTO segment_manifest
-           (segment_key, instance_id, object_key, size_bytes, sha256, first_received_at, last_received_at,
-            request_count, record_count, span_count, log_count, metric_count, event_min_ns, event_max_ns,
-            status, late, created_at, verified_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'verified', ?, ?, ?)`,
-        seg.segment_key,
-        seg.instance_id,
-        seg.object_key,
-        seg.size_bytes,
-        seg.sha256,
-        seg.first_received_at,
-        seg.last_received_at,
-        seg.request_count,
-        seg.record_count,
-        seg.span_count ?? 0,
-        seg.log_count ?? 0,
-        seg.metric_count ?? 0,
-        seg.event_min_ns ?? null,
-        seg.event_max_ns ?? null,
-        seg.late ? 1 : 0,
-        now,
-        now,
-      );
-    }
 
-    // Coverage insertion is idempotent per journal key and also heals a
-    // crash after the manifest row was written but before every atom landed:
-    // a duplicate publish re-checks all atoms instead of returning early
-    // (spec 024 R7 review fix).
-    let coveredNew = 0;
-    let coveredSkipped = 0;
-    for (const cov of seg.coverage) {
-      const hit = this.sql
-        .exec(`SELECT 1 AS one FROM segment_coverage WHERE journal_key = ?`, cov.journal_key)
+    // Spec 025 R2: the manifest row and every coverage atom are one atomic
+    // unit. A crash or an injected failure between them rolls the whole
+    // publication back, so no partially published segment is ever visible.
+    // The 024 duplicate-publish healing below remains as defense in depth.
+    const publish = (): {
+      duplicate: boolean;
+      coveredNew: number;
+      coveredSkipped: number;
+    } => {
+      const existing = this.sql
+        .exec(`SELECT sha256 FROM segment_manifest WHERE segment_key = ?`, seg.segment_key)
         .toArray();
-      if (hit.length > 0) {
-        coveredSkipped += 1;
-        continue;
+      const duplicate = existing.length > 0;
+      if (duplicate && String(existing[0]!.sha256) !== seg.sha256) {
+        throw new Error("segment_key already exists with a different checksum");
       }
-      this.sql.exec(
-        `INSERT INTO segment_coverage (journal_key, segment_key, instance_id, signal, received_at, covered_at)
-         VALUES (?,?,?,?,?,?)`,
-        cov.journal_key,
-        seg.segment_key,
-        cov.instance_id && cov.instance_id !== "" ? cov.instance_id : seg.instance_id,
-        cov.signal,
-        cov.received_at,
-        now,
-      );
-      coveredNew += 1;
-    }
-    if (duplicate) {
+      if (!duplicate) {
+        this.sql.exec(
+          `INSERT INTO segment_manifest
+             (segment_key, instance_id, object_key, size_bytes, sha256, first_received_at, last_received_at,
+              request_count, record_count, span_count, log_count, metric_count, event_min_ns, event_max_ns,
+              status, late, created_at, verified_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'verified', ?, ?, ?)`,
+          seg.segment_key,
+          seg.instance_id,
+          seg.object_key,
+          seg.size_bytes,
+          seg.sha256,
+          seg.first_received_at,
+          seg.last_received_at,
+          seg.request_count,
+          seg.record_count,
+          seg.span_count ?? 0,
+          seg.log_count ?? 0,
+          seg.metric_count ?? 0,
+          seg.event_min_ns ?? null,
+          seg.event_max_ns ?? null,
+          seg.late ? 1 : 0,
+          now,
+          now,
+        );
+      }
+
+      // Coverage insertion is idempotent per journal key and also heals a
+      // crash after the manifest row was written but before every atom landed:
+      // a duplicate publish re-checks all atoms instead of returning early
+      // (spec 024 R7 review fix).
+      let coveredNew = 0;
+      let coveredSkipped = 0;
+      for (const cov of seg.coverage) {
+        const hit = this.sql
+          .exec(`SELECT 1 AS one FROM segment_coverage WHERE journal_key = ?`, cov.journal_key)
+          .toArray();
+        if (hit.length > 0) {
+          coveredSkipped += 1;
+          continue;
+        }
+        this.sql.exec(
+          `INSERT INTO segment_coverage (journal_key, segment_key, instance_id, signal, received_at, covered_at)
+           VALUES (?,?,?,?,?,?)`,
+          cov.journal_key,
+          seg.segment_key,
+          cov.instance_id && cov.instance_id !== "" ? cov.instance_id : seg.instance_id,
+          cov.signal,
+          cov.received_at,
+          now,
+        );
+        coveredNew += 1;
+      }
+      return { duplicate, coveredNew, coveredSkipped };
+    };
+
+    // Use the storage transaction when the adapter provides one (ControlDO,
+    // in-process SQLite). The fallback keeps minimal read-only doubles usable.
+    const outcome = this.sql.transaction ? this.sql.transaction(publish) : publish();
+
+    if (outcome.duplicate) {
       this.bump("segment_duplicate");
-      return { committed: false, duplicate: true, covered_new: coveredNew, covered_skipped: coveredSkipped };
+      return {
+        committed: false,
+        duplicate: true,
+        covered_new: outcome.coveredNew,
+        covered_skipped: outcome.coveredSkipped,
+      };
     }
     this.bump("segment_published");
-    if (coveredNew > 0) this.bump("segment_covered", coveredNew);
+    if (outcome.coveredNew > 0) this.bump("segment_covered", outcome.coveredNew);
     if (seg.late) this.bump("segment_late");
-    return { committed: true, duplicate: false, covered_new: coveredNew, covered_skipped: coveredSkipped };
+    return {
+      committed: true,
+      duplicate: false,
+      covered_new: outcome.coveredNew,
+      covered_skipped: outcome.coveredSkipped,
+    };
   }
 
   /** Advertised segments, oldest range first, optionally filtered by instance. */
@@ -1093,6 +1149,17 @@ export class IngestCore {
   /** Records the outcome of a fenced compaction run (stale holders are ignored). */
   async recordCompaction(input: CompactionResultInput): Promise<{ ok: boolean; ignored: boolean }> {
     await this.ensureLoaded();
+    const now = this.now();
+
+    // Spec 025 R4: a tick skipped because another holder owns the lease is not
+    // a failure and cannot carry a matching fence, but it must still leave a
+    // visible trace so `compaction_status` is never silently stale.
+    if (input.skipped) {
+      this.setMeta("last_skipped_at", now);
+      this.setMetaText("last_skipped_reason", input.skipped);
+      return { ok: true, ignored: false };
+    }
+
     const lease = this.sql
       .exec(`SELECT holder, fencing FROM compaction_lease WHERE partition = 'primary'`)
       .toArray();
@@ -1101,7 +1168,12 @@ export class IngestCore {
         String(lease[0]!.holder) === input.holder && Number(lease[0]!.fencing) === input.fencing;
       if (!same) return { ok: false, ignored: true };
     }
-    const now = this.now();
+    if (input.lookback) {
+      this.setMeta("lookback_truncated", input.lookback.truncated ? 1 : 0);
+      this.setMetaNullable("lookback_floor_ms", input.lookback.floor_ms);
+      this.setMetaNullable("lookback_until_ms", input.lookback.until_ms);
+      this.setMeta("lookback_updated_at", now);
+    }
     if (input.ok) {
       this.setMeta("last_success_at", now);
       this.setMeta("consecutive_failures", 0);
@@ -1130,8 +1202,17 @@ export class IngestCore {
     instanceIds: string[],
     fromMS: number,
     toMS: number,
-  ): Promise<{ pending_journal: number }> {
+  ): Promise<{
+    pending_journal: number;
+    /** Last tick left the lookback scan truncated (spec 025, R3). */
+    lookback_truncated: boolean;
+    /** That truncation overlaps this receive-time range. */
+    lookback_in_range: boolean;
+    lookback_floor_ms: number | null;
+    lookback_until_ms: number | null;
+  }> {
     await this.ensureLoaded();
+    const risk = this.lookbackRisk(fromMS, toMS);
     if (this.bucket?.list) {
       const listed = await listJournalObjects(this.bucket, {
         instanceIds,
@@ -1142,7 +1223,7 @@ export class IngestCore {
       const covered = this.coveredKeySet(listed.objects.map((o) => o.key));
       const excluded = this.excludedKeySet(listed.objects.map((o) => o.key));
       const pending = listed.objects.filter((o) => !covered.has(o.key) && !excluded.has(o.key)).length;
-      return { pending_journal: pending };
+      return { pending_journal: pending, ...risk };
     }
     let q = `SELECT COUNT(*) AS n FROM journal_ledger j
                LEFT JOIN segment_coverage c ON c.journal_key = j.object_key
@@ -1153,7 +1234,34 @@ export class IngestCore {
       for (const id of instanceIds) args.push(id);
     }
     const rows = this.sql.exec(q, ...args).toArray();
-    return { pending_journal: Number(rows[0]?.n ?? 0) };
+    return { pending_journal: Number(rows[0]?.n ?? 0), ...risk };
+  }
+
+  /**
+   * Whether the last tick's truncated lookback range can still hold objects
+   * inside `[fromMS, toMS)`. Without a recorded range we fail safe and treat
+   * the whole range as at risk.
+   */
+  private lookbackRisk(
+    fromMS: number,
+    toMS: number,
+  ): {
+    lookback_truncated: boolean;
+    lookback_in_range: boolean;
+    lookback_floor_ms: number | null;
+    lookback_until_ms: number | null;
+  } {
+    const truncated = this.metaValue("lookback_truncated") === 1;
+    const floor = this.metaValue("lookback_floor_ms");
+    const until = this.metaValue("lookback_until_ms");
+    const inRange =
+      truncated && (floor === null || until === null || (toMS > floor && fromMS < until));
+    return {
+      lookback_truncated: truncated,
+      lookback_in_range: inRange,
+      lookback_floor_ms: floor,
+      lookback_until_ms: until,
+    };
   }
 
   /**
@@ -1296,19 +1404,32 @@ export class IngestCore {
 
   // ------------------------------------------------------ revoked exclusion
 
-  /** Durably records journal objects excluded because their token was revoked. */
+  /**
+   * Durably records journal objects excluded from every segment: revoked-token
+   * writes (spec 023 D3.2) and late writes whose DELETE failed (spec 025 R1).
+   */
   async recordExcludedRevoked(entries: ExcludedJournalInput[]): Promise<{ recorded: number }> {
     await this.ensureLoaded();
     const now = this.now();
-    const recorded = entries.reduce((n, entry) => n + this.recordExcludedRow(entry, now), 0);
-    if (recorded > 0) this.bump("revoked_excluded_recorded", recorded);
+    let recorded = 0;
+    let revoked = 0;
+    let late = 0;
+    for (const entry of entries) {
+      if (this.recordExcludedRow(entry, now)) {
+        recorded += 1;
+        if (entry.reason === "late_write") late += 1;
+        else revoked += 1;
+      }
+    }
+    if (revoked > 0) this.bump("revoked_excluded_recorded", revoked);
+    if (late > 0) this.bump("late_write_rejected", late);
     return { recorded };
   }
 
   private recordExcludedRow(entry: ExcludedJournalInput, now: number): number {
     const cursor = this.sql.exec(
-      `INSERT INTO excluded_journal (journal_key, token_id, instance_id, received_at, size, excluded_at)
-       VALUES (?,?,?,?,?,?)
+      `INSERT INTO excluded_journal (journal_key, token_id, instance_id, received_at, size, excluded_at, reason)
+       VALUES (?,?,?,?,?,?,?)
        ON CONFLICT (journal_key) DO NOTHING`,
       entry.key,
       entry.token_id,
@@ -1316,6 +1437,7 @@ export class IngestCore {
       entry.received_at,
       entry.size,
       now,
+      entry.reason === "late_write" ? "late_write" : "revoked",
     );
     return cursor.rowsWritten ?? 0;
   }
@@ -1325,7 +1447,7 @@ export class IngestCore {
     await this.ensureLoaded();
     const rows = this.sql
       .exec(
-        `SELECT journal_key, token_id, instance_id, received_at, size FROM excluded_journal
+        `SELECT journal_key, token_id, instance_id, received_at, size, reason FROM excluded_journal
           ORDER BY received_at DESC LIMIT ?`,
         Math.max(1, Math.min(limit, 1000)),
       )
@@ -1338,6 +1460,7 @@ export class IngestCore {
         instance_id: String(row.instance_id),
         received_at: Number(row.received_at),
         size: Number(row.size),
+        reason: row.reason === "late_write" ? "late_write" : "revoked",
       })),
       total,
     };
@@ -1365,7 +1488,20 @@ export class IngestCore {
       journal_pending_by_signal: listed.pending_by_signal,
       journal_listing_truncated: listed.truncated,
       excluded_revoked: Number(
-        this.sql.exec(`SELECT COUNT(*) AS n FROM excluded_journal`).toArray()[0]?.n ?? 0,
+        this.sql
+          .exec(`SELECT COUNT(*) AS n FROM excluded_journal WHERE reason != 'late_write'`)
+          .toArray()[0]?.n ?? 0,
+      ),
+      excluded_late_write: Number(
+        this.sql
+          .exec(`SELECT COUNT(*) AS n FROM excluded_journal WHERE reason = 'late_write'`)
+          .toArray()[0]?.n ?? 0,
+      ),
+      // Explicit alias for the spec 025 R1 marker name.
+      late_write_rejected: Number(
+        this.sql
+          .exec(`SELECT COUNT(*) AS n FROM excluded_journal WHERE reason = 'late_write'`)
+          .toArray()[0]?.n ?? 0,
       ),
       late_segments: Number(
         this.sql.exec(`SELECT COUNT(*) AS n FROM segment_manifest WHERE late = 1`).toArray()[0]?.n ?? 0,
@@ -1373,6 +1509,14 @@ export class IngestCore {
       last_success_at: this.metaValue("last_success_at"),
       last_failure_at: this.metaValue("last_failure_at"),
       consecutive_failures: this.metaValue("consecutive_failures") ?? 0,
+      // Spec 025 R4: a lease-skipped tick is visible instead of silently stale.
+      last_skipped_at: this.metaValue("last_skipped_at"),
+      last_skipped_reason: this.metaText("last_skipped_reason"),
+      // Spec 025 R3: truncated lookback visibility.
+      lookback_truncated: this.metaValue("lookback_truncated") === 1,
+      lookback_floor_ms: this.metaValue("lookback_floor_ms"),
+      lookback_until_ms: this.metaValue("lookback_until_ms"),
+      lookback_updated_at: this.metaValue("lookback_updated_at"),
       discovery_floor_ms: this.metaValue("discovery_floor_ms"),
       lease:
         lease.length === 0
@@ -1690,6 +1834,8 @@ export class IngestCore {
             bytes_published: numberOrUndefined(body.bytes_published),
             excluded_revoked: numberOrUndefined(body.excluded_revoked),
             error: typeof body.error === "string" ? body.error : null,
+            skipped: typeof body.skipped === "string" && body.skipped !== "" ? body.skipped : null,
+            lookback: normalizeLookback(body.lookback),
           }),
         );
       }
@@ -1739,6 +1885,7 @@ export class IngestCore {
               instance_id: raw.instance_id,
               received_at: raw.received_at,
               size: raw.size,
+              reason: raw.reason === "late_write" ? "late_write" : "revoked",
             });
           }
           return json(200, await this.recordExcludedRevoked(entries));
@@ -1970,6 +2117,28 @@ export class IngestCore {
     return rows.length === 0 ? null : Number(rows[0]!.value);
   }
 
+  private setMetaNullable(name: string, value: number | null): void {
+    if (value === null) {
+      this.sql.exec(`DELETE FROM compaction_meta WHERE name = ?`, name);
+      return;
+    }
+    this.setMeta(name, value);
+  }
+
+  private setMetaText(name: string, value: string): void {
+    this.sql.exec(
+      `INSERT INTO compaction_meta_text (name, value) VALUES (?, ?)
+       ON CONFLICT (name) DO UPDATE SET value = excluded.value`,
+      name,
+      value,
+    );
+  }
+
+  private metaText(name: string): string | null {
+    const rows = this.sql.exec(`SELECT value FROM compaction_meta_text WHERE name = ?`, name).toArray();
+    return rows.length === 0 ? null : String(rows[0]!.value);
+  }
+
   private bump(name: string, delta = 1): void {
     this.sql.exec(
       `INSERT INTO ingest_counters (name, value) VALUES (?, ?)
@@ -2018,6 +2187,13 @@ function registeredRow(row: SqlRow): WindowShotRecord {
 export function normalizeCoverage(input: WindowCoverage | undefined, instances: string[]): WindowCoverage {
   const missing = Array.isArray(input?.missing_segments) ? input!.missing_segments.map(String) : [];
   const pending = numOr(input?.pending_journal, 0);
+  // Spec 025 R3: a window that overlaps a truncated lookback is never complete,
+  // even when nothing is pending yet, because undiscovered objects may remain.
+  const lookbackTruncated = input?.lookback_truncated === true;
+  const floor =
+    typeof input?.lookback_floor_ms === "number" && Number.isFinite(input.lookback_floor_ms)
+      ? Math.floor(input.lookback_floor_ms)
+      : null;
   const coverage: WindowCoverage = {
     expected_segments: numOr(input?.expected_segments, 0),
     available_segments: numOr(input?.available_segments, 0),
@@ -2026,9 +2202,24 @@ export function normalizeCoverage(input: WindowCoverage | undefined, instances: 
     late_arrivals: numOr(input?.late_arrivals, 0),
     log_observed_fallbacks: numOr(input?.log_observed_fallbacks, 0),
     pending_journal: pending,
-    complete: input?.complete === true && missing.length === 0 && pending === 0,
+    lookback_truncated: lookbackTruncated,
+    lookback_floor_ms: floor,
+    complete:
+      input?.complete === true && missing.length === 0 && pending === 0 && !lookbackTruncated,
   };
   return coverage;
+}
+
+/** Validates the lookback health carried by a compaction result. */
+function normalizeLookback(
+  input: CompactionResultInput["lookback"] | undefined,
+): CompactionResultInput["lookback"] {
+  if (!input || typeof input !== "object") return null;
+  const floor =
+    typeof input.floor_ms === "number" && Number.isFinite(input.floor_ms) ? Math.floor(input.floor_ms) : null;
+  const until =
+    typeof input.until_ms === "number" && Number.isFinite(input.until_ms) ? Math.floor(input.until_ms) : null;
+  return { truncated: input.truncated === true, floor_ms: floor, until_ms: until };
 }
 
 function numOr(v: unknown, fallback: number): number {

@@ -338,6 +338,53 @@ describe("D2: ledger-free ingest and late-write guard", () => {
     expect(h.analytics.points.at(-1)!.blobs?.[1]).toBe("late_write");
     expect(await h.ingest.journalStats().then((s) => s.objects)).toBe(0);
   });
+
+  test("a failed late-write DELETE is durably excluded and never compacted (R1)", async () => {
+    const h = makeHarness({ lateWriteLimitMs: 5 });
+    await createInstance(h, "web-1");
+    const issued = await issue(h, "web-1");
+
+    const originalPut = h.bucket.put.bind(h.bucket);
+    h.bucket.put = async (key, value, options) => {
+      const result = await originalPut(key, value, options);
+      h.clock.now += 10; // simulate a slow write that trips the guard
+      return result;
+    };
+    // The guard's cleanup DELETE now fails: the object stays in R2.
+    h.bucket.delete = async () => {
+      throw new Error("simulated R2 DELETE outage");
+    };
+
+    const resp = await handleRequest(push(issued.token), h.env);
+    expect(resp.status).toBe(503);
+    expect(((await resp.json()) as { code: string }).code).toBe("late_write");
+    const [key] = [...h.bucket.objects.keys()];
+    expect(key).toBeDefined();
+    expect(await h.bucket.get(key!)).not.toBeNull();
+
+    // The rejection is durable before cleanup even runs.
+    const excluded = await h.ingest.listExcluded(10);
+    expect(excluded.total).toBe(1);
+    expect(excluded.entries[0]).toMatchObject({ key: key!, reason: "late_write" });
+
+    // Once finalized, discovery excludes the surviving object exactly like a
+    // revoked one: no segment, no coverage atom, and not counted as pending.
+    h.setClock(h.clock.now + 130_000);
+    const report = await makeCompactor(h).tick();
+    expect(report.ok).toBe(true);
+    expect(report.discovered_objects).toBe(0);
+    expect(report.segments_published).toBe(0);
+    expect(await h.bucket.get(key!)).not.toBeNull();
+    expect(await h.ingest.journalStats().then((s) => s.pending)).toBe(0);
+    expect(
+      await h.ingest.pendingJournalInRange([issued.instance_id], 0, Number.MAX_SAFE_INTEGER).then(
+        (r) => r.pending_journal,
+      ),
+    ).toBe(0);
+    expect((await h.ingest.listSegments({ limit: 10, offset: 0 })).total).toBe(0);
+    expect(h.sql.exec("SELECT COUNT(*) AS n FROM segment_coverage").toArray()[0]!.n).toBe(0);
+    expect((await h.ingest.compactionStatus()).excluded_late_write).toBe(1);
+  });
 });
 
 describe("D3: compaction-time discovery", () => {

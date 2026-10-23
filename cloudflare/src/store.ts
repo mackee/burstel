@@ -26,6 +26,16 @@ export interface SqlCursor {
 /** Synchronous SQL executor shared by DO SQLite and bun:sqlite adapters. */
 export interface SyncSql {
   exec(query: string, ...bindings: SqlValue[]): SqlCursor;
+  /**
+   * Runs every statement issued by `fn` inside one atomic storage transaction
+   * (spec 025, R2). The callback must stay synchronous: a Durable Object
+   * `transactionSync` cannot span an await.
+   *
+   * Optional so narrow read-only test doubles keep working; adapters that
+   * persist multi-row invariants (the ControlDO and the in-process SQLite fake)
+   * implement it.
+   */
+  transaction?<T>(fn: () => T): T;
 }
 
 export type ShotState = "created" | "recording" | "stopping" | "frozen" | "failed";

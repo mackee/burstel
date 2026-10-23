@@ -146,6 +146,12 @@ export interface TickReport {
   watermark: number;
   lookback_ms: number;
   lookback_truncated: boolean;
+  /** Inclusive floor of the lookback range this tick scanned (R3). */
+  lookback_floor_ms: number | null;
+  /** Exclusive ceiling of that lookback range. */
+  lookback_until_ms: number | null;
+  /** False when discovery never ran, so status must not clear prior health. */
+  lookback_known: boolean;
   error?: string;
 }
 
@@ -178,6 +184,8 @@ interface DiscoveryResult {
   floor: number | null;
   truncated: boolean;
   lookback_truncated: boolean;
+  lookback_floor: number | null;
+  lookback_until: number | null;
 }
 
 export class CompactorCore {
@@ -236,6 +244,9 @@ export class CompactorCore {
       watermark,
       lookback_ms: this.config.lookbackMs,
       lookback_truncated: false,
+      lookback_floor_ms: null,
+      lookback_until_ms: null,
+      lookback_known: false,
     };
     this.lastTickAt = this.now();
 
@@ -269,6 +280,9 @@ export class CompactorCore {
       report.discovered_objects = discovery.objects.length;
       report.excluded_revoked = discovery.excluded;
       report.lookback_truncated = discovery.lookback_truncated;
+      report.lookback_floor_ms = discovery.lookback_floor;
+      report.lookback_until_ms = discovery.lookback_until;
+      report.lookback_known = true;
       const deadline = start + this.config.tickBudgetMs;
       let failed = false;
       for (const batch of discovery.batches) {
@@ -342,7 +356,6 @@ export class CompactorCore {
       }
       await this.finish(report, start);
     }
-    this.lastReport = report;
     return report;
   }
 
@@ -355,17 +368,31 @@ export class CompactorCore {
     report.duration_ms = Date.now() - start;
     await this.armNext();
     // Report the outcome (best effort; a stale holder is ignored by the DO).
-    if (!report.skipped) {
-      await this.ingestCall("/internal/compaction/result", "POST", {
-        holder: this.holder,
-        fencing: this.lastFencing,
-        ok: report.ok,
-        segments_published: report.segments_published,
-        bytes_published: report.bytes_published,
-        excluded_revoked: report.excluded_revoked,
-        error: report.error ?? null,
-      }).catch(() => undefined);
-    }
+    // Skipped ticks are reported too (spec 025 R4), so a lease-held tick leaves
+    // `last_skipped_at` instead of silently leaving status stale. Lookback
+    // health is only sent when discovery actually ran (spec 025 R3), otherwise
+    // a failure or skip would erase the previous truncation warning.
+    const lookback = report.lookback_known
+      ? {
+          truncated: report.lookback_truncated,
+          floor_ms: report.lookback_floor_ms,
+          until_ms: report.lookback_until_ms,
+        }
+      : null;
+    await this.ingestCall("/internal/compaction/result", "POST", {
+      holder: this.holder,
+      fencing: this.lastFencing,
+      ok: report.ok,
+      skipped: report.skipped ?? null,
+      segments_published: report.segments_published,
+      bytes_published: report.bytes_published,
+      excluded_revoked: report.excluded_revoked,
+      error: report.error ?? null,
+      lookback,
+    }).catch(() => undefined);
+    // Set here (not only after the try/finally) so an early lease-skip return
+    // still updates `compaction_status.last_report` (spec 025, R4).
+    this.lastReport = report;
   }
 
   private lastFencing = 0;
@@ -449,6 +476,10 @@ export class CompactorCore {
             pageSize: 1000,
           })
         : { objects: [], truncated: false, scanned: 0 };
+    // Whether a lookback range actually exists for this tick. Its bounds are
+    // persisted in compaction_status so a truncated scan is never invisible
+    // (spec 025, R3).
+    const hasLookback = lookbackFrom < mainFrom;
     const merged = new Map<string, JournalObjectInfo>();
     for (const info of [...main.objects, ...lookback.objects]) merged.set(info.key, info);
 
@@ -519,6 +550,8 @@ export class CompactorCore {
       // Only the main range gates the cursor; the lookback is always re-listed.
       truncated: main.truncated,
       lookback_truncated: lookback.truncated,
+      lookback_floor: hasLookback ? lookbackFrom : null,
+      lookback_until: hasLookback ? mainFrom : null,
     };
   }
 

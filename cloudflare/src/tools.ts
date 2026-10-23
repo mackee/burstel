@@ -730,7 +730,15 @@ async function openWindowSession(
   sessionId: string,
   window: ShotWindow,
   catalog: SegmentManifestRow[],
-): Promise<{ selected: number; available: number; missing: string[]; pending_journal: number }> {
+): Promise<{
+  selected: number;
+  available: number;
+  missing: string[];
+  pending_journal: number;
+  lookback_truncated: boolean;
+  lookback_in_range: boolean;
+  lookback_floor_ms: number | null;
+}> {
   if (!ctx.bucket) throw new HttpError(503, "window analysis requires the object bucket binding", true, "bucket_unavailable");
   const instances = await ingestCall<{ instances: InstanceMetadata[] }>(ctx, "/internal/instance/list", "GET").catch(
     () => ({ instances: [] as InstanceMetadata[] }),
@@ -784,12 +792,30 @@ async function openWindowSession(
     windowNames.size === 0
       ? []
       : instances.instances.filter((i) => windowNames.has(i.name)).map((i) => i.instance_id);
-  const pending = await ingestCall<{ pending_journal: number }>(ctx, "/internal/compaction/pending", "POST", {
+  const pending = await ingestCall<{
+    pending_journal: number;
+    lookback_truncated?: boolean;
+    lookback_in_range?: boolean;
+    lookback_floor_ms?: number | null;
+  }>(ctx, "/internal/compaction/pending", "POST", {
     instance_ids: instanceIds,
     from_ms: window.start_ms,
     to_ms: window.end_ms,
-  }).catch(() => ({ pending_journal: 0 }));
-  return { selected: selection.selected.length, available, missing, pending_journal: pending.pending_journal };
+  }).catch(() => ({
+    pending_journal: 0,
+    lookback_truncated: false,
+    lookback_in_range: false,
+    lookback_floor_ms: null,
+  }));
+  return {
+    selected: selection.selected.length,
+    available,
+    missing,
+    pending_journal: pending.pending_journal,
+    lookback_truncated: pending.lookback_truncated === true,
+    lookback_in_range: pending.lookback_in_range === true,
+    lookback_floor_ms: typeof pending.lookback_floor_ms === "number" ? pending.lookback_floor_ms : null,
+  };
 }
 
 /** Runs `run` against a freshly committed window session, then releases it. */
@@ -839,10 +865,19 @@ async function syncCoverage(
   ctx: ToolContext,
   record: WindowShotRecord,
   catalog: SegmentManifestRow[],
-  result: { missing?: string[]; pending_journal?: number },
+  result: {
+    missing?: string[];
+    pending_journal?: number;
+    lookback_truncated?: boolean;
+    lookback_in_range?: boolean;
+    lookback_floor_ms?: number | null;
+  },
 ): Promise<void> {
   const missing = result.missing ?? [];
   const pending = result.pending_journal ?? 0;
+  // Spec 025 R3: a truncated lookback that overlaps this window means objects
+  // may still be undiscovered even when nothing is pending yet.
+  const lookbackTruncated = result.lookback_in_range === true;
   try {
     await ingestCall(ctx, "/internal/shot/window/coverage", "POST", {
       shot_id: record.shot_id,
@@ -852,7 +887,9 @@ async function syncCoverage(
         missing_segments: missing,
         instances: record.window?.instances ?? [],
         pending_journal: pending,
-        complete: missing.length === 0 && pending === 0,
+        lookback_truncated: lookbackTruncated,
+        lookback_floor_ms: result.lookback_floor_ms ?? null,
+        complete: missing.length === 0 && pending === 0 && !lookbackTruncated,
       },
     });
   } catch {

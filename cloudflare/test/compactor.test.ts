@@ -11,6 +11,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { CompactorConfig } from "../src/compactor-core";
 import { CompactorCore } from "../src/compactor-core";
+import { normalizeCoverage } from "../src/ingest-core";
 import type { IngestCore } from "../src/ingest-core";
 import { createTools } from "../src/tools";
 import {
@@ -151,6 +152,112 @@ describe("compactor coordinator (spec 018)", () => {
     const taken = await h.compactor.tick();
     expect(taken.ok).toBe(true);
     expect(taken.segments_published).toBe(1);
+  });
+
+  test("a lease-skipped tick is recorded in status instead of staying stale (R4)", async () => {
+    const h = makeHarness();
+    await seed(h, { instanceId: "inst-a", instance: "inst-a", signal: "traces", receivedAt: h.clock.now - 600_000 });
+    await h.ingest.acquireLease("primary", "holder-B", 60_000);
+
+    const skipped = await h.compactor.tick();
+    expect(skipped.skipped).toBe("lease_held");
+
+    const status = await h.ingest.compactionStatus();
+    expect(status.last_skipped_reason).toBe("lease_held");
+    expect(typeof status.last_skipped_at).toBe("number");
+    // A skip is not a success or a failure.
+    expect(status.last_success_at).toBeNull();
+    expect(status.last_failure_at).toBeNull();
+    expect(status.consecutive_failures).toBe(0);
+
+    // The coordinator's in-memory report also exposes the skip.
+    const coordinator = await h.compactor.status();
+    expect((coordinator.last_report as Record<string, unknown>).skipped).toBe("lease_held");
+  });
+
+  test("a truncated lookback is visible in status and withholds window completeness (R3)", async () => {
+    // 4 objects per scan: enough to make the lookback truncated while a
+    // backlog of 3 exists, and to clear once only one covered object remains.
+    // GC is enabled so the drained backlog leaves R2; the initial object is
+    // pinned so one covered object remains in the lookback.
+    const h = makeHarness({
+      config: { batchObjects: 1, maxBatchesPerTick: 4, gcEnabled: true, retentionMs: 1000 },
+    });
+    const t = h.clock.now;
+    // Establish a discovery cursor first (floor starts unset, so the first tick
+    // has no lookback range at all).
+    const keeper = await seed(h, {
+      instanceId: "inst-a",
+      instance: "inst-a",
+      signal: "traces",
+      receivedAt: t - 130_000,
+    });
+    await h.ingest.addPin("keep-1", "inst-a", t - 130_000, t - 130_000);
+    expect((await h.compactor.tick()).segments_published).toBe(1);
+
+    // Three finalized objects inside the 2 x grace lookback backlog.
+    for (let i = 0; i < 3; i += 1) {
+      await seed(h, {
+        instanceId: "inst-a",
+        instance: "inst-a",
+        signal: "traces",
+        receivedAt: t - 175_000 + i,
+      });
+    }
+
+    const truncated = await h.compactor.tick();
+    expect(truncated.ok).toBe(true);
+    expect(truncated.lookback_truncated).toBe(true);
+    expect(truncated.lookback_floor_ms).toBe(t - 180_000);
+    expect(truncated.lookback_until_ms).toBe(t - 90_000);
+
+    const status = await h.ingest.compactionStatus();
+    expect(status.lookback_truncated).toBe(true);
+    expect(status.lookback_floor_ms).toBe(t - 180_000);
+    expect(status.lookback_until_ms).toBe(t - 90_000);
+
+    // An empty slice inside the truncated lookback has nothing pending, yet it
+    // must not be called complete while the lookback warning stands.
+    const risk = await h.ingest.pendingJournalInRange(["inst-a"], t - 170_000, t - 169_000);
+    expect(risk.pending_journal).toBe(0);
+    expect(risk.lookback_truncated).toBe(true);
+    expect(risk.lookback_in_range).toBe(true);
+    expect(
+      normalizeCoverage(
+        {
+          expected_segments: 0,
+          available_segments: 0,
+          missing_segments: [],
+          instances: [],
+          pending_journal: 0,
+          lookback_truncated: true,
+          complete: true,
+        },
+        [],
+      ).complete,
+    ).toBe(false);
+
+    // The truncated tick already published and GC'd the backlog; the next scan
+    // fits inside the budget and clears the warning.
+    const drained = await h.compactor.tick();
+    expect(drained.lookback_truncated).toBe(false);
+    const after = await h.ingest.compactionStatus();
+    expect(after.lookback_truncated).toBe(false);
+    expect(await h.bucket.get(keeper.key)).not.toBeNull();
+    expect(await h.ingest.journalStats().then((s) => s.pending)).toBe(0);
+    const coverage = normalizeCoverage(
+      {
+        expected_segments: 0,
+        available_segments: 0,
+        missing_segments: [],
+        instances: [],
+        pending_journal: 0,
+        lookback_truncated: false,
+        complete: true,
+      },
+      [],
+    );
+    expect(coverage.complete).toBe(true);
   });
 
   test("does not publish when the compactor build fails", async () => {
