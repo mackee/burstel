@@ -75,7 +75,32 @@ export interface WranglerValidationOptions {
   expectedImageBuildContext?: string;
   expectedInstanceType?: string;
   expectedCompactorImage?: string;
+  /**
+   * Structural lint only: accept the repository's all-zero KV placeholder id.
+   * A real deploy preflight must never set this (spec 024, R2).
+   */
+  allowPlaceholderKv?: boolean;
 }
+
+/**
+ * Deploy-safe control-plane storage class (spec 024, R1).
+ *
+ * The code alias is `ControlDO`, but the exported Wrangler class and the
+ * `INGEST_DO.class_name` binding must stay `IngestDO` so an existing
+ * installation reuses its SQLite storage without a `renamed_classes` migration.
+ */
+export const LEGACY_CONTROL_DO_CLASS = "IngestDO";
+/** Code-level alias for the control-plane role; never a Wrangler class name. */
+export const CONTROL_DO_ALIAS = "ControlDO";
+
+/** True for the repo's all-zero / obvious placeholder KV namespace id. */
+export function isPlaceholderKvId(id: string | undefined): boolean {
+  const value = (id ?? "").trim().toLowerCase();
+  if (value === "") return true;
+  if (/^0+$/.test(value)) return true;
+  return value.includes("placeholder") || value.includes("replace-me") || value.startsWith("<");
+}
+
 
 /** Removes `//` and block comments while preserving string contents. */
 export function stripJsonComments(input: string): string {
@@ -299,9 +324,28 @@ export function validateWranglerConfig(
   );
   add(
     "do_binding_ingestdo",
-    bindings.some((b) => b.name === "INGEST_DO" && b.class_name === "ControlDO"),
+    bindings.some((b) => b.name === "INGEST_DO" && b.class_name === LEGACY_CONTROL_DO_CLASS),
     true,
-    "INGEST_DO -> ControlDO durable object binding (spec 023 D4)",
+    `INGEST_DO -> ${LEGACY_CONTROL_DO_CLASS} durable object binding (spec 024 R1; code alias ${CONTROL_DO_ALIAS})`,
+  );
+  // R1 deploy safety: the binding must resolve to an exported SQLite class
+  // whose name is exactly the pre-024 storage class. Renaming it here without a
+  // renamed_classes migration would orphan existing DO state.
+  const ingestBinding = bindings.find((b) => b.name === "INGEST_DO");
+  const ingestExport = ingestBinding?.class_name ? cfg.exports?.[ingestBinding.class_name] : undefined;
+  add(
+    "do_rename_preserves_storage",
+    ingestBinding?.class_name === LEGACY_CONTROL_DO_CLASS &&
+      ingestExport?.type === "durable-object" &&
+      ingestExport?.storage === "sqlite",
+    true,
+    `INGEST_DO resolves to ${ingestBinding?.class_name ?? "<missing>"} (${ingestExport?.storage ?? "no export"}); must stay ${LEGACY_CONTROL_DO_CLASS}/sqlite`,
+  );
+  add(
+    "no_unsafe_control_do_rename",
+    cfg.exports?.[CONTROL_DO_ALIAS] === undefined,
+    true,
+    `wrangler must not export ${CONTROL_DO_ALIAS} as a separate Durable Object class (it would create empty storage)`,
   );
   add(
     "do_binding_authdo",
@@ -319,9 +363,10 @@ export function validateWranglerConfig(
   );
   add(
     "export_ingestdo_sqlite",
-    exports["ControlDO"]?.type === "durable-object" && exports["ControlDO"]?.storage === "sqlite",
+    exports[LEGACY_CONTROL_DO_CLASS]?.type === "durable-object" &&
+      exports[LEGACY_CONTROL_DO_CLASS]?.storage === "sqlite",
     true,
-    `exports.ControlDO=${JSON.stringify(exports["ControlDO"] ?? null)}`,
+    `exports.${LEGACY_CONTROL_DO_CLASS}=${JSON.stringify(exports[LEGACY_CONTROL_DO_CLASS] ?? null)}`,
   );
   add(
     "export_authdo_sqlite",
@@ -352,11 +397,25 @@ export function validateWranglerConfig(
   );
 
   const kv = cfg.kv_namespaces ?? [];
+  const kvBinding = kv.find((b) => b.binding === "INSTANCE_TOKENS");
   add(
     "kv_instance_tokens_binding",
-    kv.some((b) => b.binding === "INSTANCE_TOKENS" && typeof b.id === "string" && b.id.trim() !== ""),
+    kvBinding !== undefined && typeof kvBinding.id === "string" && kvBinding.id.trim() !== "",
     true,
     "INSTANCE_TOKENS KV namespace binding (spec 023 D1)",
+  );
+  // Spec 024 R2: the checked-in all-zero id is a safe repository placeholder,
+  // but deploying it would silently break token admission. Fail the real
+  // preflight; only an explicit structural lint may accept it.
+  add(
+    "kv_instance_tokens_not_placeholder",
+    opts.allowPlaceholderKv === true || !isPlaceholderKvId(kvBinding?.id),
+    true,
+    opts.allowPlaceholderKv === true
+      ? "structural lint: placeholder KV id accepted only with allowPlaceholderKv"
+      : isPlaceholderKvId(kvBinding?.id)
+        ? "INSTANCE_TOKENS id is empty/all-zero (placeholder); substitute the real namespace id before deploy"
+        : "INSTANCE_TOKENS id is a concrete namespace id",
   );
 
   const analytics = cfg.analytics_engine_datasets ?? [];

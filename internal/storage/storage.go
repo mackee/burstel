@@ -9,6 +9,7 @@ import (
 	"database/sql/driver"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -57,6 +58,24 @@ const (
 	tableMetrics = "metric_points"
 )
 
+const (
+	// DefaultWALCheckpointBytes bounds the standalone WAL at 256 MiB
+	// (spec 024, R4). Below this size a crash-recovery replay stays short while
+	// checkpoints remain infrequent enough not to perturb ingest.
+	DefaultWALCheckpointBytes int64 = 256 << 20
+	// defaultWALPollInterval is how often the background guard inspects the WAL.
+	defaultWALPollInterval = 5 * time.Second
+)
+
+// Options tune the standalone writer. The zero value uses production defaults.
+type Options struct {
+	// WALCheckpointBytes triggers a background CHECKPOINT once the WAL reaches
+	// this size. Values <= 0 use DefaultWALCheckpointBytes.
+	WALCheckpointBytes int64
+	// WALPollInterval is the size-check cadence. Values <= 0 use 5s.
+	WALPollInterval time.Duration
+}
+
 // Storage is a single-writer DuckDB wrapper. DuckDB itself serializes writers;
 // we additionally pin the database to exactly one connection, hold it for the
 // lifetime of the Storage and serialise every batch behind one mutex so ordinal
@@ -77,11 +96,22 @@ type Storage struct {
 
 	driverConn driver.Conn
 	appenders  map[string]*duckdb.Appender
+
+	walPath            string
+	walCheckpointBytes int64
+
+	stopOnce sync.Once
+	stop     chan struct{}
+	walWG    sync.WaitGroup
 }
 
-// Open creates (or opens) the DuckDB file at dbPath, applies the schema and
-// prepares the write path.
+// Open creates (or opens) the DuckDB file at dbPath with the default WAL bound.
 func Open(ctx context.Context, dbPath string) (*Storage, error) {
+	return OpenWithOptions(ctx, dbPath, Options{})
+}
+
+// OpenWithOptions is Open with an explicit standalone WAL checkpoint bound.
+func OpenWithOptions(ctx context.Context, dbPath string, opts Options) (*Storage, error) {
 	db, err := sql.Open("duckdb", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("storage: open %s: %w", dbPath, err)
@@ -105,6 +135,16 @@ func Open(ctx context.Context, dbPath string) (*Storage, error) {
 	}
 
 	s := &Storage{db: db, conn: conn, path: dbPath, appenders: map[string]*duckdb.Appender{}}
+	walBytes := opts.WALCheckpointBytes
+	if walBytes <= 0 {
+		walBytes = DefaultWALCheckpointBytes
+	}
+	poll := opts.WALPollInterval
+	if poll <= 0 {
+		poll = defaultWALPollInterval
+	}
+	s.walPath = dbPath + ".wal"
+	s.walCheckpointBytes = walBytes
 	for _, stmt := range schemaStatements {
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			s.Close()
@@ -131,6 +171,9 @@ func Open(ctx context.Context, dbPath string) (*Storage, error) {
 		s.Close()
 		return nil, err
 	}
+	s.stop = make(chan struct{})
+	s.walWG.Add(1)
+	go s.runWALCheckpointLoop(poll)
 	return s, nil
 }
 
@@ -333,6 +376,60 @@ func (s *Storage) flushAppendersLocked(table string) error {
 	return nil
 }
 
+// runWALCheckpointLoop bounds the WAL off the ingest hot path (spec 024, R4).
+// It only inspects the file size, then takes the writer mutex to CHECKPOINT;
+// an in-flight batch is never interrupted and the caller never waits.
+func (s *Storage) runWALCheckpointLoop(interval time.Duration) {
+	defer s.walWG.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.stop:
+			return
+		case <-ticker.C:
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, _ = s.CheckpointIfNeeded(ctx)
+			cancel()
+		}
+	}
+}
+
+// CheckpointIfNeeded runs CHECKPOINT when the WAL has reached the configured
+// bound. It is safe to call from tests and the background guard.
+func (s *Storage) CheckpointIfNeeded(ctx context.Context) (bool, error) {
+	info, err := os.Stat(s.walPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("storage: stat wal: %w", err)
+	}
+	if info.Size() < s.walCheckpointBytes {
+		return false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false, ErrClosed
+	}
+	// Re-check under the writer lock: the WAL may already have been truncated.
+	info, err = os.Stat(s.walPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("storage: stat wal: %w", err)
+	}
+	if info.Size() < s.walCheckpointBytes {
+		return false, nil
+	}
+	if _, err := s.conn.ExecContext(ctx, "CHECKPOINT"); err != nil {
+		return false, fmt.Errorf("storage: wal checkpoint: %w", err)
+	}
+	return true, nil
+}
+
 // Checkpoint flushes the WAL into the main database file. It must be called
 // after all writers have drained and before Close.
 func (s *Storage) Checkpoint(ctx context.Context) error {
@@ -350,6 +447,10 @@ func (s *Storage) Checkpoint(ctx context.Context) error {
 // Close releases appenders, prepared statements and the underlying connection.
 // It is safe to call more than once.
 func (s *Storage) Close() error {
+	if s.stop != nil {
+		s.stopOnce.Do(func() { close(s.stop) })
+		s.walWG.Wait()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {

@@ -1,36 +1,30 @@
 #!/usr/bin/env bash
 #
-# cloudflare-multishot-smoke.sh - bounded live two-shot isolation E2E against a
-# deployed burstel Worker + Containers + R2 deployment (spec 013, Parts A+B).
+# cloudflare-multishot-smoke.sh - bounded live two-instance isolation E2E.
 #
-# It proves that two shots recording at the same time, each addressed by its own
-# per-shot ingest token on the stable /ingest endpoint, keep strictly isolated
-# DuckDB state:
+# Spec 024 R3: rewritten for the current named-instance model. There are no
+# per-shot ingest tokens and no recording containers on the ingest path.
 #
-#   1. create two shots concurrently (both `recording`);
-#   2. push the OTLP fixtures with token A only;
-#   3. assert shot A's counters advanced while shot B's stayed at zero;
-#   4. push with token B and assert both advanced;
-#   5. freeze both and assert independent frozen artifacts;
-#   6. assert scope separation (/ingest rejects the admin token; /api/*
-#      rejects a per-shot token);
-#   7. (Part B) mint two `member` tokens, cross-operate on each other's shots,
-#      deny the registry with 403, revoke one immediately, and list MCP tools.
+# It proves:
+#   1. two named instances each get a distinct push-only `bit_` token;
+#   2. POST /api/shots defaults to logical window shots (kind=window) and each
+#      shot can be scoped to one instance;
+#   3. /ingest/v1/* attributes each export to the token's instance (checked from
+#      the x-burstel-instance response header, never a cross-instance leak);
+#   4. owner filtering on GET /api/shots is isolated;
+#   5. revocation of one instance token is immediate (401) without affecting the
+#      other instance;
+#   6. /ingest rejects admin/member credentials, and window markers stop to a
+#      ready/incomplete state.
 #
-# Secret confidentiality: tokens are read from the environment, passed to curl
-# via `--config` process substitution (never argv) and to otlpsend via
-# BURSTEL_PUSH_TOKEN, never echoed, never written to the repository, logs, URLs
-# or result files.
-#
-# This script was NOT executed by the implementing agent: it needs the live
-# Cloudflare deploy host (a real `wrangler deploy`) and Docker-built container.
+# Secret confidentiality: tokens are read from the environment and passed to
+# curl via `--config` process substitution (never argv), and are never echoed.
+# No deploy and no Cloudflare resource mutation.
 #
 # Usage:
 #   BURSTEL_BASE_URL=https://burstel.example \
 #   BURSTEL_API_TOKEN=... \
 #   scripts/cloudflare-multishot-smoke.sh
-#
-# Optional: OTLPSEND_BIN (otherwise cmd/otlpsend is built with go).
 set -euo pipefail
 
 BASE="${BURSTEL_BASE_URL:-}"
@@ -76,147 +70,111 @@ jget() { python3 -c "import sys,json;d=json.load(sys.stdin);print(d$1)" 2>/dev/n
 expect_code() { [ "$HTTP_CODE" = "$1" ] || die "$2 returned HTTP $HTTP_CODE, want $1: $BODY"; }
 
 ADMIN="Authorization: Bearer $ADMIN_TOKEN"
+STAMP="$(date +%s)"
+INSTANCE_A="multi-a-$STAMP"
+INSTANCE_B="multi-b-$STAMP"
+
+# Sends one minimal valid OTLP protobuf export with an instance token and
+# returns the attributed instance from the response header (stdout).
+push_signal() { # token signal
+  local token="$1" signal="$2" cfg code
+  cfg="$(printf 'silent\nshow-error\nmax-time = 30\nrequest = "POST"\nheader = "%s"\nheader = "Content-Type: application/x-protobuf"\ndata-binary = "@-"\n' "X-Burstel-Token: $token")"
+  code="$(printf '\x0a\x00' | curl --config <(printf '%s' "$cfg") -D "$WORK/headers" -o /dev/null -w '%{http_code}' "$BASE/ingest/v1/$signal")"
+  [ "$code" = "200" ] || die "/ingest/v1/$signal returned HTTP $code, want 200"
+  awk 'tolower($1) == "x-burstel-instance:" { print $2 }' "$WORK/headers" | tr -d '\r'
+}
+
+push_expect() { # token signal want_code label
+  local token="$1" signal="$2" want="$3" label="$4" cfg code
+  cfg="$(printf 'silent\nshow-error\nmax-time = 30\nrequest = "POST"\nheader = "%s"\nheader = "Content-Type: application/x-protobuf"\ndata-binary = "@-"\n' "X-Burstel-Token: $token")"
+  code="$(printf '\x0a\x00' | curl --config <(printf '%s' "$cfg") -o /dev/null -w '%{http_code}' "$BASE/ingest/v1/$signal")"
+  [ "$code" = "$want" ] || die "$label returned HTTP $code, want $want"
+}
 
 echo "== healthz ==" >&2
 req GET /healthz
 expect_code 200 "healthz"
 
-echo "== create two concurrent shots ==" >&2
-req POST /api/shots "{\"owner\":\"e2e-a\",\"metadata\":{\"source\":\"multishot-a\",\"ts\":\"$(date +%s)\"}}" "$ADMIN"
+echo "== two named instances + distinct push tokens ==" >&2
+req POST /api/instances "{\"name\":\"$INSTANCE_A\"}" "$ADMIN"
+expect_code 201 "create instance A"
+INSTANCE_ID_A="$(printf '%s' "$BODY" | jget "['instance_id']")"
+req POST "/api/instances/$INSTANCE_A/tokens" '{}' "$ADMIN"
+expect_code 201 "issue token A"
+PUSH_A="$(printf '%s' "$BODY" | jget "['token']")"
+TOKEN_ID_A="$(printf '%s' "$BODY" | jget "['id']")"
+[ -n "$PUSH_A" ] || die "no token for instance A"
+
+req POST /api/instances "{\"name\":\"$INSTANCE_B\"}" "$ADMIN"
+expect_code 201 "create instance B"
+INSTANCE_ID_B="$(printf '%s' "$BODY" | jget "['instance_id']")"
+req POST "/api/instances/$INSTANCE_B/tokens" '{}' "$ADMIN"
+expect_code 201 "issue token B"
+PUSH_B="$(printf '%s' "$BODY" | jget "['token']")"
+[ -n "$PUSH_B" ] || die "no token for instance B"
+[ "$PUSH_A" != "$PUSH_B" ] || die "instances share a token"
+[ "$INSTANCE_ID_A" != "$INSTANCE_ID_B" ] || die "instances share an id"
+
+echo "== two default (window) shots, one per instance ==" >&2
+req POST /api/shots "{\"owner\":\"e2e-a\",\"instances\":[\"$INSTANCE_A\"],\"metadata\":{\"source\":\"multishot-a\",\"ts\":\"$STAMP\"}}" "$ADMIN"
 expect_code 201 "create shot A"
 SHOT_A="$(printf '%s' "$BODY" | jget "['shot_id']")"
-PUSH_A="$(printf '%s' "$BODY" | jget "['ingest_token']")"
-[ -n "$SHOT_A" ] || die "no shot A id"
-[ -n "$PUSH_A" ] || die "shot A did not disclose a per-shot token"
+[ "$(printf '%s' "$BODY" | jget "['kind']")" = "window" ] || die "shot A is not a window shot: $BODY"
+SHOT_A_INST="$(printf '%s' "$BODY" | jget "['window']['instances'][0]")"
+[ "$SHOT_A_INST" = "$INSTANCE_A" ] || die "shot A window instance=$SHOT_A_INST, want $INSTANCE_A"
 
-req POST /api/shots "{\"owner\":\"e2e-b\",\"metadata\":{\"source\":\"multishot-b\",\"ts\":\"$(date +%s)\"}}" "$ADMIN"
+req POST /api/shots "{\"owner\":\"e2e-b\",\"instances\":[\"$INSTANCE_B\"],\"metadata\":{\"source\":\"multishot-b\",\"ts\":\"$STAMP\"}}" "$ADMIN"
 expect_code 201 "create shot B"
 SHOT_B="$(printf '%s' "$BODY" | jget "['shot_id']")"
-PUSH_B="$(printf '%s' "$BODY" | jget "['ingest_token']")"
-[ -n "$SHOT_B" ] || die "no shot B id"
-[ -n "$PUSH_B" ] || die "shot B did not disclose a per-shot token"
+[ "$(printf '%s' "$BODY" | jget "['kind']")" = "window" ] || die "shot B is not a window shot: $BODY"
 [ "$SHOT_A" != "$SHOT_B" ] || die "shots share an id"
-[ "$PUSH_A" != "$PUSH_B" ] || die "shots share an ingest token"
 
-echo "== both shots are recording simultaneously ==" >&2
-for id in "$SHOT_A" "$SHOT_B"; do
-  req GET "/api/shots/$id" "" "$ADMIN"
-  expect_code 200 "status $id"
-  [ "$(printf '%s' "$BODY" | jget "['state']")" = "recording" ] || die "shot $id is not recording: $BODY"
-done
+echo "== /ingest attributes each token to its own instance ==" >&2
+GOT_A="$(push_signal "$PUSH_A" traces)"
+[ "$GOT_A" = "$INSTANCE_ID_A" ] || die "token A was attributed to $GOT_A, want $INSTANCE_ID_A"
+GOT_B="$(push_signal "$PUSH_B" logs)"
+[ "$GOT_B" = "$INSTANCE_ID_B" ] || die "token B was attributed to $GOT_B, want $INSTANCE_ID_B"
 
-echo "== GET /api/shots lists both with attribution ==" >&2
+echo "== owner filtering ==" >&2
 req GET "/api/shots?owner=e2e-a" "" "$ADMIN"
 expect_code 200 "list owner=e2e-a"
 printf '%s' "$BODY" | grep -q "$SHOT_A" || die "list did not return shot A"
-printf '%s' "$BODY" | grep -q "$SHOT_B" && die "owner filter leaked shot B"
+if printf '%s' "$BODY" | grep -q "$SHOT_B"; then die "owner filter leaked shot B"; fi
 req GET "/api/shots?owner=e2e-b" "" "$ADMIN"
 expect_code 200 "list owner=e2e-b"
 printf '%s' "$BODY" | grep -q "$SHOT_B" || die "list did not return shot B"
 
-OTLPSEND_BIN="${OTLPSEND_BIN:-}"
-if [ -z "$OTLPSEND_BIN" ]; then
-  command -v go >/dev/null 2>&1 || die "go not found and OTLPSEND_BIN unset"
-  OTLPSEND_BIN="$WORK/otlpsend"
-  (cd "$(dirname "$0")/.." && go build -o "$OTLPSEND_BIN" ./cmd/otlpsend)
-fi
-
-echo "== token A only: shot A advances, shot B stays at zero ==" >&2
-BURSTEL_PUSH_TOKEN="$PUSH_A" "$OTLPSEND_BIN" -ingest "$BASE" >/dev/null 2>"$WORK/a.err" \
-  || die "otlpsend A failed: $(cat "$WORK/a.err")"
-
-req GET "/api/shots/$SHOT_A" "" "$ADMIN"
-expect_code 200 "status A after A-only push"
-SPANS_A="$(printf '%s' "$BODY" | jget "['counters']['spans']")"
-req GET "/api/shots/$SHOT_B" "" "$ADMIN"
-expect_code 200 "status B after A-only push"
-SPANS_B="$(printf '%s' "$BODY" | jget "['counters']['spans']")"
-[ "$SPANS_A" -gt 0 ] || die "shot A recorded no spans ($SPANS_A)"
-[ "$SPANS_B" = "0" ] || die "isolation breach: shot B saw $SPANS_B spans from token A"
-
-echo "== token B: shot B advances too ==" >&2
-BURSTEL_PUSH_TOKEN="$PUSH_B" "$OTLPSEND_BIN" -ingest "$BASE" >/dev/null 2>"$WORK/b.err" \
-  || die "otlpsend B failed: $(cat "$WORK/b.err")"
-req GET "/api/shots/$SHOT_B" "" "$ADMIN"
-expect_code 200 "status B after B push"
-SPANS_B2="$(printf '%s' "$BODY" | jget "['counters']['spans']")"
-[ "$SPANS_B2" -gt 0 ] || die "shot B recorded no spans ($SPANS_B2)"
-
-echo "== freeze both; independent artifacts ==" >&2
-req POST "/api/shots/$SHOT_A/stop" "" "$ADMIN"
-expect_code 200 "stop A"
-SHA_A="$(printf '%s' "$BODY" | jget "['sha256']")"
-SIZE_A="$(printf '%s' "$BODY" | jget "['size_bytes']")"
-[ "$(printf '%s' "$BODY" | jget "['state']")" = "frozen" ] || die "shot A did not freeze"
-req POST "/api/shots/$SHOT_B/stop" "" "$ADMIN"
-expect_code 200 "stop B"
-SHA_B="$(printf '%s' "$BODY" | jget "['sha256']")"
-SIZE_B="$(printf '%s' "$BODY" | jget "['size_bytes']")"
-[ "$(printf '%s' "$BODY" | jget "['state']")" = "frozen" ] || die "shot B did not freeze"
-printf '%s' "$SHA_A" | grep -Eq '^[0-9a-f]{64}$' || die "shot A sha256 is not 64 hex chars"
-printf '%s' "$SHA_B" | grep -Eq '^[0-9a-f]{64}$' || die "shot B sha256 is not 64 hex chars"
-[ "$SIZE_A" -gt 0 ] || die "shot A size_bytes is not positive"
-[ "$SIZE_B" -gt 0 ] || die "shot B size_bytes is not positive"
-
-echo "== scope separation ==" >&2
+echo "== admin and instance credential scopes stay separate ==" >&2
 req GET "/api/shots/$SHOT_A" "" "X-Burstel-Token: $PUSH_A"
-expect_code 401 "per-shot token on admin route"
+expect_code 401 "instance token on admin route"
 req POST /ingest/v1/logs '{}' "$ADMIN"
 expect_code 401 "admin token on /ingest"
 
-echo "== retired installation-wide token endpoint ==" >&2
-req POST /api/ingest-token "" "$ADMIN"
-expect_code 410 "retired ingest-token endpoint"
+echo "== revoking A is immediate and does not affect B ==" >&2
+req DELETE "/api/instances/$INSTANCE_A/tokens/$TOKEN_ID_A" "" "$ADMIN"
+expect_code 200 "revoke token A"
+push_expect "$PUSH_A" traces 401 "revoked token A"
+GOT_B_AFTER="$(push_signal "$PUSH_B" traces)"
+[ "$GOT_B_AFTER" = "$INSTANCE_ID_B" ] || die "token B attribution changed after revoking A"
 
-echo "== shared multi-user tokens (spec 013, Part B) ==" >&2
-req POST /api/tokens "{\"scope\":\"member\",\"owner\":\"e2e-alice\"}" "$ADMIN"
-expect_code 201 "mint member alice"
-MEMBER_A="$(printf '%s' "$BODY" | jget "['token']")"
-MEMBER_A_ID="$(printf '%s' "$BODY" | jget "['id']")"
-[ -n "$MEMBER_A" ] || die "no member A token"
+echo "== stop both window markers ==" >&2
+for id in "$SHOT_A" "$SHOT_B"; do
+  req POST "/api/shots/$id/stop" "" "$ADMIN"
+  expect_code 200 "stop $id"
+  case "$(printf '%s' "$BODY" | jget "['state']")" in
+    ready|incomplete) ;;
+    *) die "window shot $id stopped in an unexpected state: $BODY" ;;
+  esac
+done
 
-req POST /api/tokens "{\"scope\":\"member\",\"owner\":\"e2e-bob\"}" "$ADMIN"
-expect_code 201 "mint member bob"
-MEMBER_B="$(printf '%s' "$BODY" | jget "['token']")"
-[ -n "$MEMBER_B" ] || die "no member B token"
-[ "$MEMBER_A" != "$MEMBER_B" ] || die "member tokens are identical"
-
-# Member A creates a shot; member B operates on it (no ownership restriction).
-req POST /api/shots "{\"owner\":\"e2e-alice\"}" "Authorization: Bearer $MEMBER_A"
-expect_code 201 "member A creates shot"
-SHOT_M="$(printf '%s' "$BODY" | jget "['shot_id']")"
-req GET "/api/shots/$SHOT_M" "" "Authorization: Bearer $MEMBER_B"
-expect_code 200 "member B reads member A's shot"
-req POST "/api/shots/$SHOT_M/ingest-token" "" "Authorization: Bearer $MEMBER_B"
-expect_code 201 "member B mints a token for member A's shot"
-req POST "/api/shots/$SHOT_M/stop" "" "Authorization: Bearer $MEMBER_B"
-expect_code 200 "member B stops member A's shot"
-
-# A member token may not manage the registry.
-req GET /api/tokens "" "Authorization: Bearer $MEMBER_A"
-expect_code 403 "member denied token list"
-req POST /api/tokens "{\"scope\":\"member\"}" "Authorization: Bearer $MEMBER_A"
-expect_code 403 "member denied token mint"
-
-# The MCP surface is available to a member (operational tools list).
+echo "== MCP tools/list ==" >&2
 req POST /mcp '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' \
-  "Authorization: Bearer $MEMBER_B" "Accept: application/json, text/event-stream"
-expect_code 200 "member MCP tools/list"
+  "$ADMIN" "Accept: application/json, text/event-stream"
+expect_code 200 "MCP tools/list"
 printf '%s' "$BODY" | grep -q '"shot_start"' || die "MCP tools/list missing shot_start"
-
-# Revoking one member cuts that person off immediately without rotating others.
-req DELETE "/api/tokens/$MEMBER_A_ID" "" "$ADMIN"
-expect_code 200 "revoke member A"
-req GET /api/shots "" "Authorization: Bearer $MEMBER_A"
-expect_code 401 "revoked member A rejected"
-req GET /api/shots "" "Authorization: Bearer $MEMBER_B"
-expect_code 200 "member B still works after member A is revoked"
-
-# A member token is not a push token.
-req POST /ingest/v1/logs '{}' "Authorization: Bearer $MEMBER_B"
-expect_code 401 "member token rejected on /ingest"
+printf '%s' "$BODY" | grep -q '"instance_token_issue"' || die "MCP tools/list missing instance_token_issue"
 
 cat <<JSON
-{"base_url":"$BASE","shot_a":"$SHOT_A","shot_b":"$SHOT_B","isolation":"ok","concurrent_recording":"ok","frozen_sha256_a":"$SHA_A","frozen_sha256_b":"$SHA_B","owner_filter":"ok","scope_separation":"ok","installation_token_retired":true,"multi_user":"ok","member_cross_shot":"ok","member_registry_denied":true,"revocation":"ok","mcp_member":"ok"}
+{"base_url":"$BASE","instance_a":"$INSTANCE_A","instance_b":"$INSTANCE_B","shot_a":"$SHOT_A","shot_b":"$SHOT_B","model":"named-instances+window-shots","isolation":"ok","owner_filter":"ok","scope_separation":"ok","revocation":"ok","window_stop":"ok","mcp_tools_list":"ok"}
 JSON
 echo "== cloudflare multishot smoke passed (no secret was printed) ==" >&2

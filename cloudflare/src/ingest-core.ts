@@ -25,6 +25,7 @@
 //   * A frozen shot's artifact outlives its (former) credentials by design.
 
 import type { R2BucketLike } from "./artifacts";
+import { DEFAULT_REVOKED_RETENTION_MS } from "./env";
 import { badRequest } from "./errors";
 import { errorResponse, json, readJson } from "./http";
 import { InstanceCore, newInstanceToken } from "./instance-core";
@@ -845,41 +846,44 @@ export class IngestCore {
     const existing = this.sql
       .exec(`SELECT sha256 FROM segment_manifest WHERE segment_key = ?`, validated.value.segment_key)
       .toArray();
-    if (existing.length > 0) {
-      if (String(existing[0]!.sha256) !== validated.value.sha256) {
-        return Promise.reject(new Error("segment_key already exists with a different checksum"));
-      }
-      this.bump("segment_duplicate");
-      return { committed: false, duplicate: true, covered_new: 0, covered_skipped: 0 };
+    const duplicate = existing.length > 0;
+    if (duplicate && String(existing[0]!.sha256) !== validated.value.sha256) {
+      return Promise.reject(new Error("segment_key already exists with a different checksum"));
     }
 
     const now = this.now();
     const seg = validated.value;
-    this.sql.exec(
-      `INSERT INTO segment_manifest
-         (segment_key, instance_id, object_key, size_bytes, sha256, first_received_at, last_received_at,
-          request_count, record_count, span_count, log_count, metric_count, event_min_ns, event_max_ns,
-          status, late, created_at, verified_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'verified', ?, ?, ?)`,
-      seg.segment_key,
-      seg.instance_id,
-      seg.object_key,
-      seg.size_bytes,
-      seg.sha256,
-      seg.first_received_at,
-      seg.last_received_at,
-      seg.request_count,
-      seg.record_count,
-      seg.span_count ?? 0,
-      seg.log_count ?? 0,
-      seg.metric_count ?? 0,
-      seg.event_min_ns ?? null,
-      seg.event_max_ns ?? null,
-      seg.late ? 1 : 0,
-      now,
-      now,
-    );
+    if (!duplicate) {
+      this.sql.exec(
+        `INSERT INTO segment_manifest
+           (segment_key, instance_id, object_key, size_bytes, sha256, first_received_at, last_received_at,
+            request_count, record_count, span_count, log_count, metric_count, event_min_ns, event_max_ns,
+            status, late, created_at, verified_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'verified', ?, ?, ?)`,
+        seg.segment_key,
+        seg.instance_id,
+        seg.object_key,
+        seg.size_bytes,
+        seg.sha256,
+        seg.first_received_at,
+        seg.last_received_at,
+        seg.request_count,
+        seg.record_count,
+        seg.span_count ?? 0,
+        seg.log_count ?? 0,
+        seg.metric_count ?? 0,
+        seg.event_min_ns ?? null,
+        seg.event_max_ns ?? null,
+        seg.late ? 1 : 0,
+        now,
+        now,
+      );
+    }
 
+    // Coverage insertion is idempotent per journal key and also heals a
+    // crash after the manifest row was written but before every atom landed:
+    // a duplicate publish re-checks all atoms instead of returning early
+    // (spec 024 R7 review fix).
     let coveredNew = 0;
     let coveredSkipped = 0;
     for (const cov of seg.coverage) {
@@ -901,6 +905,10 @@ export class IngestCore {
         now,
       );
       coveredNew += 1;
+    }
+    if (duplicate) {
+      this.bump("segment_duplicate");
+      return { committed: false, duplicate: true, covered_new: coveredNew, covered_skipped: coveredSkipped };
     }
     this.bump("segment_published");
     if (coveredNew > 0) this.bump("segment_covered", coveredNew);
@@ -1132,7 +1140,8 @@ export class IngestCore {
         maxObjects: 20_000,
       });
       const covered = this.coveredKeySet(listed.objects.map((o) => o.key));
-      const pending = listed.objects.filter((o) => !covered.has(o.key)).length;
+      const excluded = this.excludedKeySet(listed.objects.map((o) => o.key));
+      const pending = listed.objects.filter((o) => !covered.has(o.key) && !excluded.has(o.key)).length;
       return { pending_journal: pending };
     }
     let q = `SELECT COUNT(*) AS n FROM journal_ledger j
@@ -1181,7 +1190,9 @@ export class IngestCore {
       };
     }
     const listed = await listAllJournalObjects(this.bucket, Math.max(1, maxObjects));
-    const covered = this.coveredKeySet(listed.objects.map((o) => o.key));
+    const keys = listed.objects.map((o) => o.key);
+    const covered = this.coveredKeySet(keys);
+    const excluded = this.excludedKeySet(keys);
     const bySignal: Record<string, number> = {};
     const pendingBySignal: Record<string, number> = {};
     let bytes = 0;
@@ -1191,7 +1202,7 @@ export class IngestCore {
       bytes += object.size;
       bySignal[object.signal] = (bySignal[object.signal] ?? 0) + 1;
       if (oldest === null || object.received_at < oldest) oldest = object.received_at;
-      if (!covered.has(object.key)) {
+      if (!covered.has(object.key) && !excluded.has(object.key)) {
         pending += 1;
         pendingBySignal[object.signal] = (pendingBySignal[object.signal] ?? 0) + 1;
       }
@@ -1245,6 +1256,20 @@ export class IngestCore {
             WHERE s.status = 'verified' AND c.journal_key IN (${placeholders})`,
           ...chunk,
         )
+        .toArray()) {
+        set.add(String(row.journal_key));
+      }
+    }
+    return set;
+  }
+
+  /** Journal keys durably excluded by revocation (never pending/compacted). */
+  private excludedKeySet(keys: string[]): Set<string> {
+    const set = new Set<string>();
+    for (const chunk of chunkKeys(keys, 90)) {
+      const placeholders = chunk.map(() => "?").join(",");
+      for (const row of this.sql
+        .exec(`SELECT journal_key FROM excluded_journal WHERE journal_key IN (${placeholders})`, ...chunk)
         .toArray()) {
         set.add(String(row.journal_key));
       }
@@ -1375,23 +1400,32 @@ export class IngestCore {
   async listGCEligible(opts: {
     now: number;
     retention_ms: number;
+    /** Audit retention for revoked/excluded objects (spec 024, R5). */
+    revoked_retention_ms?: number;
+    /** Return only revoked-excluded candidates (retention sweep). */
+    revoked_only?: boolean;
     force: boolean;
     limit: number;
   }): Promise<{ candidates: GCandidate[]; protected: number; considered: number }> {
     await this.ensureLoaded();
     const limit = Math.max(1, Math.min(opts.limit, 5000));
+    const excludedRetention =
+      opts.revoked_retention_ms === undefined ? DEFAULT_REVOKED_RETENTION_MS : Math.max(0, opts.revoked_retention_ms);
     const candidates: GCandidate[] = [];
     let protectedCount = 0;
 
-    // Revoked-excluded objects: eligible immediately.
+    // Revoked-excluded objects: eligible only after the audit retention window.
     const excludedRows = this.sql
       .exec(
-        `SELECT journal_key, size, received_at, instance_id FROM excluded_journal
-          ORDER BY received_at ASC LIMIT ?`,
+        `SELECT journal_key, size, received_at, instance_id, excluded_at FROM excluded_journal
+          ORDER BY ${opts.revoked_only ? "excluded_at ASC" : "received_at ASC"} LIMIT ?`,
         limit,
       )
       .toArray();
+    let excludedConsidered = 0;
     for (const row of excludedRows) {
+      excludedConsidered += 1;
+      if (!opts.force && Number(row.excluded_at) > opts.now - excludedRetention) continue;
       candidates.push({
         key: String(row.journal_key),
         size: Number(row.size ?? 0),
@@ -1399,6 +1433,9 @@ export class IngestCore {
         instance_id: String(row.instance_id),
         segment_key: "",
       });
+    }
+    if (opts.revoked_only) {
+      return { candidates, protected: 0, considered: excludedConsidered };
     }
 
     const remaining = Math.max(0, limit - candidates.length);
@@ -1444,7 +1481,7 @@ export class IngestCore {
         segment_key: String(row.segment_key),
       });
     }
-    return { candidates, protected: protectedCount, considered: excludedRows.length + rows.length };
+    return { candidates, protected: protectedCount, considered: excludedConsidered + rows.length };
   }
 
   /**
@@ -1724,10 +1761,27 @@ export class IngestCore {
       }
       if (path === "/internal/compaction/gc/list") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
-        const body = await readJson<{ retention_ms?: number; force?: boolean; limit?: number }>(request);
+        const body = await readJson<{
+          retention_ms?: number;
+          revoked_retention_ms?: number;
+          revoked_only?: boolean;
+          force?: boolean;
+          limit?: number;
+        }>(request);
         const retention = typeof body.retention_ms === "number" ? body.retention_ms : 24 * 60 * 60 * 1000;
         const limit = typeof body.limit === "number" && body.limit > 0 ? body.limit : 500;
-        return json(200, await this.listGCEligible({ now: this.now(), retention_ms: retention, force: body.force === true, limit }));
+        return json(
+          200,
+          await this.listGCEligible({
+            now: this.now(),
+            retention_ms: retention,
+            revoked_retention_ms:
+              typeof body.revoked_retention_ms === "number" ? body.revoked_retention_ms : undefined,
+            revoked_only: body.revoked_only === true,
+            force: body.force === true,
+            limit,
+          }),
+        );
       }
       if (path === "/internal/compaction/gc/delete") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });

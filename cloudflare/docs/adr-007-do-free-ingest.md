@@ -73,11 +73,18 @@ Rotation grace is handled correctly: a rotated token's effective revocation
 instant is `max(revoked_at, grace_until)`, so objects accepted during the
 documented overlap are not excluded.
 
-### D4. ControlDO
+### D4. ControlDO (deploy-safe `IngestDO` export)
 
-`IngestDO` is renamed and reduced to `ControlDO`: instances, authoritative
-tokens, shots, segment manifest, compaction lease/pins and the discovery cursor.
-It is not on the ingest hot path.
+The code-level control-plane role is `ControlDO`, but the **exported Wrangler
+storage class keeps the legacy name `IngestDO`** (spec 024 R1). It owns the
+instance registry, authoritative tokens, shots, segment manifest, compaction
+lease/pins and discovery cursor, and is not on the ingest hot path.
+
+Keeping the class name is deliberate: a real rename requires a
+`renamed_classes` migration, which this repo's `exports`-style Wrangler config
+cannot declare. Deploying a new class name without it would create empty
+storage and orphan all authoritative state. `preflight` enforces
+`INGEST_DO.class_name == "IngestDO"` and refuses a separate `ControlDO` export.
 
 ## Revised guarantees (replacing the corresponding spec-014 wording)
 
@@ -90,12 +97,17 @@ It is not on the ingest hot path.
    Revocation takes effect at the edge within the KV propagation window
    (nominally `<= 60 s`: 30 s memory + 60 s KV, overlapping). Data written after
    a token's effective revocation instant is excluded from every segment and
-   deleted, so it can never appear in analysis.
+   from pending counts, and is retained in place for the configured audit
+   window (default 7 days, spec 024 R5) before deletion, so it can never appear
+   in analysis.
 4. **The durable ledger guarantee becomes:** every `200`-acknowledged export is
    a durable R2 object, and is either included in a verified segment or
    explicitly reported as `excluded_revoked` — never silently missing.
    Duplicate upstream retries remain bounded (distinct immutable objects,
    de-duplicated at compaction by key and checksum).
+5. **Revocation lookup is fail-closed at compaction.** If the authoritative
+   revocation set cannot be read, the tick fails and retries; it never compacts
+   objects whose token state is unknown (spec 024 R7).
 
 ## Consequences
 
@@ -105,7 +117,5 @@ It is not on the ingest hot path.
 * Compaction must list R2 prefixes; the key layout embeds a fixed-width
   `received_at` so discovery seeks with `startAfter` instead of scanning the
   whole bucket.
-* Deploying the `IngestDO` -> `ControlDO` rename requires a Durable Object
-  `renamed_classes` migration in the deployment job (this repository's
-  `exports`-style Wrangler config cannot also declare `migrations`). No
-  deployment is performed here.
+* The DO storage class stays `IngestDO`; no deployment-time rename migration is
+  needed (spec 024 R1). No deployment is performed here.

@@ -21,6 +21,8 @@
 #   scripts/cloudflare-preflight.sh                 # full read-only preflight
 #   scripts/cloudflare-preflight.sh --config-only   # no credentials needed
 #   scripts/cloudflare-preflight.sh --config cloudflare/wrangler.jsonc
+#   scripts/cloudflare-preflight.sh --config-only --allow-placeholder-kv
+#       (structural lint only; the real preflight rejects the all-zero id)
 #
 # Credentials (optional, read-only):
 #   CLOUDFLARE_API_TOKEN   API token used for the read-only account lookups
@@ -32,13 +34,15 @@ CF="$REPO_ROOT/cloudflare"
 CONFIG="$CF/wrangler.jsonc"
 MODE="full"
 MAX_INSTANCES=10
+ALLOW_PLACEHOLDER_KV=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --config-only) MODE="config"; shift ;;
     --config) CONFIG="$2"; shift 2 ;;
     --max-instances) MAX_INSTANCES="$2"; shift 2 ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    --allow-placeholder-kv) ALLOW_PLACEHOLDER_KV=1; shift ;;
+    -h|--help) sed -n '2,36p' "$0"; exit 0 ;;
     *) echo "cloudflare-preflight: unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -52,10 +56,12 @@ die() { printf 'cloudflare-preflight: %s\n' "$*" >&2; exit 2; }
 
 command -v bun >/dev/null 2>&1 || die "bun is required to run the preflight validator"
 RUNNER=(bun "$CF/scripts/preflight.mjs")
+CONFIG_ARGS=(--config "$CONFIG" --max-instances "$MAX_INSTANCES")
+if [ "$ALLOW_PLACEHOLDER_KV" = "1" ]; then CONFIG_ARGS+=(--allow-placeholder-kv); fi
 
 if [ "$MODE" = "config" ]; then
   echo "cloudflare-preflight: config-only (no credentials, no deploy)" >&2
-  "${RUNNER[@]}" --config "$CONFIG" --max-instances "$MAX_INSTANCES" --config-only
+  "${RUNNER[@]}" "${CONFIG_ARGS[@]}" --config-only
   exit $?
 fi
 
@@ -181,8 +187,7 @@ fi
 
 # ------------------------------------------------------------ run report
 ARGS=(
-  --config "$CONFIG"
-  --max-instances "$MAX_INSTANCES"
+  "${CONFIG_ARGS[@]}"
   --whoami "$TMP/whoami.json"
   --secrets "$TMP/secrets.json"
   --r2 "$TMP/r2.json"

@@ -52,9 +52,9 @@ interface ConfigShape {
 }
 
 describe("wrangler configuration validation", () => {
-  test("the checked-in wrangler.jsonc satisfies every required invariant", () => {
+  test("the checked-in wrangler.jsonc satisfies every structural invariant", () => {
     const cfg = loadWranglerConfig(REAL_CONFIG);
-    const report = finalize(validateWranglerConfig(cfg));
+    const report = finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true }));
     if (!report.ok) {
       throw new Error(`failed: ${report.failed_required.join(", ")}`);
     }
@@ -74,9 +74,66 @@ describe("wrangler configuration validation", () => {
 
   test("requires SQLite-backed DO exports", () => {
     const cfg = loadWranglerConfig(REAL_CONFIG);
-    cfg.exports!["ControlDO"]!.storage = "key-value";
-    const report = finalize(validateWranglerConfig(cfg));
+    cfg.exports!["IngestDO"]!.storage = "key-value";
+    const report = finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true }));
     expect(report.failed_required).toContain("export_ingestdo_sqlite");
+  });
+
+  test("R1: the binding keeps the legacy IngestDO storage class across the upgrade", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    const binding = cfg.durable_objects!.bindings!.find((b) => b.name === "INGEST_DO");
+    expect(binding?.class_name).toBe("IngestDO");
+    expect(cfg.exports?.["IngestDO"]).toEqual({ type: "durable-object", storage: "sqlite" });
+    expect(cfg.exports?.["ControlDO"]).toBeUndefined();
+    const report = finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true }));
+    expect(report.failed_required).not.toContain("do_rename_preserves_storage");
+    expect(report.failed_required).not.toContain("do_binding_ingestdo");
+  });
+
+  test("R1: an unsafe ControlDO rename/orphan is rejected", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    const binding = cfg.durable_objects!.bindings!.find((b) => b.name === "INGEST_DO");
+    binding!.class_name = "ControlDO";
+    cfg.exports!["ControlDO"] = { type: "durable-object", storage: "sqlite" };
+    const report = finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true }));
+    expect(report.failed_required).toContain("do_binding_ingestdo");
+    expect(report.failed_required).toContain("do_rename_preserves_storage");
+    expect(report.failed_required).toContain("no_unsafe_control_do_rename");
+  });
+
+  test("R1: pre-023 and 024 configs resolve INGEST_DO to the same storage class", () => {
+    const resolve = (cfg: WranglerConfig): string => {
+      const binding = cfg.durable_objects?.bindings?.find((b) => b.name === "INGEST_DO");
+      const exported = binding?.class_name ? cfg.exports?.[binding.class_name] : undefined;
+      return `${binding?.class_name ?? "<missing>"}/${exported?.storage ?? "<missing>"}`;
+    };
+    // Class name + SQLite storage are the storage identity: if this value is
+    // unchanged, Cloudflare reuses the existing DO's stored objects.
+    const pre023: WranglerConfig = {
+      durable_objects: { bindings: [{ name: "INGEST_DO", class_name: "IngestDO" }] },
+      exports: { IngestDO: { type: "durable-object", storage: "sqlite" } },
+    };
+    const post024 = loadWranglerConfig(REAL_CONFIG);
+    expect(resolve(pre023)).toBe("IngestDO/sqlite");
+    expect(resolve(post024)).toBe(resolve(pre023));
+  });
+
+  test("R2: the all-zero INSTANCE_TOKENS placeholder fails a real preflight", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    expect(cfg.kv_namespaces?.[0]?.id).toBe("00000000000000000000000000000000");
+    const report = finalize(validateWranglerConfig(cfg));
+    expect(report.failed_required).toContain("kv_instance_tokens_not_placeholder");
+    // Structural lint may explicitly opt in.
+    expect(
+      finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true })).failed_required,
+    ).not.toContain("kv_instance_tokens_not_placeholder");
+  });
+
+  test("R2: a missing INGEST_ANALYTICS dataset binding fails preflight", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    cfg.analytics_engine_datasets = [];
+    const report = finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true }));
+    expect(report.failed_required).toContain("analytics_ingest_binding");
   });
 
   test("requires the SQLite AuthDO binding/export (spec 013, Part B)", () => {

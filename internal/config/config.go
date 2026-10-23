@@ -21,6 +21,10 @@ const (
 	// write slot before the server answers 503 + Retry-After instead of queueing
 	// unboundedly (spec 022, Part C).
 	DefaultMaxQueueWait = 500 * time.Millisecond
+	// DefaultWALCheckpointBytes bounds the standalone DuckDB WAL (spec 024,
+	// R4). A background guard checkpoints once the WAL reaches this size, off
+	// the ingest hot path.
+	DefaultWALCheckpointBytes int64 = 256 << 20 // 256 MiB
 )
 
 // Config describes a running burstel recorder.
@@ -54,6 +58,9 @@ type Config struct {
 	WriteTimeout time.Duration
 	// AnalysisTimeout bounds a single read-only analysis query/restore.
 	AnalysisTimeout time.Duration
+	// WALCheckpointBytes bounds the standalone DuckDB WAL. The background guard
+	// checkpoints once it reaches this size (spec 024, R4).
+	WALCheckpointBytes int64
 }
 
 // Load returns configuration from the environment, falling back to defaults.
@@ -68,6 +75,10 @@ func Load() Config {
 		MaxQueueWait:    envDuration("BURSTEL_MAX_QUEUE_WAIT", DefaultMaxQueueWait),
 		WriteTimeout:    envDuration("BURSTEL_WRITE_TIMEOUT", DefaultWriteTimeout),
 		AnalysisTimeout: envDuration("BURSTEL_ANALYSIS_TIMEOUT", DefaultAnalysisTimeout),
+		WALCheckpointBytes: envInt64(
+			"BURSTEL_WAL_CHECKPOINT_BYTES",
+			DefaultWALCheckpointBytes,
+		),
 	}
 	return cfg
 }

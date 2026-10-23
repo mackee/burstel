@@ -76,7 +76,10 @@ export async function listJournalObjects(
   const instancePrefixes = await discoverInstancePrefixes(bucket, options.instanceIds);
   outer: for (const instancePrefix of instancePrefixes) {
     const signalPrefixes = await discoverSignalPrefixes(bucket, instancePrefix);
-    for (const signalPrefix of signalPrefixes) {
+    // Each signal prefix is independently time-ordered. Hitting the exclusive
+    // upper bound in one prefix must not skip older objects in another signal
+    // (or another instance) prefix: only that prefix is exhausted.
+    signalLoop: for (const signalPrefix of signalPrefixes) {
       let cursor: string | undefined;
       let startAfter = `${signalPrefix}${timeCursor(fromMs)}`;
       for (;;) {
@@ -91,14 +94,16 @@ export async function listJournalObjects(
           limit: pageSize,
           include: ["customMetadata"],
         });
+        let reachedUpperBound = false;
         for (const obj of page.objects) {
           scanned += 1;
           const info = toJournalInfo(obj, signalPrefix);
           if (!info) continue;
           if (info.received_at >= toMs) {
-            // Keys are time-ordered inside a prefix; nothing later can qualify.
-            truncated = false;
-            break outer;
+            // Keys are time-ordered inside a prefix; nothing later in *this*
+            // prefix can qualify, but other prefixes still might.
+            reachedUpperBound = true;
+            break;
           }
           if (info.received_at < fromMs) continue;
           objects.push(info);
@@ -107,6 +112,7 @@ export async function listJournalObjects(
             break outer;
           }
         }
+        if (reachedUpperBound) continue signalLoop;
         if (!page.truncated || !page.cursor) break;
         cursor = page.cursor;
         startAfter = "";

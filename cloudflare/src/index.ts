@@ -1,9 +1,9 @@
 // Worker entrypoint for burstel.
 //
 // The Worker receives public HTTP traffic, authenticates it, and routes each
-// shot to its own named ShotDO. A singleton ControlDO (formerly IngestDO)
-// coordinates named instances, authoritative tokens, the shot registry, the
-// segment manifest and the compaction lease. The ShotDO owns the Container and
+// shot to its own named ShotDO. A singleton control DO (exported as `IngestDO`,
+// code alias `ControlDO`) coordinates named instances, authoritative tokens,
+// the shot registry, the segment manifest and the compaction lease. The ShotDO owns the Container and
 // R2 freeze logic; see src/app.ts, src/control-do.ts and src/shot-do.ts.
 //
 // Spec 023 removes the Durable Object from the ingest hot path: instance tokens
@@ -17,10 +17,12 @@
 
 import { handleRequest } from "./app";
 import { COMPACTOR_DO_NAME } from "./compactor-core";
+import { autoBackfillInstanceTokens } from "./tools";
 import type { Env } from "./shot-do";
 
 export { ShotDO } from "./shot-do";
-export { ControlDO } from "./control-do";
+// Spec 024 R1: the exported storage class keeps the deploy-safe legacy name.
+export { IngestDO } from "./control-do";
 export { AuthDO } from "./auth-do";
 export { CompactorDO } from "./compactor-do";
 export type { Env } from "./shot-do";
@@ -35,8 +37,13 @@ export default {
    * primary scheduler; this simply kicks a bounded tick so a lost alarm cannot
    * stall compaction indefinitely. The fenced lease makes overlapping triggers
    * safe (at most one active compaction per partition).
+   *
+   * Spec 024 R2: also refresh the KV instance-token cache from the
+   * authoritative control plane. This is idempotent and makes a 018/022 -> 023
+   * upgrade safe even before the first admission miss.
    */
   async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(autoBackfillInstanceTokens(env.INGEST_DO, env.INSTANCE_TOKENS).catch(() => undefined));
     const compactor = env.COMPACTOR_DO;
     if (!compactor) return;
     const stub = compactor.getByName(COMPACTOR_DO_NAME);

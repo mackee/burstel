@@ -195,7 +195,9 @@ func (r *Recorder) Start(ctx context.Context, req StartRequest) (Info, error) {
 		return Info{}, err
 	}
 	dbPath := filepath.Join(dir, ArtifactName)
-	store, err := storage.Open(ctx, dbPath)
+	store, err := storage.OpenWithOptions(ctx, dbPath, storage.Options{
+		WALCheckpointBytes: r.cfg.WALCheckpointBytes,
+	})
 	if err != nil {
 		r.failLocked(err)
 		return Info{}, err

@@ -479,11 +479,40 @@ export async function backfillInstanceTokens(
   ctx: ToolContext,
 ): Promise<{ backfilled: number; failed: number }> {
   if (!ctx.tokens) throw new HttpError(503, "INSTANCE_TOKENS is not configured", true, "kv_unavailable");
-  const live = await ingestCall<{ tokens: TokenDigestEntry[] }>(ctx, "/internal/instance/token/live", "GET");
+  return autoBackfillInstanceTokens(ctx.ingest, ctx.tokens);
+}
+
+/**
+ * Automatic, idempotent KV backfill (spec 024, R2).
+ *
+ * Runs from the Worker's Cron trigger so an upgrade from pre-023 to 023 never
+ * leaves a live `bit_` token absent from KV. It re-reads the authoritative live
+ * digest list and overwrites each entry; repeated runs are harmless. A control
+ * plane or KV failure never throws to the scheduler: the next admission miss
+ * still backfills that token synchronously in `admitInstanceToken`.
+ */
+export async function autoBackfillInstanceTokens(
+  ingest: IngestNamespaceLike,
+  tokens: KVNamespaceLike | undefined,
+): Promise<{ backfilled: number; failed: number; skipped?: string }> {
+  if (!tokens) return { backfilled: 0, failed: 0, skipped: "kv_unconfigured" };
+  let live: { tokens: TokenDigestEntry[] };
+  try {
+    const stub = ingest.getByName(INGEST_DO_NAME);
+    const resp = await stub.fetch(
+      new Request(`${DO_ORIGIN}/internal/instance/token/live`, { method: "GET" }),
+    );
+    if (resp.status < 200 || resp.status >= 300) {
+      return { backfilled: 0, failed: 0, skipped: `authoritative_${resp.status}` };
+    }
+    live = (await resp.json()) as { tokens: TokenDigestEntry[] };
+  } catch {
+    return { backfilled: 0, failed: 0, skipped: "authoritative_unavailable" };
+  }
   let backfilled = 0;
   let failed = 0;
-  for (const entry of live.tokens) {
-    const ok = await ctx.tokens
+  for (const entry of live.tokens ?? []) {
+    const ok = await tokens
       .put(
         entry.digest,
         JSON.stringify({

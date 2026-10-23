@@ -103,6 +103,11 @@ export interface AppEnv {
   /** Compaction finalize lag (spec 018/023). Default 90 000 ms. */
   COMPACTION_GRACE_MS?: string;
   /**
+   * Revoked-token journal quarantine (spec 024, R5). Excluded objects are kept
+   * for audit for this long before deletion. Default 7 days.
+   */
+  COMPACTION_REVOKED_RETENTION_MS?: string;
+  /**
    * Late-write guard (spec 023, D2.2). Defaults to `COMPACTION_GRACE_MS / 2`.
    * An R2 PUT that completes later than `received_at + LATE_WRITE_LIMIT_MS`
    * is deleted and answered with a retryable 503.
@@ -126,6 +131,9 @@ export const DEFAULT_MAX_INGEST_BYTES = 8 * 1024 * 1024;
 
 /** Default compaction finalize lag (90 s). */
 export const DEFAULT_COMPACTION_GRACE_MS = 90_000;
+
+/** Default revoked-token journal retention (7 days, spec 024 R5). */
+export const DEFAULT_REVOKED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Parses `MAX_INGEST_BYTES`, falling back to the default. */
 export function maxIngestBytes(env: { MAX_INGEST_BYTES?: string }): number {
@@ -154,6 +162,14 @@ export function lateWriteLimitMs(env: { LATE_WRITE_LIMIT_MS?: string; COMPACTION
     if (Number.isFinite(parsed) && parsed >= 0) return parsed;
   }
   return Math.max(1, Math.floor(compactionGraceMs(env) / 2));
+}
+
+/** Parses the revoked-object audit retention, falling back to 7 days. */
+export function revokedRetentionMs(env: { COMPACTION_REVOKED_RETENTION_MS?: string }): number {
+  const raw = env.COMPACTION_REVOKED_RETENTION_MS?.trim();
+  if (!raw) return DEFAULT_REVOKED_RETENTION_MS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_REVOKED_RETENTION_MS;
 }
 
 /** Bounds for `GET /api/shots` pagination. */

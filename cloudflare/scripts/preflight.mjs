@@ -9,7 +9,7 @@
 //   preflight.mjs --config <wrangler.jsonc> [--whoami <file>] [--secrets <file>]
 //                 [--r2 <file>] [--docker-cli 1] [--docker-daemon 1]
 //                 [--docker-buildx 1] [--docker-platform-linux-amd64 1]
-//                 [--max-instances 10]
+//                 [--max-instances 10] [--config-only] [--allow-placeholder-kv]
 import { readFileSync } from "node:fs";
 
 import {
@@ -62,7 +62,12 @@ if (!configPath || configPath === true) {
 }
 const config = loadWranglerConfig(readFileSync(configPath, "utf8"));
 const maxInstances = Number(arg("max-instances", "10"));
-checks.push(...validateWranglerConfig(config, { maxInstances }));
+checks.push(
+  ...validateWranglerConfig(config, {
+    maxInstances,
+    allowPlaceholderKv: flag("allow-placeholder-kv"),
+  }),
+);
 
 if (flag("config-only")) {
   const configReport = finalize(checks);

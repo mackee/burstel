@@ -58,7 +58,7 @@ describe("segment manifest publication", () => {
     const { core } = makeIngest({ now: () => 5000 });
     await core.publishSegment(publishInput());
     const again = await core.publishSegment(publishInput());
-    expect(again).toEqual({ committed: false, duplicate: true, covered_new: 0, covered_skipped: 0 });
+    expect(again).toEqual({ committed: false, duplicate: true, covered_new: 0, covered_skipped: 3 });
     const status = await core.segmentStatus();
     expect(status.segments).toBe(1);
     expect(status.coverage).toBe(3);

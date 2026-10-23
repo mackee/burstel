@@ -364,6 +364,12 @@ scripts/local-trial.sh                # 60s baseline + 180s regressed
 - `200` は「生バッチが DuckDB トランザクションとしてコミットされた後」にのみ返す
   (キューに積んだだけで ack しない)。`stop` の `CHECKPOINT` は、この時点で
   WAL にコミット済みの内容を本体ファイルへ反映する。
+- **WAL は 256 MiB で有界(spec 024 R4)。** ingest とは別のバックグラウンド
+  ガードが WAL サイズを監視し、閾値以上なら writer ロックの下で `CHECKPOINT` を
+  実行する。ingest のコミット経路が `CHECKPOINT` を直接呼ぶことはない。
+  `BURSTEL_WAL_CHECKPOINT_BYTES` で変更できる。クラッシュ時は WAL の未 checkpoint
+  分(最大 256 MiB 程度)を replay するため、復旧時間も有界になる。`stop` は
+  従来通り drain 後に明示 `CHECKPOINT` する。
 - **shot 外のデータは 200 + OTLP `partial_success`(rejected 件数 +
   `"no active shot; data discarded"`)で受理し、破棄する。**
   503 を返して exporter を再試行ループに落とし、BSP キュー溢れと

@@ -67,6 +67,11 @@ export interface CompactorConfig {
    */
   lookbackMs: number;
   retentionMs: number;
+  /**
+   * Audit retention for revoked-token journal objects (spec 024, R5). They are
+   * excluded from segments immediately but kept in place this long before GC.
+   */
+  revokedRetentionMs: number;
   gcEnabled: boolean;
   batchObjects: number;
   batchBytes: number;
@@ -84,6 +89,7 @@ export function defaultCompactorConfig(): CompactorConfig {
     graceMs: 90_000,
     lookbackMs: 180_000,
     retentionMs: 24 * 60 * 60 * 1000,
+    revokedRetentionMs: 7 * 24 * 60 * 60 * 1000,
     gcEnabled: false,
     batchObjects: 2048,
     batchBytes: 32 * 1024 * 1024,
@@ -134,6 +140,8 @@ export interface TickReport {
   excluded_revoked: number;
   gc_deleted: number;
   gc_protected: number;
+  /** Revoked/excluded objects deleted after the audit retention window (R5). */
+  revoked_deleted: number;
   duration_ms: number;
   watermark: number;
   lookback_ms: number;
@@ -223,6 +231,7 @@ export class CompactorCore {
       excluded_revoked: 0,
       gc_deleted: 0,
       gc_protected: 0,
+      revoked_deleted: 0,
       duration_ms: 0,
       watermark,
       lookback_ms: this.config.lookbackMs,
@@ -294,6 +303,15 @@ export class CompactorCore {
         report.gc_deleted = gc.deleted;
         report.gc_protected = gc.protected;
       }
+
+      // Spec 024 R5: revoked-token objects are excluded from analysis at once
+      // but retained for audit (default 7 days) before deletion - independent
+      // of the destructive COMPACTION_GC opt-in.
+      const revoked = await this.runRevokedRetention().catch((error) => {
+        this.log("burstel: revoked retention failed", { error: errorMessage(error) });
+        return { deleted: 0 };
+      });
+      report.revoked_deleted = revoked.deleted;
 
       // Advance the discovery cursor only after a fully successful tick, and
       // only past what was actually handled. A failed/truncated run leaves the
@@ -455,7 +473,7 @@ export class CompactorCore {
         "/internal/instance/token/revocations",
         "POST",
         { token_ids: tokenIds },
-      ).catch(() => ({ revocations: [] }));
+      );
       const revokedAt = new Map<string, number | null>();
       for (const row of revocation.revocations) revokedAt.set(row.token_id, row.revoked_at);
       if (revokedAt.size > 0) {
@@ -481,23 +499,10 @@ export class CompactorCore {
           await this.ingestCall("/internal/compaction/excluded", "POST", { entries }).catch((error) => {
             this.log("burstel: failed to record revoked exclusion", { error: errorMessage(error) });
           });
-          // Revoked data must never be analysed; delete it as soon as it is
-          // proven final. This is the GC path for excluded objects.
-          if (this.bucket?.delete) {
-            for (const entry of toExclude) {
-              try {
-                await this.bucket.delete(entry.key);
-              } catch (error) {
-                this.log("burstel: failed to delete revoked journal object", {
-                  key: entry.key,
-                  error: errorMessage(error),
-                });
-              }
-            }
-            await this.ingestCall("/internal/compaction/gc/delete", "POST", {
-              keys: toExclude.map((o) => o.key),
-            }).catch(() => undefined);
-          }
+          // Revoked data must never be analysed. The durable exclusion row is
+          // written above and the manifest lookup filters it forever; the R2
+          // object itself is retained for the audit window (spec 024 R5) and
+          // deleted later by runRevokedRetention().
         }
       }
     }
@@ -745,7 +750,12 @@ export class CompactorCore {
       const listed = await this.ingestCall<{ candidates: GCandidate[]; protected: number; considered: number }>(
         "/internal/compaction/gc/list",
         "POST",
-        { retention_ms: this.config.retentionMs, force, limit: 500 },
+        {
+          retention_ms: this.config.retentionMs,
+          revoked_retention_ms: this.config.revokedRetentionMs,
+          force,
+          limit: 500,
+        },
       );
       protectedCount += listed.protected;
       if (listed.candidates.length === 0) break;
@@ -765,6 +775,48 @@ export class CompactorCore {
       if (listed.considered < 500) break;
     }
     return { deleted, protected: protectedCount };
+  }
+
+  /**
+   * Deletes revoked-token journal objects whose audit retention has elapsed
+   * (spec 024 R5). Runs on every tick, independently of COMPACTION_GC, because
+   * these objects are already excluded from every segment and analysis view.
+   */
+  async runRevokedRetention(): Promise<{ deleted: number }> {
+    if (!this.bucket || !this.bucket.delete) return { deleted: 0 };
+    let deleted = 0;
+    for (let page = 0; page < 20; page++) {
+      const listed = await this.ingestCall<{ candidates: GCandidate[]; protected: number; considered: number }>(
+        "/internal/compaction/gc/list",
+        "POST",
+        {
+          retention_ms: 0,
+          revoked_retention_ms: this.config.revokedRetentionMs,
+          revoked_only: true,
+          force: false,
+          limit: 500,
+        },
+      );
+      if (listed.candidates.length === 0) break;
+      const deletedKeys: string[] = [];
+      for (const candidate of listed.candidates) {
+        try {
+          await this.bucket.delete(candidate.key);
+          deletedKeys.push(candidate.key);
+          deleted += 1;
+        } catch (error) {
+          this.log("burstel: revoked retention delete failed", {
+            key: candidate.key,
+            error: errorMessage(error),
+          });
+        }
+      }
+      if (deletedKeys.length > 0) {
+        await this.ingestCall("/internal/compaction/gc/delete", "POST", { keys: deletedKeys }).catch(() => undefined);
+      }
+      if (listed.considered < 500) break;
+    }
+    return { deleted };
   }
 
   // --------------------------------------------------------------- status
@@ -791,6 +843,7 @@ export class CompactorCore {
         grace_ms: this.config.graceMs,
         lookback_ms: this.config.lookbackMs,
         retention_ms: this.config.retentionMs,
+        revoked_retention_ms: this.config.revokedRetentionMs,
         gc_enabled: this.config.gcEnabled,
         schedule_ms: this.config.scheduleMs,
       },

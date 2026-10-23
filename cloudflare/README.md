@@ -1,4 +1,4 @@
-# burstel Cloudflare layer — Worker + ShotDO + SQLite ControlDO + R2
+# burstel Cloudflare layer — Worker + ShotDO + SQLite control DO (`IngestDO` export) + R2
 
 This directory contains the Phase 2 Cloudflare layer for **burstel**. It builds
 on the Phase 1 Go recorder (`../cmd/burstel`, `../Dockerfile`); it does **not**
@@ -26,7 +26,8 @@ replace it.
 * `src/auth-do.ts` — singleton SQLite `AuthDO` holding the per-person token registry (digest + scope + attribution-only owner).
 * `src/shot-do.ts` — `ShotDO extends DurableObject`, wires `ctx.storage.sql`,
   `ctx.container` and the `BUCKET` R2 binding into the core.
-* `src/control-do.ts` — the singleton `ControlDO` (formerly `IngestDO`). It owns
+* `src/control-do.ts` — the singleton control DO, exported as `IngestDO` (code
+  alias `ControlDO`, spec 024 R1). It owns
   instances, authoritative tokens, the shot registry, the segment manifest and
   the compaction lease/pins, and is **never** on the ingest hot path.
 * `src/admission.ts` — memory -> KV -> authoritative token admission with exact
@@ -598,8 +599,9 @@ scripts/cloudflare-preflight.sh                 # full read-only preflight (auth
 `BUCKET -> burstel-shots`, no anonymous admin) and parse read-only
 `wrangler whoami --json`, `wrangler secret list` (names only) and R2 bucket
 listings. The live [`scripts/cloudflare-smoke.sh`](../scripts/cloudflare-smoke.sh)
-is a bounded E2E
-(two short shots) that never exposes a secret in argv/files/logs.
+is a bounded E2E (one short window shot + real OTLP through `/ingest`) that
+never exposes a secret in argv/files/logs. Spec 024 R3 rewrote it and
+`cloudflare-multishot-smoke.sh` for named instances + window shots.
 
 ### Not verified here (needs a distinct authorized deployment job)
 

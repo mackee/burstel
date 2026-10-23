@@ -14,6 +14,7 @@ import { CompactorCore } from "../src/compactor-core";
 import type { AppEnv } from "../src/env";
 import type { IngestCore } from "../src/ingest-core";
 import { sha256HexBytes } from "../src/crypto";
+import { autoBackfillInstanceTokens } from "../src/tools";
 import {
   FakeBucket,
   FakeCompactorContainer,
@@ -258,6 +259,41 @@ describe("D1: KV token admission", () => {
     h.kv.failGet = new Error("KV unavailable");
     expect((await handleRequest(push(issued.token), h.env)).status).toBe(200);
   });
+
+  test("the Cron backfill warms KV without waiting for an admission miss (R2)", async () => {
+    const h = makeHarness();
+    const instance = await h.ingest.instanceRegistry.upsert("web-1");
+    const issued = await h.ingest.instanceRegistry.issue("web-1");
+    // Simulate an upgrade: authoritative state exists, KV is empty, memory cold.
+    h.kv.values.clear();
+    resetAdmissionCache();
+
+    const result = await autoBackfillInstanceTokens(h.namespace, h.kv);
+    expect(result).toMatchObject({ backfilled: 1, failed: 0 });
+    expect(result.skipped).toBeUndefined();
+    expect(h.kv.values.size).toBe(1);
+
+    const before = h.namespace.admitCalls();
+    expect((await handleRequest(push(issued.token), h.env)).status).toBe(200);
+    expect(h.namespace.admitCalls()).toBe(before);
+    expect([...h.bucket.objects.values()][0]!.customMetadata?.instance_id).toBe(instance.instance_id);
+  });
+
+  test("the Cron backfill is best effort and idempotent", async () => {
+    const h = makeHarness();
+    await h.ingest.instanceRegistry.upsert("web-1");
+    await h.ingest.instanceRegistry.issue("web-1");
+    const first = await autoBackfillInstanceTokens(h.namespace, h.kv);
+    const second = await autoBackfillInstanceTokens(h.namespace, h.kv);
+    expect(first.backfilled).toBe(1);
+    expect(second.backfilled).toBe(1);
+    expect(h.kv.values.size).toBe(1);
+    expect(await autoBackfillInstanceTokens(h.namespace, undefined)).toMatchObject({
+      backfilled: 0,
+      failed: 0,
+      skipped: "kv_unconfigured",
+    });
+  });
 });
 
 describe("D2: ledger-free ingest and late-write guard", () => {
@@ -331,7 +367,7 @@ describe("D3: compaction-time discovery", () => {
     expect(rows).toEqual(["inst-a", "inst-b"]);
   });
 
-  test("objects written with a token revoked before receipt are excluded, recorded and GC'd", async () => {
+  test("objects written with a token revoked before receipt are excluded, retained for audit and then GC'd (R5)", async () => {
     const h = makeHarness();
     const t = h.clock.now;
     h.setClock(t - 300_000);
@@ -360,7 +396,9 @@ describe("D3: compaction-time discovery", () => {
     expect(report.ok).toBe(true);
     expect(report.excluded_revoked).toBe(1);
     expect(report.segments_published).toBe(1);
-    expect(await h.bucket.get(bad.key)).toBeNull();
+    // Spec 024 R5: kept in place for the default 7-day audit window.
+    expect(report.revoked_deleted).toBe(0);
+    expect(await h.bucket.get(bad.key)).not.toBeNull();
     expect(await h.bucket.get(good.key)).not.toBeNull();
 
     const covered = h.sql
@@ -369,8 +407,101 @@ describe("D3: compaction-time discovery", () => {
       .map((r) => String(r.journal_key));
     expect(covered).toEqual([good.key]);
     expect(covered).not.toContain(bad.key);
-    expect(await h.ingest.listExcluded(10).then((r) => r.total)).toBe(0); // GC'd after deletion
+    expect(await h.ingest.listExcluded(10).then((r) => r.total)).toBe(1);
+    // R7 review: retained-but-excluded objects are not "pending" work.
+    expect(await h.ingest.journalStats().then((s) => s.pending)).toBe(0);
+    expect(
+      await h.ingest.pendingJournalInRange(["inst-a"], 0, Number.MAX_SAFE_INTEGER).then((r) => r.pending_journal),
+    ).toBe(0);
     expect((await h.ingest.compactionStatus()).counters as Record<string, number>).toMatchObject({ excluded_revoked: 1 });
+
+    // After the audit window the object is deleted and the exclusion row is
+    // consumed; the good object is untouched.
+    h.setClock(t + 7 * 24 * 60 * 60 * 1000 + 1);
+    const swept = await makeCompactor(h).tick();
+    expect(swept.revoked_deleted).toBe(1);
+    expect(await h.bucket.get(bad.key)).toBeNull();
+    expect(await h.ingest.listExcluded(10).then((r) => r.total)).toBe(0);
+  });
+
+  test("a duplicate segment publish heals coverage atoms lost after the manifest row (R7)", async () => {
+    const h = makeHarness();
+    const t = h.clock.now;
+    const obj = await seedJournal(h, {
+      instanceId: "inst-a",
+      instance: "a",
+      tokenId: "tok-a",
+      receivedAt: t - 130_000,
+    });
+    const bytes = new TextEncoder().encode("segment-bytes");
+    const sha = await sha256HexBytes(bytes);
+    const segmentKey = `segments/all/${t - 130_000}-${t - 130_000}-abcdef0123456789.duckdb`;
+    await h.bucket.put(segmentKey, bytes, { sha256: sha, customMetadata: { sha256: sha } });
+    const input = {
+      segment_key: segmentKey,
+      instance_id: "all",
+      object_key: segmentKey,
+      size_bytes: bytes.byteLength,
+      sha256: sha,
+      first_received_at: t - 130_000,
+      last_received_at: t - 130_000,
+      request_count: 1,
+      record_count: 1,
+      coverage: [{ journal_key: obj.key, signal: "traces", received_at: t - 130_000, instance_id: "inst-a" }],
+    };
+
+    const first = await h.ingest.publishSegment(input);
+    expect(first.committed).toBe(true);
+    // Simulate a crash between the manifest write and the coverage atoms.
+    h.sql.exec(`DELETE FROM segment_coverage WHERE journal_key = '${obj.key}'`);
+    expect(h.sql.exec("SELECT COUNT(*) AS n FROM segment_coverage").toArray()[0]!.n).toBe(0);
+
+    const again = await h.ingest.publishSegment(input);
+    expect(again.duplicate).toBe(true);
+    expect(again.covered_new).toBe(1);
+    expect(await h.ingest.coverageLookup([obj.key])).toEqual({ covered: [obj.key], excluded: [] });
+  });
+
+  test("a revocation-lookup failure fails the tick instead of compacting revoked data (R7)", async () => {
+    const h = makeHarness();
+    const t = h.clock.now;
+    h.setClock(t - 300_000);
+    await h.ingest.instanceRegistry.upsert("web-1");
+    const issued = await h.ingest.instanceRegistry.issue("web-1");
+    h.setClock(t - 200_000);
+    await h.ingest.instanceRegistry.revoke("web-1", issued.id);
+    h.setClock(t);
+    const bad = await seedJournal(h, {
+      instanceId: issued.instance_id,
+      instance: "web-1",
+      tokenId: issued.id,
+      receivedAt: t - 130_000,
+    });
+
+    const failingNamespace = {
+      getByName: () => ({
+        fetch: async (request: Request): Promise<Response> => {
+          if (new URL(request.url).pathname === "/internal/instance/token/revocations") {
+            throw new Error("revocation lookup unavailable");
+          }
+          return h.ingest.handleInternal(request);
+        },
+      }),
+    };
+    const compactor = new CompactorCore({
+      ingest: failingNamespace,
+      bucket: h.bucket,
+      container: new FakeCompactorContainer(),
+      holder: "spec-024",
+      now: () => h.clock.now,
+      config: { graceMs: 90_000 },
+    });
+    const report = await compactor.tick();
+    expect(report.ok).toBe(false);
+    expect(report.segments_published).toBe(0);
+    // Fail closed: the potentially revoked object is never published.
+    expect(await h.bucket.get(bad.key)).not.toBeNull();
+    expect(await h.ingest.listSegments({ limit: 10, offset: 0 }).then((r) => r.total)).toBe(0);
   });
 
   test("a batch-capped run never advances the cursor past uncompacted objects", async () => {

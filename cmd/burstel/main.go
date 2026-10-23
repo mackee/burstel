@@ -40,6 +40,7 @@ func main() {
 	flag.IntVar(&cfg.MaxInflight, "max-inflight", cfg.MaxInflight, "max concurrent durable writes")
 	flag.DurationVar(&cfg.MaxQueueWait, "max-queue-wait", cfg.MaxQueueWait, "how long an OTLP request waits for a write slot before 503 + Retry-After")
 	flag.DurationVar(&cfg.WriteTimeout, "write-timeout", cfg.WriteTimeout, "timeout for a single durable write")
+	flag.Int64Var(&cfg.WALCheckpointBytes, "wal-checkpoint-bytes", cfg.WALCheckpointBytes, "background DuckDB WAL checkpoint threshold in bytes (default 256 MiB)")
 	flag.Parse()
 
 	if *showVersion {

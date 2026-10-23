@@ -1,13 +1,22 @@
 # Cloudflare deployment runbook (spec 009)
 
 This runbook deploys the burstel Worker + per-shot `ShotDO` Containers + SQLite
-`ControlDO` (formerly `IngestDO`) + R2 freeze layer. Since spec 023 the ingest
-hot path is authenticated from KV `INSTANCE_TOKENS` and performs one R2 PUT;
-the deployment must create that namespace and the `INGEST_ANALYTICS` dataset
-(see the bindings in `wrangler.jsonc`) and, for an existing installation, apply
-a Durable Object `renamed_classes` migration from `IngestDO` to `ControlDO`. **Nothing in this repository performs a Cloudflare
-mutation on its own**: the preflight script is strictly read-only, and the
-deploy sequence is an explicit operator action.
+control-plane Durable Object + R2 freeze layer. Since spec 023 the ingest hot
+path is authenticated from KV `INSTANCE_TOKENS` and performs one R2 PUT; the
+deployment must create that namespace and the `INGEST_ANALYTICS` dataset (see
+the bindings in `wrangler.jsonc`).
+
+**Deploy-safe DO name (spec 024 R1).** The exported storage class keeps the
+legacy name `IngestDO`; `ControlDO` is only a code-level alias. Renaming a
+Durable Object class requires a `renamed_classes` migration, and this repo's
+`exports`-style Wrangler config cannot declare one. Deploying `ControlDO` as a
+new class without that migration would create empty storage and orphan every
+instance, token, shot, segment-manifest row, compaction lease/pin and the
+discovery cursor. `preflight` therefore requires
+`INGEST_DO.class_name == "IngestDO"` and `exports.IngestDO.storage == "sqlite"`,
+and refuses a separate `ControlDO` export. **Nothing in this repository performs
+a Cloudflare mutation on its own**: the preflight script is strictly read-only,
+and the deploy sequence is an explicit operator action.
 
 > **Atomicity warning.** On Cloudflare, a Worker deploy and a Container rollout
 > are *not* atomic. `wrangler.jsonc` builds the container image from
@@ -36,7 +45,7 @@ runs as the nonroot user `burstel` (uid 10001).
 | --- | --- | --- |
 | `BURSTEL_API_TOKEN` | admin: `/api/*`, `/mcp`, legacy per-shot path | Worker secret |
 | `BURSTEL_INTERNAL_TOKEN` | recorder `/internal/*` defense-in-depth | Worker secret, injected into the container by the `ShotDO` |
-| instance push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its named instance | minted at runtime by `POST /api/instances/{name}/tokens` (admin\|member), shown **once**; only its digest is stored in `ControlDO` (and positively cached in KV) |
+| instance push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its named instance | minted at runtime by `POST /api/instances/{name}/tokens` (admin\|member), shown **once**; only its digest is stored in the control DO (and positively cached in KV) |
 | per-person token | `/api/*` + `/mcp` as `admin` or `member` (member = full operational, no registry) | minted at runtime by `POST /api/tokens` (admin only), shown **once**; only its digest is stored in `AuthDO` |
 
 Rules (all fail closed): the internal token must be non-empty and **different**
@@ -95,8 +104,11 @@ credentials, and do not use a mutable tag.
 ## 4. Read-only preflight
 
 ```bash
-# Config invariants only (no credentials, safe anywhere, used by tests):
+# Config invariants only (no credentials, safe anywhere, used by tests). This
+# still fails on the checked-in all-zero KV placeholder by design; use
+# --allow-placeholder-kv only for a structural lint, never before a deploy.
 scripts/cloudflare-preflight.sh --config-only
+scripts/cloudflare-preflight.sh --config-only --allow-placeholder-kv
 
 # Full read-only preflight (requires wrangler auth / CLOUDFLARE_API_TOKEN):
 CLOUDFLARE_API_TOKEN=... scripts/cloudflare-preflight.sh
@@ -114,9 +126,11 @@ The full preflight checks, without mutating anything:
   are never read or printed);
 * `docker`/`buildx`/`linux/amd64` compatibility;
 * the `wrangler.jsonc` invariants: `ShotDO` container on `standard-1`, bounded
-  `max_instances`, SQLite `ShotDO`/`ControlDO`/`AuthDO` exports,
-  `BUCKET -> burstel-shots`, no `BURSTEL_DEV_INSECURE_AUTH`, no plaintext tokens
-  in `vars`.
+  `max_instances`, SQLite `ShotDO`/`IngestDO`/`AuthDO` exports, the deploy-safe
+  `INGEST_DO -> IngestDO` binding (no `ControlDO` rename),
+  `BUCKET -> burstel-shots`, a concrete (not all-zero) `INSTANCE_TOKENS` KV id,
+  a present `INGEST_ANALYTICS` dataset, no `BURSTEL_DEV_INSECURE_AUTH`, and no
+  plaintext tokens in `vars`.
 
 It exits non-zero and prints `BLOCKED` if anything required fails — including
 "no image-build mechanism". It never runs `wrangler deploy`.
@@ -137,6 +151,40 @@ If the deployment partially fails, the Worker and Container may be at different
 revisions; re-run the deploy after fixing the image/config rather than patching
 live.
 
+## 5a. Upgrade order from 018/022 to 023+ (spec 024 R2)
+
+An existing installation deployed at 018/022 has `IngestDO` storage and `bit_`
+instance tokens that predate the 023 KV admission cache. Upgrade in this exact
+order; do not skip a step, and do not rename the DO class:
+
+1. **Create/reuse the KV namespace.** Create `INSTANCE_TOKENS` with
+   `wrangler kv namespace create INSTANCE_TOKENS` (an operator action, not done
+   by the repo) and replace the all-zero placeholder `id` in
+   `cloudflare/wrangler.jsonc`. `preflight` fails on the placeholder.
+2. **Create the Analytics Engine dataset binding.** `INGEST_ANALYTICS` must be
+   present with dataset `burstel_ingest`; `preflight` fails when the binding is
+   missing.
+3. **Confirm the DO name is unchanged.** The config must bind `INGEST_DO` to
+   `IngestDO` and export `IngestDO` with SQLite storage. No `renamed_classes`
+   migration is needed or allowed; this keeps the authoritative state.
+4. **Deploy the Worker.** `wrangler deploy` updates the same DO class in place.
+   The Worker's Cron trigger also runs an idempotent KV backfill from the
+   authoritative live-token list, so a live `bit_` token is admitted after the
+   deploy even if its first request misses KV. A miss still backfills that one
+   token synchronously.
+5. **Run an explicit backfill after deploy** (belt and braces; admin only):
+   `POST /api/instance-tokens/backfill`. It is idempotent and never returns raw
+   tokens.
+6. **Smoke the upgrade** with the current-model scripts in section 6. Verify a
+   pre-upgrade `bit_` token returns 200 on `/ingest/v1/traces` and that
+   `GET /api/ingest/status` shows the acknowledged object.
+7. **Optional:** leave `COMPACTION_GC=0`; compaction still publishes verified
+   segments. Revoked-token objects are excluded immediately and deleted only
+   after `COMPACTION_REVOKED_RETENTION_MS` (default 7 days).
+
+Rollback does **not** require any DO migration: the storage class was never
+renamed.
+
 ## 6. Post-deploy smoke
 
 ```bash
@@ -146,22 +194,21 @@ BURSTEL_INTERNAL_TOKEN=... \
 scripts/cloudflare-smoke.sh
 ```
 
-`scripts/cloudflare-smoke.sh` is a **small, bounded** E2E (two short shots —
-never a 60/180s benchmark). It checks health, auth boundaries, creates a named
-instance and issues its 24h token, sends real OTLP traces/metrics/logs through
-the stable `/ingest` endpoint, freezes a shot, then runs REST
-query/analyze/schema/compare and MCP `tools/list`/`tools/call`, verifies
-admin/instance scope separation, and asserts the retired `/api/ingest-token` and
-`/api/shots/{id}/ingest-token` endpoints return `410`. `scripts/cloudflare-multishot-smoke.sh`
-additionally runs two **concurrent** shots, proves instance data isolation, and
-(spec 013, Part B) mints two `member` tokens, cross-operates on each other's
-shots, denies the person-token registry, revokes one immediately and lists MCP
-tools.
-Tokens are read from the environment, passed to curl through `--config` process
-substitution (never argv) and to `cmd/otlpsend` through `BURSTEL_PUSH_TOKEN`;
-they are never echoed, written to the repo, logged, put in URLs or CI artifacts.
-It does not touch an ISUCON host. Both scripts need a live deploy host and are
-not executed by the offline test suites.
+`scripts/cloudflare-smoke.sh` is a **small, bounded** E2E (seconds, never a
+60/180s benchmark). Spec 024 R3 rewrote it for the current model: it checks
+health and auth boundaries, creates a named instance and issues its 24h token,
+creates a **default window shot** (`kind=window`, no per-shot token), sends real
+OTLP traces/metrics/logs through `/ingest` with `cmd/burstel-loadgen`, verifies
+the listing-based journal count, exercises the idempotent KV backfill, stops the
+window marker and lists MCP tools. `scripts/cloudflare-multishot-smoke.sh` now
+creates two named instances with distinct tokens, proves `/ingest` attributions
+(`x-burstel-instance`) do not cross instances, checks owner filtering, revokes
+one instance token immediately and stops both window markers.
+Tokens are read from the environment and passed to curl through `--config`
+process substitution (never argv) and to `burstel-loadgen` through
+`BURSTEL_PUSH_TOKEN`; they are never echoed, written to the repo, logged, put in
+URLs or CI artifacts. It does not touch an ISUCON host. Both scripts need a live
+deploy host and are not executed by the offline test suites (`bash -n` is).
 
 ### Installing the collector token on the ISUCON host (manual)
 
@@ -196,6 +243,11 @@ Containers are ephemeral and are destroyed on freeze/idle.
   objects if long-term retention is not required. Compaction discovers these
   objects by listing (spec 023), so never delete `journal/*` before the
   compactor has published (or explicitly excluded) the object.
+* Revoked-token journal objects are excluded from segments and analysis
+  immediately, then retained in place for audit for
+  `COMPACTION_REVOKED_RETENTION_MS` (default 7 days). A tick sweep deletes them
+  after that window; this is independent of the destructive `COMPACTION_GC`
+  opt-in for covered data.
 * Containers require Workers Paid; do not leave test Containers running.
 
 ## 9. Non-goals
