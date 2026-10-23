@@ -74,7 +74,7 @@ describe("wrangler configuration validation", () => {
 
   test("requires SQLite-backed DO exports", () => {
     const cfg = loadWranglerConfig(REAL_CONFIG);
-    cfg.exports!["IngestDO"]!.storage = "key-value";
+    cfg.exports!["ControlDO"]!.storage = "key-value";
     const report = finalize(validateWranglerConfig(cfg));
     expect(report.failed_required).toContain("export_ingestdo_sqlite");
   });

@@ -10,7 +10,7 @@ change that introduced it.
 | --- | --- | --- | --- |
 | `BURSTEL_API_TOKEN` | admin: `/api/*`, `/mcp`, legacy per-shot `/shots/{id}` | Worker secret | sent to a container, logged, committed |
 | `BURSTEL_INTERNAL_TOKEN` | recorder `/internal/*` only (defense in depth) | Worker secret **and** injected into the container env by the DO | reused as the admin token, logged, committed |
-| instance push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its named instance | minted by `POST /api/instances/{name}/tokens` (admin\|member), returned once | stored raw (only its digest lives in `IngestDO`), logged, used for admin routes |
+| instance push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its named instance | minted by `POST /api/instances/{name}/tokens` (admin\|member), returned once; positive grants cached in KV | stored raw (only its digest lives in `ControlDO`/KV), logged, used for admin routes |
 | per-person token (`admin`/`member`) | `/api/*` and `/mcp`; `member` is full operational but never registry; `admin` may manage the registry | minted by `POST /api/tokens` (admin only), returned once | stored raw (only its digest lives in `AuthDO`), logged, used as a push/internal token |
 
 Requirements, all **fail closed** when violated:
@@ -22,9 +22,11 @@ Requirements, all **fail closed** when violated:
    container environment or its request headers.
 3. The instance push-only token is independent, random (>= 256 bits), and never
    used as either the admin or the internal token. Ingestion authenticates it
-   before any disk/bucket write and only acknowledges (`200`) after the raw
-   bytes are durable in R2 **and** a ledger row is committed; a durable-write
-   failure is a retryable `5xx`.
+   (memory -> KV `INSTANCE_TOKENS` -> authoritative `ControlDO`) before any
+   bucket write and only acknowledges (`200`) after the raw bytes are durable in
+   R2; a write failure or a late write is a retryable `5xx`. Negative admission
+   results are never cached. See ADR-007 for the exact expiry/revocation
+   boundaries.
 4. The recorder itself refuses `/internal/*` when `BURSTEL_INTERNAL_TOKEN` is
    empty, so a directly-reachable container is not left open.
 
@@ -42,8 +44,8 @@ wrangler secret put BURSTEL_INTERNAL_TOKEN
   `wrangler dev`.
 * There are no hardcoded credential defaults anywhere in the Worker, the DO, the
   recorder or the image.
-* Tokens are compared in constant time and never logged. The DO stores only the
-  one-way SHA-256 digest of an instance push token.
+* Tokens are compared in constant time and never logged. The control plane and
+  KV store only the one-way SHA-256 digest of an instance push token.
 * Per-person registry tokens (spec 013, Part B) store only a SHA-256 digest in
   `AuthDO`; `GET /api/tokens` never returns a value, and a revoked/expired token
   fails immediately (`401`). Token issuance is the trust boundary: hand out one
@@ -63,14 +65,19 @@ wrangler secret put BURSTEL_INTERNAL_TOKEN
 ## Durable intake and retry semantics
 
 * The stable instance endpoint authenticates first, writes the original bytes to
-  a unique R2 object, commits a durable ledger row, and only then answers OTLP
-  `200`. A valid export is **never** discarded for lack of an active shot, and an
-  R2 or ledger failure is a retryable `5xx`.
+  a unique R2 object, and only then answers OTLP `200`. Every acknowledged
+  export is either included in a verified segment or explicitly reported as
+  `excluded_revoked`; it is never silently missing. A valid export is **never**
+  discarded for lack of an active shot, and an R2 failure or a late write is a
+  retryable `5xx`.
 * The legacy per-shot path (`/shots/{id}/v1/*`) has no durability guarantee of
   its own: it proxies to the shot's recorder, so a request rejected because the
   shot is stopping/not-recording may be answered with a valid OTLP `200` and
   `X-Burstel-Disposition: ignored-no-active-shot`, while genuine failures stay a
   retryable `503`.
+* Revocation is absolute for analysis but eventually consistent at the edge
+  (nominal KV propagation <= 60 s). Compaction excludes objects written at/after
+  the token's effective revocation instant and deletes them.
 * A recording shot whose container has **stopped** is terminally lost (spec 012):
   the shot becomes `failed` (`lost: true`). This affects only the legacy path; it
   has no effect on instance intake.

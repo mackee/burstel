@@ -2,9 +2,10 @@
 //
 // Every tool is a thin, authenticated proxy to a Durable Object. The ShotDO owns
 // the R2 artifact, the analysis container and the read-only DuckDB session; the
-// IngestDO owns the named-instance registry, instance credentials and the
-// durable raw-journal ledger. MCP callers cannot bypass the same boundaries the
-// REST API uses.
+// ControlDO owns the named-instance registry, authoritative instance
+// credentials, the shot registry, the segment manifest and the compaction
+// lease. Spec 023 keeps it off the ingest hot path. MCP callers cannot bypass
+// the same boundaries the REST API uses.
 //
 // Spec 014: named instances with 256-bit push-only tokens replaced the per-shot
 // ingest tokens and the recording cap. `/ingest/v1/*` now journals raw OTLP
@@ -12,6 +13,7 @@
 
 import { AUTH_DO_NAME, isScope } from "./auth-core";
 import type { AuthTokenIssue, AuthTokenMetadata } from "./auth-core";
+import { cacheTokenGrant, deleteTokenGrant } from "./admission";
 import type { R2BucketLike } from "./artifacts";
 import { COMPACTOR_DO_NAME } from "./compactor-core";
 import { DO_ORIGIN } from "./env";
@@ -20,11 +22,12 @@ import type {
   CompactorNamespaceLike,
   DoStubLike,
   IngestNamespaceLike,
+  KVNamespaceLike,
   ShotNamespaceLike,
 } from "./env";
 import { badRequest, conflict, HttpError, unknownInstance } from "./errors";
 import { INGEST_DO_NAME, isValidInstanceName, normalizeInstanceName } from "./ingest-core";
-import type { CreateWindowShotInput, InstanceMetadata, InstanceTokenIssue, InstanceTokenMetadata, SegmentManifestRow, StartWindowShotInput, WindowShotRecord } from "./ingest-core";
+import type { CreateWindowShotInput, InstanceMetadata, InstanceTokenIssue, InstanceTokenMetadata, JournalListingStats, SegmentManifestRow, StartWindowShotInput, WindowShotRecord } from "./ingest-core";
 import { isShotId, newShotId } from "./ids";
 import { isValidInstanceLabel, normalizeInstances, selectSegments } from "./shot-window";
 import type { ShotWindow, WindowSegmentMeta } from "./shot-window";
@@ -45,6 +48,12 @@ export interface ToolContext {
    * the Worker can stream verified segment objects into the analysis container.
    */
   bucket?: R2BucketLike;
+  /**
+   * Instance-token admission cache (spec 023, D1). Issue/rotate/revoke keep it
+   * in sync; `backfillInstanceTokens` populates it once for pre-023 `bit_`
+   * tokens.
+   */
+  tokens?: KVNamespaceLike;
 }
 
 export interface FreezeRef {
@@ -108,6 +117,8 @@ export function createTools(ctx: ToolContext) {
       issueInstanceToken(ctx, name, opts),
     listInstanceTokens: (name: string) => listInstanceTokens(ctx, name),
     revokeInstanceToken: (name: string, id: string) => revokeInstanceToken(ctx, name, id),
+    backfillInstanceTokens: () => backfillInstanceTokens(ctx),
+    ingestStatus: () => ingestStatus(ctx),
     compactionStatus: () => compactionStatus(ctx),
     compactionRun: (opts: { gc?: boolean } = {}) => compactionRun(ctx, opts),
   };
@@ -378,11 +389,25 @@ export async function issueInstanceToken(
 ): Promise<InstanceTokenIssue> {
   const normalized = normalizeInstanceName(name);
   if (!isValidInstanceName(normalized)) throw badRequest("invalid instance name");
-  return ingestCall<InstanceTokenIssue>(ctx, "/internal/instance/token/issue", "POST", {
+  const issued = await ingestCall<InstanceTokenIssue>(ctx, "/internal/instance/token/issue", "POST", {
     name: normalized,
     rotate: opts.rotate === true,
     overlap_seconds: opts.overlap_seconds,
   });
+  const expiresAt = Date.parse(issued.expires_at);
+  await cacheTokenGrant(ctx.tokens, issued.token, {
+    instance_id: issued.instance_id,
+    instance_name: issued.instance,
+    token_id: issued.id,
+    expires_at: Number.isFinite(expiresAt) ? expiresAt : Date.now() + issued.ttl_seconds * 1000,
+  });
+  if (opts.rotate === true) {
+    // Rotation revokes the previous token(s) with a grace. A KV entry cannot
+    // represent grace, so drop it: the authoritative ControlDO keeps honouring
+    // the grace window, then rejects. Never leave a stale positive entry.
+    await dropTokenDigests(ctx, normalized, (entry) => entry.revoked || entry.token_id !== issued.id);
+  }
+  return issued;
 }
 
 /** Lists instance token metadata (never values). */
@@ -406,13 +431,83 @@ export async function revokeInstanceToken(
   const normalized = normalizeInstanceName(name);
   if (!isValidInstanceName(normalized)) throw badRequest("invalid instance name");
   if (typeof id !== "string" || id.trim() === "") throw badRequest("token id is required");
-  return ingestCall<{ revoked: boolean; id: string }>(ctx, "/internal/instance/token/revoke", "POST", {
+  const result = await ingestCall<{ revoked: boolean; id: string }>(ctx, "/internal/instance/token/revoke", "POST", {
     name: normalized,
     id,
   });
+  // Drop the positive cache entry so the edge converges within the propagation
+  // window instead of waiting for natural expiry.
+  await dropTokenDigests(ctx, normalized, (entry) => entry.token_id === id);
+  return result;
+}
+
+interface TokenDigestEntry {
+  digest: string;
+  token_id: string;
+  instance_id: string;
+  instance: string;
+  issued_at: number;
+  expires_at: number;
+  revoked: boolean;
+  grace_until: number | null;
+  revoked_at: number | null;
+}
+
+async function dropTokenDigests(
+  ctx: ToolContext,
+  name: string,
+  predicate: (entry: TokenDigestEntry) => boolean,
+): Promise<void> {
+  if (!ctx.tokens) return;
+  const listed = await ingestCall<{ tokens: TokenDigestEntry[] }>(
+    ctx,
+    "/internal/instance/token/digests",
+    "POST",
+    { name },
+  ).catch(() => ({ tokens: [] as TokenDigestEntry[] }));
+  for (const entry of listed.tokens) {
+    if (predicate(entry)) await deleteTokenGrant(ctx.tokens, entry.digest);
+  }
+}
+
+/**
+ * One-shot backfill (spec 023, D1.4): copies every live pre-023 `bit_` token's
+ * grant into KV so admission no longer needs the ControlDO. Keyed by digest, so
+ * no raw token is ever needed or stored. Idempotent; safe to run repeatedly.
+ */
+export async function backfillInstanceTokens(
+  ctx: ToolContext,
+): Promise<{ backfilled: number; failed: number }> {
+  if (!ctx.tokens) throw new HttpError(503, "INSTANCE_TOKENS is not configured", true, "kv_unavailable");
+  const live = await ingestCall<{ tokens: TokenDigestEntry[] }>(ctx, "/internal/instance/token/live", "GET");
+  let backfilled = 0;
+  let failed = 0;
+  for (const entry of live.tokens) {
+    const ok = await ctx.tokens
+      .put(
+        entry.digest,
+        JSON.stringify({
+          instance_id: entry.instance_id,
+          instance_name: entry.instance,
+          token_id: entry.token_id,
+          expires_at: entry.expires_at,
+        }),
+        { expiration: Math.max(1, Math.ceil(entry.expires_at / 1000)) },
+      )
+      .then(() => true)
+      .catch(() => false);
+    if (ok) backfilled += 1;
+    else failed += 1;
+  }
+  return { backfilled, failed };
 }
 
 // --------------------------------------------------------- compaction
+
+/** Journal occupancy/backlog straight from the R2 listing (spec 023 D3.4). */
+export async function ingestStatus(ctx: ToolContext): Promise<JournalListingStats> {
+  return ingestCall<JournalListingStats>(ctx, "/internal/compaction/journal", "GET");
+}
 
 /** Compaction backlog/health (spec 018). admin|member; never returns secrets. */
 export async function compactionStatus(ctx: ToolContext): Promise<Record<string, unknown>> {

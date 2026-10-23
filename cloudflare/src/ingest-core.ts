@@ -1,23 +1,27 @@
-// Ingestion coordinator core (spec 014).
+// Control-plane core (spec 014, reduced by spec 023 D4).
 //
 // This core is deliberately free of Cloudflare-specific globals so the exact
-// same logic runs in production (over `IngestDO` SQLite storage) and in unit
+// same logic runs in production (over `ControlDO` SQLite storage) and in unit
 // tests (over `bun:sqlite`). It owns:
 //
 //   * the named-instance registry and push-only instance credentials, delegated
 //     to {@link InstanceCore} over the same SQLite storage (spec 014);
-//   * the durable raw-journal ledger: one row per *acknowledged* OTLP export,
-//     written after the raw bytes are durable in R2 and before the OTLP 200;
 //   * the shot registry: which shots exist and their attribution-only `owner`,
 //     so `GET /api/shots` can list shots. The former
 //     `MAX_CONCURRENT_RECORDING` cap is gone (spec 014): shots may record
-//     concurrently, bounded only by explicit backend capacity controls.
+//     concurrently, bounded only by explicit backend capacity controls;
+//   * the segment manifest, compaction lease/pins and discovery cursor.
+//
+// Spec 023 removed the per-request journal ledger from the ingest ACK path:
+// the Worker authenticates from KV and writes one R2 object. The legacy ledger
+// table/endpoints remain only for reconciliation tooling and older tests;
+// compaction discovers work by listing R2.
 //
 // Design boundaries:
 //   * An instance token authorizes *only* POST /ingest/v1/{traces,metrics,logs}
 //     and resolves to an instance, never to a shot or a segment.
-//   * Expiry is evaluated per arriving request against an injectable clock and
-//     is never extended by shot creation, stop, queries or telemetry.
+//   * Expiry is evaluated at the edge from `expires_at` and is exact; the
+//     authoritative check here is the source of truth on a cache miss.
 //   * A frozen shot's artifact outlives its (former) credentials by design.
 
 import type { R2BucketLike } from "./artifacts";
@@ -25,6 +29,8 @@ import { badRequest } from "./errors";
 import { errorResponse, json, readJson } from "./http";
 import { InstanceCore, newInstanceToken } from "./instance-core";
 import type { InstanceCoreDeps } from "./instance-core";
+import { listAllJournalObjects, listJournalObjects } from "./journal-listing";
+import type { JournalObjectInfo } from "./journal-listing";
 import {
   DEFAULT_WINDOW_BOUNDS,
   externalWindow,
@@ -41,8 +47,17 @@ import type { Signal, SqlRow, SqlValue, SyncSql } from "./store";
 
 export { constantTimeEqual, sha256Hex } from "./crypto";
 
-/** Name of the singleton coordinator Durable Object. */
-export const INGEST_DO_NAME = "ingest-primary";
+/** Name of the singleton control-plane Durable Object (spec 023, D4). */
+export const CONTROL_DO_NAME = "ingest-primary";
+/** Backwards-compatible alias used by existing callers/tests. */
+export const INGEST_DO_NAME = CONTROL_DO_NAME;
+
+/**
+ * Segment scope for a cross-instance time bucket (spec 023, D3.3). It is the
+ * synthetic `instance_id` of a multi-instance segment; individual rows keep
+ * their real `instance_id` column.
+ */
+export { MULTI_INSTANCE_SCOPE } from "./segment-scope";
 
 /**
  * How long a logical window shot protects its receive-time range from GC. The
@@ -126,11 +141,34 @@ export interface JournalEntry {
   committed_at?: number;
 }
 
+/** One journal object excluded because its token was revoked before receipt. */
+export interface ExcludedJournalInput {
+  key: string;
+  token_id: string;
+  instance_id: string;
+  received_at: number;
+  size: number;
+}
+
+/** Aggregated journal occupancy straight from the R2 listing (spec 023). */
+export interface JournalListingStats {
+  objects: number;
+  bytes: number;
+  pending: number;
+  by_signal: Record<string, number>;
+  pending_by_signal: Record<string, number>;
+  oldest_received_at: number | null;
+  truncated: boolean;
+  scanned: number;
+}
+
 /** One journal object attributed to a segment by the compactor (spec 015). */
 export interface SegmentCoverageInput {
   journal_key: string;
   signal: string;
   received_at: number;
+  /** Real instance of the object; absent for a single-instance segment. */
+  instance_id?: string;
 }
 
 /**
@@ -197,12 +235,17 @@ export interface CompactionObject {
   content_type: string;
   content_encoding: string;
   received_at: number;
+  /** Token that authorized the write; used for compaction-time revocation. */
+  token_id?: string;
 }
 
-/** One bounded, single-instance receive-time window ready to compact. */
+/** One bounded receive-time bucket ready to compact (spec 023, D3.3). */
 export interface CompactionBatch {
-  instance_id: string;
-  instance: string;
+  /**
+   * Segment scope. `MULTI_INSTANCE_SCOPE` ("all") for the normal cross-instance
+   * time bucket; a specific instance id only for the legacy ledger planner.
+   */
+  scope_id: string;
   first_received_at: number;
   last_received_at: number;
   objects: CompactionObject[];
@@ -259,6 +302,7 @@ export interface CompactionResultInput {
   ok: boolean;
   segments_published?: number;
   bytes_published?: number;
+  excluded_revoked?: number;
   error?: string | null;
 }
 
@@ -349,9 +393,22 @@ const SCHEMA_STATEMENTS: string[] = [
      instance_id TEXT NOT NULL,
      signal      TEXT NOT NULL,
      received_at INTEGER NOT NULL,
-     covered_at  INTEGER NOT NULL
+     covered_at  INTEGER NOT NULL,
+     deleted_from_r2 INTEGER NOT NULL DEFAULT 0
    )`,
   `CREATE INDEX IF NOT EXISTS segment_coverage_segment ON segment_coverage (segment_key)`,
+  // Spec 023: journal objects written with a token revoked before receipt are
+  // excluded from every segment. The row is durable proof of exclusion and
+  // makes the object GC-eligible even when coverage is empty.
+  `CREATE TABLE IF NOT EXISTS excluded_journal (
+     journal_key TEXT PRIMARY KEY,
+     token_id    TEXT NOT NULL,
+     instance_id TEXT NOT NULL,
+     received_at INTEGER NOT NULL,
+     size        INTEGER NOT NULL,
+     excluded_at INTEGER NOT NULL
+   )`,
+  `CREATE INDEX IF NOT EXISTS excluded_journal_time ON excluded_journal (received_at)`,
   // Spec 018: single-active lease per compaction partition. At-least-once
   // scheduling is fenced by (holder, fencing): a stale holder can never publish
   // or delete after a newer holder has taken the lease.
@@ -413,6 +470,8 @@ export class IngestCore {
       `ALTER TABLE shot_registry ADD COLUMN coverage_json TEXT`,
       // Additive migration for a segment_pins table created before TTL support.
       `ALTER TABLE segment_pins ADD COLUMN expires_at INTEGER`,
+      // Additive migration for coverage rows created before spec 023 GC markers.
+      `ALTER TABLE segment_coverage ADD COLUMN deleted_from_r2 INTEGER NOT NULL DEFAULT 0`,
     ]) {
       try {
         this.sql.exec(stmt);
@@ -685,9 +744,11 @@ export class IngestCore {
   // ------------------------------------------------------------- journal
 
   /**
-   * Durably indexes one acknowledged OTLP export. Idempotent on the object key
-   * so a reconciliation replay cannot double-count. Must succeed before the
-   * Worker answers the exporter with OTLP 200.
+   * Durably indexes one acknowledged OTLP export.
+   *
+   * @deprecated Spec 023 removed the ledger from the ingest ACK path. This
+   * remains only for legacy reconciliation tooling; new intake never calls it,
+   * and compaction discovers work from the R2 listing.
    */
   async commitJournal(entry: JournalEntry): Promise<{ committed: boolean }> {
     await this.ensureLoaded();
@@ -834,7 +895,7 @@ export class IngestCore {
          VALUES (?,?,?,?,?,?)`,
         cov.journal_key,
         seg.segment_key,
-        seg.instance_id,
+        cov.instance_id && cov.instance_id !== "" ? cov.instance_id : seg.instance_id,
         cov.signal,
         cov.received_at,
         now,
@@ -939,7 +1000,7 @@ export class IngestCore {
       };
       const split =
         cur === null ||
-        cur.instance_id !== obj.instance_id ||
+        cur.scope_id !== obj.instance_id ||
         obj.received_at - cur.first_received_at >= opts.window_ms ||
         cur.objects.length >= maxObjects ||
         curBytes + obj.size > maxBytes;
@@ -947,8 +1008,7 @@ export class IngestCore {
         if (cur !== null) batches.push(cur);
         if (batches.length >= maxBatches) break;
         cur = {
-          instance_id: obj.instance_id,
-          instance: obj.instance,
+          scope_id: obj.instance_id,
           first_received_at: obj.received_at,
           last_received_at: obj.received_at,
           objects: [],
@@ -1040,6 +1100,7 @@ export class IngestCore {
       this.bump("compaction_success");
       if (input.segments_published) this.bump("segments_published", input.segments_published);
       if (input.bytes_published) this.bump("bytes_published", input.bytes_published);
+      if (input.excluded_revoked) this.bump("excluded_revoked", input.excluded_revoked);
     } else {
       this.setMeta("last_failure_at", now);
       this.bump("consecutive_failures", 1);
@@ -1050,9 +1111,12 @@ export class IngestCore {
 
   /**
    * Counts raw journal objects that are still un-compacted inside a half-open
-   * receive-time range (optionally scoped to instances). Window analysis uses
-   * this to disclose `pending` data rather than silently claiming an empty or
-   * complete window (spec 018).
+   * receive-time range (optionally scoped to instances).
+   *
+   * Spec 023: the count comes from the R2 listing of the window range, because
+   * there is no per-request ledger. Covered objects are de-duplicated against
+   * the manifest's coverage atoms. A ledger fallback is kept only for pure unit
+   * tests that inject no bucket.
    */
   async pendingJournalInRange(
     instanceIds: string[],
@@ -1060,6 +1124,17 @@ export class IngestCore {
     toMS: number,
   ): Promise<{ pending_journal: number }> {
     await this.ensureLoaded();
+    if (this.bucket?.list) {
+      const listed = await listJournalObjects(this.bucket, {
+        instanceIds,
+        fromMs: fromMS,
+        toMs: toMS,
+        maxObjects: 20_000,
+      });
+      const covered = this.coveredKeySet(listed.objects.map((o) => o.key));
+      const pending = listed.objects.filter((o) => !covered.has(o.key)).length;
+      return { pending_journal: pending };
+    }
     let q = `SELECT COUNT(*) AS n FROM journal_ledger j
                LEFT JOIN segment_coverage c ON c.journal_key = j.object_key
               WHERE c.journal_key IS NULL AND j.received_at >= ? AND j.received_at < ?`;
@@ -1072,40 +1147,200 @@ export class IngestCore {
     return { pending_journal: Number(rows[0]?.n ?? 0) };
   }
 
-  /** Storage/retention/backlog health for the compaction subsystem. */
-  async compactionStatus(): Promise<Record<string, unknown>> {
+  /**
+   * Journal occupancy from the R2 listing (spec 023, D3.4). This is the
+   * operational and benchmark-verification view: every acknowledged export is
+   * exactly one object, so `objects` is the number of durable 200s.
+   */
+  async journalStats(maxObjects = 20_000): Promise<JournalListingStats> {
     await this.ensureLoaded();
-    const now = this.now();
-    const pending = Number(
-      this.sql
+    if (!this.bucket?.list) {
+      const objects = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM journal_ledger`).toArray()[0]?.n ?? 0);
+      const pendingRow = this.sql
         .exec(
           `SELECT COUNT(*) AS n FROM journal_ledger j
              LEFT JOIN segment_coverage c ON c.journal_key = j.object_key
             WHERE c.journal_key IS NULL`,
         )
-        .toArray()[0]?.n ?? 0,
+        .toArray();
+      const bySignal: Record<string, number> = {};
+      for (const row of this.sql
+        .exec(`SELECT signal, COUNT(*) AS n FROM journal_ledger GROUP BY signal`)
+        .toArray()) {
+        bySignal[String(row.signal)] = Number(row.n ?? 0);
+      }
+      return {
+        objects,
+        bytes: Number(this.sql.exec(`SELECT COALESCE(SUM(size),0) AS n FROM journal_ledger`).toArray()[0]?.n ?? 0),
+        pending: Number(pendingRow[0]?.n ?? 0),
+        by_signal: bySignal,
+        pending_by_signal: bySignal,
+        oldest_received_at: null,
+        truncated: false,
+        scanned: objects,
+      };
+    }
+    const listed = await listAllJournalObjects(this.bucket, Math.max(1, maxObjects));
+    const covered = this.coveredKeySet(listed.objects.map((o) => o.key));
+    const bySignal: Record<string, number> = {};
+    const pendingBySignal: Record<string, number> = {};
+    let bytes = 0;
+    let pending = 0;
+    let oldest: number | null = null;
+    for (const object of listed.objects) {
+      bytes += object.size;
+      bySignal[object.signal] = (bySignal[object.signal] ?? 0) + 1;
+      if (oldest === null || object.received_at < oldest) oldest = object.received_at;
+      if (!covered.has(object.key)) {
+        pending += 1;
+        pendingBySignal[object.signal] = (pendingBySignal[object.signal] ?? 0) + 1;
+      }
+    }
+    return {
+      objects: listed.objects.length,
+      bytes,
+      pending,
+      by_signal: bySignal,
+      pending_by_signal: pendingBySignal,
+      oldest_received_at: oldest,
+      truncated: listed.truncated,
+      scanned: listed.scanned,
+    };
+  }
+
+  /** Which of these journal keys are already attributed to a verified segment. */
+  async coverageLookup(keys: string[]): Promise<{ covered: string[]; excluded: string[] }> {
+    await this.ensureLoaded();
+    const covered: string[] = [];
+    const excluded: string[] = [];
+    for (const chunk of chunkKeys(keys, 90)) {
+      const placeholders = chunk.map(() => "?").join(",");
+      for (const row of this.sql
+        .exec(
+          `SELECT c.journal_key FROM segment_coverage c
+             JOIN segment_manifest s ON s.segment_key = c.segment_key
+            WHERE s.status = 'verified' AND c.journal_key IN (${placeholders})`,
+          ...chunk,
+        )
+        .toArray()) {
+        covered.push(String(row.journal_key));
+      }
+      for (const row of this.sql
+        .exec(`SELECT journal_key FROM excluded_journal WHERE journal_key IN (${placeholders})`, ...chunk)
+        .toArray()) {
+        excluded.push(String(row.journal_key));
+      }
+    }
+    return { covered, excluded };
+  }
+
+  private coveredKeySet(keys: string[]): Set<string> {
+    const set = new Set<string>();
+    for (const chunk of chunkKeys(keys, 90)) {
+      const placeholders = chunk.map(() => "?").join(",");
+      for (const row of this.sql
+        .exec(
+          `SELECT c.journal_key FROM segment_coverage c
+             JOIN segment_manifest s ON s.segment_key = c.segment_key
+            WHERE s.status = 'verified' AND c.journal_key IN (${placeholders})`,
+          ...chunk,
+        )
+        .toArray()) {
+        set.add(String(row.journal_key));
+      }
+    }
+    return set;
+  }
+
+  // ------------------------------------------------- discovery floor (D3.1)
+
+  /** Persisted discovery cursor; `null` means "scan from the beginning". */
+  async discoveryFloor(): Promise<{ floor_ms: number | null }> {
+    await this.ensureLoaded();
+    return { floor_ms: this.metaValue("discovery_floor_ms") };
+  }
+
+  /** Advances the discovery cursor. Never moves it backwards. */
+  async setDiscoveryFloor(floorMs: number): Promise<{ floor_ms: number }> {
+    await this.ensureLoaded();
+    const current = this.metaValue("discovery_floor_ms");
+    const next = current === null ? Math.max(0, Math.floor(floorMs)) : Math.max(current, Math.floor(floorMs));
+    this.setMeta("discovery_floor_ms", next);
+    return { floor_ms: next };
+  }
+
+  // ------------------------------------------------------ revoked exclusion
+
+  /** Durably records journal objects excluded because their token was revoked. */
+  async recordExcludedRevoked(entries: ExcludedJournalInput[]): Promise<{ recorded: number }> {
+    await this.ensureLoaded();
+    const now = this.now();
+    const recorded = entries.reduce((n, entry) => n + this.recordExcludedRow(entry, now), 0);
+    if (recorded > 0) this.bump("revoked_excluded_recorded", recorded);
+    return { recorded };
+  }
+
+  private recordExcludedRow(entry: ExcludedJournalInput, now: number): number {
+    const cursor = this.sql.exec(
+      `INSERT INTO excluded_journal (journal_key, token_id, instance_id, received_at, size, excluded_at)
+       VALUES (?,?,?,?,?,?)
+       ON CONFLICT (journal_key) DO NOTHING`,
+      entry.key,
+      entry.token_id,
+      entry.instance_id,
+      entry.received_at,
+      entry.size,
+      now,
     );
-    const oldestRow = this.sql
+    return cursor.rowsWritten ?? 0;
+  }
+
+  /** Excluded journal objects, newest first (audit/diagnostics). */
+  async listExcluded(limit: number): Promise<{ entries: ExcludedJournalInput[]; total: number }> {
+    await this.ensureLoaded();
+    const rows = this.sql
       .exec(
-        `SELECT MIN(j.received_at) AS m FROM journal_ledger j
-           LEFT JOIN segment_coverage c ON c.journal_key = j.object_key
-          WHERE c.journal_key IS NULL`,
+        `SELECT journal_key, token_id, instance_id, received_at, size FROM excluded_journal
+          ORDER BY received_at DESC LIMIT ?`,
+        Math.max(1, Math.min(limit, 1000)),
       )
       .toArray();
-    const oldest = oldestRow[0]?.m == null ? null : Number(oldestRow[0].m);
+    const total = Number(this.sql.exec(`SELECT COUNT(*) AS n FROM excluded_journal`).toArray()[0]?.n ?? 0);
+    return {
+      entries: rows.map((row) => ({
+        key: String(row.journal_key),
+        token_id: String(row.token_id),
+        instance_id: String(row.instance_id),
+        received_at: Number(row.received_at),
+        size: Number(row.size),
+      })),
+      total,
+    };
+  }
+
+  /** Storage/retention/backlog health for the compaction subsystem. */
+  async compactionStatus(): Promise<Record<string, unknown>> {
+    await this.ensureLoaded();
+    const now = this.now();
+    const listed = await this.journalStats();
+    const oldest = listed.oldest_received_at;
     const lease = this.sql
       .exec(`SELECT holder, fencing, expires_at FROM compaction_lease WHERE partition = 'primary'`)
       .toArray();
     return {
-      unprocessed_journal: pending,
+      unprocessed_journal: listed.pending,
       oldest_backlog_age_ms: oldest === null ? null : now - oldest,
       completed_segments: this.countSegments(),
       coverage_rows: this.countCoverage(),
       covered_bytes: Number(
         this.sql.exec(`SELECT COALESCE(SUM(size_bytes),0) AS n FROM segment_manifest`).toArray()[0]?.n ?? 0,
       ),
-      journal_bytes: Number(
-        this.sql.exec(`SELECT COALESCE(SUM(size),0) AS n FROM journal_ledger`).toArray()[0]?.n ?? 0,
+      journal_bytes: listed.bytes,
+      journal_objects: listed.objects,
+      journal_pending_by_signal: listed.pending_by_signal,
+      journal_listing_truncated: listed.truncated,
+      excluded_revoked: Number(
+        this.sql.exec(`SELECT COUNT(*) AS n FROM excluded_journal`).toArray()[0]?.n ?? 0,
       ),
       late_segments: Number(
         this.sql.exec(`SELECT COUNT(*) AS n FROM segment_manifest WHERE late = 1`).toArray()[0]?.n ?? 0,
@@ -1113,6 +1348,7 @@ export class IngestCore {
       last_success_at: this.metaValue("last_success_at"),
       last_failure_at: this.metaValue("last_failure_at"),
       consecutive_failures: this.metaValue("consecutive_failures") ?? 0,
+      discovery_floor_ms: this.metaValue("discovery_floor_ms"),
       lease:
         lease.length === 0
           ? null
@@ -1127,9 +1363,14 @@ export class IngestCore {
   }
 
   /**
-   * Lists covered journal objects eligible for GC. A verified segment must
-   * cover the object, the retention window must have elapsed (unless force) and
-   * the object's segment range must not overlap an active shot pin.
+   * Lists journal objects eligible for GC.
+   *
+   * Two classes (spec 023):
+   *   * revoked-excluded objects are always eligible (never pinned, no
+   *     retention: revoked data must never be analysed);
+   *   * covered objects are eligible once a verified segment covers them, the
+   *     retention window has elapsed (unless forced) and their segment range
+   *     does not overlap an active shot pin.
    */
   async listGCEligible(opts: {
     now: number;
@@ -1139,25 +1380,47 @@ export class IngestCore {
   }): Promise<{ candidates: GCandidate[]; protected: number; considered: number }> {
     await this.ensureLoaded();
     const limit = Math.max(1, Math.min(opts.limit, 5000));
-    const rows = this.sql
+    const candidates: GCandidate[] = [];
+    let protectedCount = 0;
+
+    // Revoked-excluded objects: eligible immediately.
+    const excludedRows = this.sql
       .exec(
-        `SELECT c.journal_key, j.size, c.received_at, c.instance_id, c.segment_key,
-                s.first_received_at, s.last_received_at
-           FROM segment_coverage c
-           JOIN segment_manifest s ON s.segment_key = c.segment_key
-           JOIN journal_ledger j ON j.object_key = c.journal_key
-          WHERE s.status = 'verified'
-          ORDER BY c.received_at ASC
-          LIMIT ?`,
+        `SELECT journal_key, size, received_at, instance_id FROM excluded_journal
+          ORDER BY received_at ASC LIMIT ?`,
         limit,
       )
       .toArray();
+    for (const row of excludedRows) {
+      candidates.push({
+        key: String(row.journal_key),
+        size: Number(row.size ?? 0),
+        received_at: Number(row.received_at),
+        instance_id: String(row.instance_id),
+        segment_key: "",
+      });
+    }
+
+    const remaining = Math.max(0, limit - candidates.length);
+    const rows = remaining === 0
+      ? []
+      : this.sql
+          .exec(
+            `SELECT c.journal_key, j.size, c.received_at, c.instance_id, c.segment_key,
+                    s.first_received_at, s.last_received_at
+               FROM segment_coverage c
+               JOIN segment_manifest s ON s.segment_key = c.segment_key
+               LEFT JOIN journal_ledger j ON j.object_key = c.journal_key
+              WHERE s.status = 'verified' AND c.deleted_from_r2 = 0
+              ORDER BY c.received_at ASC
+              LIMIT ?`,
+            remaining,
+          )
+          .toArray();
     const pins = this.sql
       .exec(`SELECT shot_id, instance_id, from_ms, to_ms, expires_at FROM segment_pins`)
       .toArray();
     const cutoff = opts.now - opts.retention_ms;
-    const candidates: GCandidate[] = [];
-    let protectedCount = 0;
     for (const row of rows) {
       const segFirst = Number(row.first_received_at);
       const segLast = Number(row.last_received_at);
@@ -1168,21 +1431,26 @@ export class IngestCore {
       }
       const receivedAt = Number(row.received_at);
       if (!opts.force && (opts.retention_ms <= 0 || receivedAt > cutoff)) continue;
+      let size = Number(row.size ?? 0);
+      if (!Number.isFinite(size) || size <= 0) {
+        const head = await this.bucket?.head?.(String(row.journal_key));
+        size = head?.size ?? 0;
+      }
       candidates.push({
         key: String(row.journal_key),
-        size: Number(row.size),
+        size,
         received_at: receivedAt,
         instance_id: instanceId,
         segment_key: String(row.segment_key),
       });
     }
-    return { candidates, protected: protectedCount, considered: rows.length };
+    return { candidates, protected: protectedCount, considered: excludedRows.length + rows.length };
   }
 
   /**
-   * Removes the durable ledger rows for covered journal objects. Only objects
-   * already attributed to a *verified* segment may be dropped; a concurrent
-   * re-publish can never resurrect them.
+   * Marks journal objects as deleted from R2. Only objects already attributed
+   * to a *verified* segment (or explicitly excluded for revocation) may be
+   * marked; the coverage row is retained so compaction never resurrects them.
    */
   async deleteJournalKeys(keys: string[]): Promise<{ deleted: number }> {
     await this.ensureLoaded();
@@ -1196,9 +1464,14 @@ export class IngestCore {
           key,
         )
         .toArray();
-      if (covered.length === 0) continue;
-      const cursor = this.sql.exec(`DELETE FROM journal_ledger WHERE object_key = ?`, key);
-      deleted += cursor.rowsWritten ?? 0;
+      const excluded = this.sql
+        .exec(`SELECT 1 AS one FROM excluded_journal WHERE journal_key = ?`, key)
+        .toArray();
+      if (covered.length === 0 && excluded.length === 0) continue;
+      this.sql.exec(`UPDATE segment_coverage SET deleted_from_r2 = 1 WHERE journal_key = ?`, key);
+      this.sql.exec(`DELETE FROM excluded_journal WHERE journal_key = ?`, key);
+      this.sql.exec(`DELETE FROM journal_ledger WHERE object_key = ?`, key);
+      deleted += 1;
     }
     if (deleted > 0) this.bump("gc_deleted", deleted);
     return { deleted };
@@ -1378,6 +1651,7 @@ export class IngestCore {
             ok: body.ok === true,
             segments_published: numberOrUndefined(body.segments_published),
             bytes_published: numberOrUndefined(body.bytes_published),
+            excluded_revoked: numberOrUndefined(body.excluded_revoked),
             error: typeof body.error === "string" ? body.error : null,
           }),
         );
@@ -1395,6 +1669,58 @@ export class IngestCore {
         const fromMS = typeof body.from_ms === "number" && Number.isFinite(body.from_ms) ? body.from_ms : 0;
         const toMS = typeof body.to_ms === "number" && Number.isFinite(body.to_ms) ? body.to_ms : Number.MAX_SAFE_INTEGER;
         return json(200, await this.pendingJournalInRange(instanceIds, fromMS, toMS));
+      }
+      if (path === "/internal/compaction/journal") {
+        if (request.method !== "GET") return json(405, { error: "method not allowed" });
+        return json(200, await this.journalStats());
+      }
+      if (path === "/internal/compaction/coverage") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ keys?: string[] }>(request);
+        const keys = Array.isArray(body.keys) ? body.keys.filter((k): k is string => typeof k === "string") : [];
+        return json(200, await this.coverageLookup(keys));
+      }
+      if (path === "/internal/compaction/excluded") {
+        if (request.method === "POST") {
+          const body = await readJson<{ entries?: ExcludedJournalInput[] }>(request);
+          const entries: ExcludedJournalInput[] = [];
+          for (const raw of body.entries ?? []) {
+            if (
+              !raw ||
+              typeof raw.key !== "string" ||
+              raw.key === "" ||
+              typeof raw.token_id !== "string" ||
+              typeof raw.instance_id !== "string" ||
+              typeof raw.received_at !== "number" ||
+              typeof raw.size !== "number"
+            ) {
+              return json(400, { error: "invalid excluded entry", code: "bad_request" });
+            }
+            entries.push({
+              key: raw.key,
+              token_id: raw.token_id,
+              instance_id: raw.instance_id,
+              received_at: raw.received_at,
+              size: raw.size,
+            });
+          }
+          return json(200, await this.recordExcludedRevoked(entries));
+        }
+        if (request.method === "GET") {
+          return json(200, await this.listExcluded(500));
+        }
+        return json(405, { error: "method not allowed" });
+      }
+      if (path === "/internal/compaction/discovery") {
+        if (request.method === "GET") return json(200, await this.discoveryFloor());
+        if (request.method === "POST") {
+          const body = await readJson<{ floor_ms?: number }>(request);
+          if (typeof body.floor_ms !== "number" || !Number.isFinite(body.floor_ms)) {
+            return json(400, { error: "floor_ms is required", code: "bad_request" });
+          }
+          return json(200, await this.setDiscoveryFloor(body.floor_ms));
+        }
+        return json(405, { error: "method not allowed" });
       }
       if (path === "/internal/compaction/gc/list") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
@@ -1659,6 +1985,13 @@ function numberOrUndefined(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
+/** Splits key arrays so a SQL `IN (...)` never exceeds the variable limit. */
+function chunkKeys(keys: string[], size: number): string[][] {
+  const chunks: string[][] = [];
+  for (let i = 0; i < keys.length; i += size) chunks.push(keys.slice(i, i + size));
+  return chunks;
+}
+
 /** Bounds a compaction plan request so the coordinator can never over-ask. */
 function normalizePlanOptions(raw: Partial<CompactionPlanOptions> | undefined): CompactionPlanOptions {
   const bounded = (v: unknown, def: number, max: number): number =>
@@ -1775,7 +2108,13 @@ export function validateSegmentPublish(raw: Partial<SegmentPublishInput> | undef
     if (typeof entry.received_at !== "number" || !Number.isFinite(entry.received_at)) {
       return { ok: false, error: "coverage.received_at is required" };
     }
-    coverage.push({ journal_key: entry.journal_key, signal: entry.signal, received_at: entry.received_at });
+    coverage.push({
+      journal_key: entry.journal_key,
+      signal: entry.signal,
+      received_at: entry.received_at,
+      instance_id:
+        typeof entry.instance_id === "string" && entry.instance_id !== "" ? entry.instance_id : undefined,
+    });
   }
   const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : 0);
   const nullable = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);

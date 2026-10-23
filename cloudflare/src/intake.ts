@@ -1,48 +1,41 @@
-// Durable continuous OTLP/HTTP intake (spec 014).
+// Durable continuous OTLP/HTTP intake (spec 014), retrofitted for a DO-free
+// hot path (spec 023, D1/D2).
 //
 // The stable `/ingest/v1/{traces,metrics,logs}` endpoints authenticate a
-// push-only *instance* token (token -> instance, never token -> shot) and then
+// push-only *instance* token (token -> instance, never token -> shot) and
 // durably journal the raw export into R2 before acknowledging it with a valid
 // OTLP ExportResponse.
 //
-// Durability boundary (hard requirement):
-//   1. authenticate the instance token (before any disk/bucket write);
+// Hot path (no Durable Object call on a cache hit):
+//   1. admit the instance token from memory -> KV -> authoritative ControlDO;
 //   2. validate the body (protobuf/gzip/JSON) — malformed input is rejected;
 //   3. PUT the original, unmodified bytes to a unique, server-generated R2
-//      object (`journal/{instance_id}/{signal}/{received_at}-{id}.bin`);
-//   4. commit a durable ledger row in the IngestDO;
+//      object (`journal/{instance_id}/{signal}/{received_at}-{id}.bin`) with
+//      `token_id` in custom metadata (used by compaction-time revocation);
+//   4. late-write guard: if the PUT completed after
+//      `received_at + LATE_WRITE_LIMIT_MS`, delete it and answer 503 so the
+//      exporter retries with a fresh `received_at`;
 //   5. only then return OTLP 200.
 //
-// If step 3 or 4 fails the request fails closed with a retryable 5xx, so an
-// upstream exporter retries. Duplicate delivery under upstream retry is bounded
-// and documented: each accepted export is a distinct, immutable object and the
-// ledger is idempotent on the object key.
+// There is no `journal_ledger` write and no `/internal/journal/commit` on the
+// ingest path. Counters go to Workers Analytics Engine (best effort) and the
+// compactor discovers work by listing R2 (spec 023, D3).
 //
-// No runtime Container is involved in acknowledging intake: the Worker writes
-// directly to R2 and the IngestDO.
+// If step 3 fails the request fails closed with a retryable 5xx, so an upstream
+// exporter retries. Duplicate delivery under upstream retry is bounded and
+// documented: each accepted export is a distinct, immutable object, and
+// compaction de-duplicates by key/sha256 against the manifest.
 
+import { admitInstanceToken } from "./admission";
+import { recordIngestPoint } from "./analytics";
 import { extractToken } from "./auth";
 import { sha256HexBytes } from "./crypto";
-import { DO_ORIGIN, JOURNAL_PREFIX, maxIngestBytes } from "./env";
-import type { AppEnv, DoStubLike } from "./env";
+import { JOURNAL_PREFIX, lateWriteLimitMs, maxIngestBytes } from "./env";
+import type { AppEnv } from "./env";
 import { badRequest, HttpError } from "./errors";
 import { json } from "./http";
-import { INGEST_DO_NAME } from "./ingest-core";
-import type { InstanceAdmitResult } from "./ingest-core";
 import { randomHexId } from "./crypto";
 import type { Signal } from "./store";
-
-export interface JournalCommitBody {
-  key: string;
-  instance_id: string;
-  instance: string;
-  signal: Signal;
-  size: number;
-  sha256: string;
-  content_type: string;
-  content_encoding: string;
-  received_at: number;
-}
 
 const PROTOBUF_TYPES = new Set(["application/x-protobuf", "application/protobuf", "application/vnd.google.protobuf"]);
 const JSON_TYPES = new Set(["application/json"]);
@@ -53,12 +46,19 @@ export async function handleInstanceIngest(
   env: AppEnv,
   signal: Signal,
 ): Promise<Response> {
-  const stub = env.INGEST_DO.getByName(INGEST_DO_NAME);
-
-  // 1. Authenticate first — before any body read or durable write.
+  const clock = env.now ?? (() => Date.now());
+  const receivedAt = clock();
   const token = extractToken(request);
-  const admitted = await callJson<InstanceAdmitResult>(stub, "/internal/instance/admit", "POST", { token });
+  const admitted = await admitInstanceToken(env, token, receivedAt);
   if (!admitted.ok) {
+    recordIngestPoint(env, {
+      status: "rejected",
+      reason: `invalid_token_${admitted.reason}`,
+      signal,
+      bytes: 0,
+      received_at: receivedAt,
+      duration_ms: clock() - receivedAt,
+    });
     return json(401, {
       error: `instance token ${admitted.reason}`,
       code: `instance_token_${admitted.reason}`,
@@ -68,74 +68,103 @@ export async function handleInstanceIngest(
 
   const contentType = normalizeContentType(request.headers.get("content-type"));
   const contentEncoding = normalizeContentEncoding(request.headers.get("content-encoding"));
+  let bytes = new Uint8Array(0);
 
-  // Respect the request size bound before buffering anything durable.
-  const declared = Number(request.headers.get("content-length") ?? "");
-  const limit = maxIngestBytes(env);
-  if (Number.isFinite(declared) && declared > limit) {
-    throw new HttpError(413, `OTLP body exceeds the ${limit}-byte limit`, false, "payload_too_large");
-  }
-  const bytes = new Uint8Array(await request.arrayBuffer());
-  if (bytes.byteLength === 0) throw badRequest("empty OTLP body");
-  if (bytes.byteLength > limit) {
-    throw new HttpError(413, `OTLP body exceeds the ${limit}-byte limit`, false, "payload_too_large");
-  }
-
-  // 2. Validate before persisting so malformed input never becomes durable.
-  await validateBody(bytes, contentType, contentEncoding, signal);
-
-  if (!env.BUCKET) {
-    throw new HttpError(503, "durable journal bucket is not configured", true, "journal_unavailable");
-  }
-
-  const receivedAt = Date.now();
-  const key = journalKey(admitted.instance_id, signal, receivedAt);
-  const sha256 = await sha256HexBytes(bytes);
-
-  // 3. Durable raw journal write, preserving the original bytes and encoding.
   try {
-    const object = await env.BUCKET.put(key, bytes, {
-      sha256,
-      httpMetadata: { contentType: contentType || "application/octet-stream" },
-      customMetadata: {
-        signal,
-        instance_id: admitted.instance_id,
-        instance: admitted.instance_name,
-        received_at: String(receivedAt),
+    // Respect the request size bound before buffering anything durable.
+    const declared = Number(request.headers.get("content-length") ?? "");
+    const limit = maxIngestBytes(env);
+    if (Number.isFinite(declared) && declared > limit) {
+      throw new HttpError(413, `OTLP body exceeds the ${limit}-byte limit`, false, "payload_too_large");
+    }
+    bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.byteLength === 0) throw badRequest("empty OTLP body");
+    if (bytes.byteLength > limit) {
+      throw new HttpError(413, `OTLP body exceeds the ${limit}-byte limit`, false, "payload_too_large");
+    }
+
+    // Validate before persisting so malformed input never becomes durable.
+    await validateBody(bytes, contentType, contentEncoding, signal);
+
+    if (!env.BUCKET) {
+      throw new HttpError(503, "durable journal bucket is not configured", true, "journal_unavailable");
+    }
+
+    const key = journalKey(admitted.instance_id, signal, receivedAt);
+    const sha256 = await sha256HexBytes(bytes);
+
+    // Durable raw journal write, preserving the original bytes and encoding.
+    try {
+      const object = await env.BUCKET.put(key, bytes, {
         sha256,
-        content_encoding: contentEncoding,
-      },
+        httpMetadata: { contentType: contentType || "application/octet-stream" },
+        customMetadata: {
+          signal,
+          instance_id: admitted.instance_id,
+          instance: admitted.instance_name,
+          token_id: admitted.token_id,
+          received_at: String(receivedAt),
+          sha256,
+          content_encoding: contentEncoding,
+          content_type: contentType,
+        },
+      });
+      if (!object) throw new Error("R2 PUT returned null");
+    } catch (error) {
+      throw new HttpError(
+        503,
+        `durable journal write failed: ${error instanceof Error ? error.message : String(error)}`,
+        true,
+        "journal_write_failed",
+      );
+    }
+
+    // Late-write guard: a very slow PUT may land after the compactor could have
+    // finalized (and later re-listed) the time bucket. Delete it and let the
+    // exporter retry, so every acknowledged object is safely inside grace.
+    const completedAt = clock();
+    const lateLimit = lateWriteLimitMs(env);
+    if (lateLimit > 0 && completedAt - receivedAt > lateLimit) {
+      await env.BUCKET.delete?.(key).catch(() => undefined);
+      throw new HttpError(
+        503,
+        `journal write completed ${completedAt - receivedAt}ms after receipt, above the ${lateLimit}ms limit`,
+        true,
+        "late_write",
+      );
+    }
+
+    recordIngestPoint(env, {
+      status: "accepted",
+      signal,
+      instance_id: admitted.instance_id,
+      instance: admitted.instance_name,
+      token_id: admitted.token_id,
+      bytes: bytes.byteLength,
+      received_at: receivedAt,
+      duration_ms: completedAt - receivedAt,
     });
-    if (!object) throw new Error("R2 PUT returned null");
+
+    return exportResponse(contentType, {
+      "x-burstel-instance-id": admitted.instance_id,
+      "x-burstel-instance": admitted.instance_name,
+      "x-burstel-disposition": "journaled",
+    });
   } catch (error) {
-    throw new HttpError(
-      503,
-      `durable journal write failed: ${error instanceof Error ? error.message : String(error)}`,
-      true,
-      "journal_write_failed",
-    );
+    const reason = error instanceof HttpError ? error.code : "internal";
+    recordIngestPoint(env, {
+      status: "rejected",
+      reason,
+      signal,
+      instance_id: admitted.instance_id,
+      instance: admitted.instance_name,
+      token_id: admitted.token_id,
+      bytes: bytes.byteLength,
+      received_at: receivedAt,
+      duration_ms: clock() - receivedAt,
+    });
+    throw error;
   }
-
-  // 4. Durable ledger index; a failure here fails the ACK so the exporter retries.
-  const body: JournalCommitBody = {
-    key,
-    instance_id: admitted.instance_id,
-    instance: admitted.instance_name,
-    signal,
-    size: bytes.byteLength,
-    sha256,
-    content_type: contentType,
-    content_encoding: contentEncoding,
-    received_at: receivedAt,
-  };
-  await callJson(stub, "/internal/journal/commit", "POST", body);
-
-  // 5. Durable in R2 + ledger: acknowledge with the signal-specific response.
-  return exportResponse(contentType, {
-    "x-burstel-instance-id": admitted.instance_id,
-    "x-burstel-instance": admitted.instance_name,
-    "x-burstel-disposition": "journaled",
-  });
 }
 
 /** Server-generated, unique, path-safe R2 key for one accepted export. */
@@ -271,36 +300,4 @@ function readVarint(bytes: Uint8Array, start: number): { value: number; next: nu
     if (shift > 63) return null;
   }
   return null;
-}
-
-async function callJson<T>(stub: DoStubLike, path: string, method: string, body?: unknown): Promise<T> {
-  const init: RequestInit = { method };
-  if (body !== undefined) {
-    init.headers = { "content-type": "application/json" };
-    init.body = JSON.stringify(body);
-  }
-  let resp: Response;
-  try {
-    resp = await stub.fetch(new Request(`${DO_ORIGIN}${path}`, init));
-  } catch (error) {
-    throw new HttpError(
-      503,
-      `ingest coordinator unreachable: ${error instanceof Error ? error.message : String(error)}`,
-      true,
-      "ingest_unavailable",
-    );
-  }
-  if (resp.status >= 200 && resp.status < 300) return (await resp.json()) as T;
-  let message = `ingest coordinator request failed with status ${resp.status}`;
-  let code = "error";
-  let retryable = resp.status >= 500;
-  try {
-    const parsed = (await resp.json()) as { error?: string; code?: string; retryable?: boolean };
-    if (parsed.error) message = parsed.error;
-    if (parsed.code) code = parsed.code;
-    if (parsed.retryable !== undefined) retryable = parsed.retryable === true;
-  } catch {
-    // keep defaults
-  }
-  throw new HttpError(resp.status, message, retryable, code);
 }

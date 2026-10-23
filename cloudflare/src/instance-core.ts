@@ -1,7 +1,7 @@
 // Named-instance registry and push-only instance credentials (spec 014).
 //
 // This core is deliberately free of Cloudflare-specific globals so the exact
-// same logic runs in production (over `IngestDO` SQLite storage) and in unit
+// same logic runs in production (over `ControlDO` SQLite storage) and in unit
 // tests (over `bun:sqlite`). It owns:
 //
 //   * the named logical *instance* registry — an explicit, normalized name maps
@@ -79,6 +79,8 @@ export interface InstanceAdmitSuccess {
   ok: true;
   instance_id: string;
   instance_name: string;
+  /** Stable token id, recorded with each journal object for D3 exclusion. */
+  token_id: string;
   expires_at: number;
 }
 
@@ -115,7 +117,8 @@ const SCHEMA_STATEMENTS: string[] = [
      issued_at    INTEGER NOT NULL,
      expires_at   INTEGER NOT NULL,
      revoked      INTEGER NOT NULL DEFAULT 0,
-     grace_until  INTEGER
+     grace_until  INTEGER,
+     revoked_at   INTEGER
    )`,
   `CREATE INDEX IF NOT EXISTS instance_token_instance ON instance_token (instance_id)`,
 ];
@@ -162,6 +165,27 @@ interface InstanceTokenRow {
   expires_at: number;
   revoked: number;
   grace_until: number | null;
+  revoked_at: number | null;
+}
+
+/** One token digest, exposed only on internal control-plane routes. */
+export interface InstanceTokenDigest {
+  digest: string;
+  token_id: string;
+  instance_id: string;
+  instance: string;
+  issued_at: number;
+  expires_at: number;
+  revoked: boolean;
+  grace_until: number | null;
+  revoked_at: number | null;
+}
+
+/** Effective revocation instant: a grace token is revoked when it stops working. */
+export interface InstanceTokenRevocation {
+  token_id: string;
+  revoked_at: number | null;
+  expires_at: number;
 }
 
 export class InstanceCore {
@@ -183,6 +207,19 @@ export class InstanceCore {
 
   async load(): Promise<void> {
     for (const stmt of SCHEMA_STATEMENTS) this.sql.exec(stmt);
+    // Additive migration for an `instance_token` table created before spec 023.
+    for (const stmt of [
+      `ALTER TABLE instance_token ADD COLUMN revoked_at INTEGER`,
+      // Legacy revoked rows have no recorded instant. Excluding from their issue
+      // time is conservative (over-exclusion is safe for analysis).
+      `UPDATE instance_token SET revoked_at = issued_at WHERE revoked = 1 AND revoked_at IS NULL`,
+    ]) {
+      try {
+        this.sql.exec(stmt);
+      } catch {
+        // Column already exists.
+      }
+    }
     this.loaded = true;
   }
 
@@ -267,8 +304,8 @@ export class InstanceCore {
     const issuedAt = this.now();
     const expiresAt = issuedAt + INSTANCE_TOKEN_TTL_MS;
     this.sql.exec(
-      `INSERT INTO instance_token (digest, token_id, instance_id, issued_at, expires_at, revoked, grace_until)
-       VALUES (?, ?, ?, ?, ?, 0, NULL)`,
+      `INSERT INTO instance_token (digest, token_id, instance_id, issued_at, expires_at, revoked, grace_until, revoked_at)
+       VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)`,
       digest,
       id,
       instance.instance_id,
@@ -319,8 +356,9 @@ export class InstanceCore {
     if (!instance) throw notFound(`unknown instance ${normalized}`);
     if (typeof id !== "string" || id.trim() === "") return { revoked: false, id };
     const cursor = this.sql.exec(
-      `UPDATE instance_token SET revoked = 1, grace_until = NULL
-        WHERE token_id = ? AND instance_id = ?`,
+      `UPDATE instance_token SET revoked = 1, grace_until = NULL, revoked_at = ?
+        WHERE token_id = ? AND instance_id = ? AND revoked = 0`,
+      this.now(),
       id,
       instance.instance_id,
     );
@@ -354,8 +392,86 @@ export class InstanceCore {
       ok: true,
       instance_id: instance.instance_id,
       instance_name: instance.name,
+      token_id: match.token_id,
       expires_at: match.expires_at,
     };
+  }
+
+  /**
+   * One-shot backfill source (spec 023, D1.4): every live (non-revoked,
+   * unexpired) token digest with the exact grant the Worker caches. Internal
+   * only: a raw digest is a credential-adjacent value and never leaves the
+   * trusted control plane.
+   */
+  async listLiveTokenDigests(): Promise<{ tokens: InstanceTokenDigest[] }> {
+    await this.ensureLoaded();
+    const now = this.now();
+    const tokens: InstanceTokenDigest[] = [];
+    for (const row of this.tokenRows()) {
+      if (row.revoked === 1) continue;
+      if (now >= row.expires_at) continue;
+      const instance = this.instanceById(row.instance_id);
+      tokens.push({
+        digest: row.digest,
+        token_id: row.token_id,
+        instance_id: row.instance_id,
+        instance: instance?.name ?? "",
+        issued_at: row.issued_at,
+        expires_at: row.expires_at,
+        revoked: false,
+        grace_until: row.grace_until,
+        revoked_at: row.revoked_at,
+      });
+    }
+    return { tokens };
+  }
+
+  /** All token digests for one instance; used to invalidate KV on rotate/revoke. */
+  async listTokenDigests(name: string): Promise<{ tokens: InstanceTokenDigest[] }> {
+    await this.ensureLoaded();
+    const normalized = normalizeInstanceName(name);
+    requireName(normalized);
+    const instance = this.instanceByName(normalized);
+    if (!instance) throw notFound(`unknown instance ${normalized}`);
+    const tokens = this.tokenRows()
+      .filter((row) => row.instance_id === instance.instance_id)
+      .map((row) => ({
+        digest: row.digest,
+        token_id: row.token_id,
+        instance_id: row.instance_id,
+        instance: instance.name,
+        issued_at: row.issued_at,
+        expires_at: row.expires_at,
+        revoked: row.revoked === 1,
+        grace_until: row.grace_until,
+        revoked_at: row.revoked_at,
+      }));
+    return { tokens };
+  }
+
+  /**
+   * Effective revocation instants for the compactor (spec 023, D3.2).
+   *
+   * A rotated token is still accepted until `grace_until`; its effective
+   * revocation instant is therefore `max(revoked_at, grace_until)`. An object
+   * with `received_at >= effective_revoked_at` is excluded from segments.
+   */
+  async tokenRevocations(tokenIds: string[]): Promise<{ revocations: InstanceTokenRevocation[] }> {
+    await this.ensureLoaded();
+    if (tokenIds.length === 0) return { revocations: [] };
+    const wanted = new Set(tokenIds.filter((id) => id !== ""));
+    const revocations: InstanceTokenRevocation[] = [];
+    for (const row of this.tokenRows()) {
+      if (!wanted.has(row.token_id) || row.revoked !== 1) continue;
+      const grace = row.grace_until ?? 0;
+      const revokedAt = Math.max(row.revoked_at ?? 0, grace);
+      revocations.push({
+        token_id: row.token_id,
+        revoked_at: revokedAt > 0 ? revokedAt : null,
+        expires_at: row.expires_at,
+      });
+    }
+    return { revocations };
   }
 
   // ----------------------------------------------------------- internal
@@ -409,6 +525,26 @@ export class InstanceCore {
         }
         return json(200, await this.revoke(body.name, body.id));
       }
+      if (path === "/internal/instance/token/digests") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ name?: string }>(request);
+        if (typeof body.name !== "string" || body.name.trim() === "") {
+          return json(400, { error: "name is required", code: "bad_request" });
+        }
+        return json(200, await this.listTokenDigests(body.name));
+      }
+      if (path === "/internal/instance/token/live") {
+        if (request.method !== "GET") return json(405, { error: "method not allowed" });
+        return json(200, await this.listLiveTokenDigests());
+      }
+      if (path === "/internal/instance/token/revocations") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ token_ids?: string[] }>(request);
+        const ids = Array.isArray(body.token_ids)
+          ? body.token_ids.filter((id): id is string => typeof id === "string")
+          : [];
+        return json(200, await this.tokenRevocations(ids));
+      }
       if (path === "/internal/instance/admit") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
         const body = await readJson<{ token?: string | null }>(request);
@@ -423,10 +559,12 @@ export class InstanceCore {
   // ------------------------------------------------------------ helpers
 
   private revokeActiveTokens(instanceId: string, grace: number): number {
+    const now = this.now();
     const cursor = this.sql.exec(
-      `UPDATE instance_token SET revoked = 1, grace_until = ?
+      `UPDATE instance_token SET revoked = 1, grace_until = ?, revoked_at = ?
         WHERE instance_id = ? AND revoked = 0`,
-      this.now() + grace,
+      now + grace,
+      now + grace,
       instanceId,
     );
     return cursor.rowsWritten ?? 0;
@@ -449,7 +587,7 @@ export class InstanceCore {
   private tokenRows(): InstanceTokenRow[] {
     return this.sql
       .exec(
-        `SELECT digest, token_id, instance_id, issued_at, expires_at, revoked, grace_until
+        `SELECT digest, token_id, instance_id, issued_at, expires_at, revoked, grace_until, revoked_at
            FROM instance_token`,
       )
       .toArray()
@@ -461,6 +599,7 @@ export class InstanceCore {
         expires_at: Number(row.expires_at),
         revoked: Number(row.revoked ?? 0),
         grace_until: row.grace_until == null ? null : Number(row.grace_until),
+        revoked_at: row.revoked_at == null ? null : Number(row.revoked_at),
       }));
   }
 

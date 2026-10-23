@@ -39,11 +39,12 @@ function setup(options: { adminToken?: string | null } = {}): Setup {
   let clock = 1_700_000_000_000;
   const now = () => clock;
   const shots = new FakeShotNamespace();
-  const ingest = makeIngest({ now });
+  const bucket = new FakeBucket();
+  const ingest = makeIngest({ now, bucket });
   const env: AppEnv = {
     SHOT_DO: shots,
     INGEST_DO: new FakeIngestNamespace(ingest.core),
-    BUCKET: new FakeBucket(),
+    BUCKET: bucket,
     PUBLIC_BASE_URL: "https://burstel.example",
   };
   if (options.adminToken !== null) env.BURSTEL_API_TOKEN = options.adminToken ?? TOKEN;

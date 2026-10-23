@@ -1,23 +1,25 @@
-// Compactor coordinator core (spec 018).
+// Compactor coordinator core (spec 018, retrofitted by spec 023 D3).
 //
-// This is the missing production link between the durable raw journal (spec 014)
-// and the window-shot analysis (spec 016). It is deliberately free of
+// This is the missing production link between the durable raw journal (spec
+// 014) and the window-shot analysis (spec 016). It is deliberately free of
 // Cloudflare-specific globals so the exact same orchestration runs in
-// production (a `CompactorDO` with a real Container + R2 binding + IngestDO) and
-// in bounded unit tests (a fake container + fake R2 + real SQLite IngestCore).
+// production (a `CompactorDO` with a real Container + R2 binding + ControlDO)
+// and in bounded unit tests (a fake container + fake R2 + real SQLite core).
 //
 // One bounded tick:
-//   1. acquire a fenced, single-active lease from the IngestDO (the durable
-//      source of truth — never a local DuckDB manifest);
-//   2. ask the IngestDO for the next bounded batch of *uncovered*, finalized
-//      journal objects, grouped into receive-time windows;
-//   3. stream each journal object's exact bytes into the short-lived Go
-//      compactor Container, which reuses `internal/compaction` + the decoder and
-//      returns one immutable DuckDB segment (deterministic key + checksum);
-//   4. stream the segment bytes straight into R2 (R2 itself enforces the
-//      advertised SHA-256), then HEAD-verify size/checksum;
-//   5. publish the verified manifest + exact coverage set to the IngestDO, which
-//      re-verifies the stored object before it advertises it;
+//   1. acquire a fenced, single-active lease from the ControlDO;
+//   2. discover finalized journal objects **by listing R2** (spec 023 D3.1):
+//      `received_at < now - grace`, re-listing a lookback window of at least
+//      2 x grace every run so a late object is picked up after a previous
+//      run's cursor;
+//   3. exclude objects already covered by a verified segment (key de-dup) and
+//      objects whose `token_id` was revoked at/before `received_at` (D3.2);
+//   4. group the rest into cross-instance time buckets (D3.3), stream each
+//      object's exact bytes into the short-lived Go compactor Container, and
+//      get one immutable DuckDB segment back;
+//   5. stream the segment bytes into R2 (R2 enforces the advertised SHA-256),
+//      HEAD-verify size/checksum, then publish the verified manifest + exact
+//      coverage set to the ControlDO;
 //   6. optionally GC verified, unpinned journal objects; release the lease and
 //      arm the next bounded tick.
 //
@@ -34,16 +36,22 @@ import { DO_ORIGIN } from "./env";
 import type { DoStubLike, IngestNamespaceLike } from "./env";
 import { HttpError } from "./errors";
 import { json } from "./http";
-import { INGEST_DO_NAME } from "./ingest-core";
+import {
+  INGEST_DO_NAME,
+  MULTI_INSTANCE_SCOPE,
+} from "./ingest-core";
 import type {
   CompactionBatch,
   CompactionLease,
-  CompactionPlan,
+  CompactionObject,
+  ExcludedJournalInput,
   GCandidate,
   SegmentCoverageInput,
   SegmentPublishInput,
   SegmentPublishResult,
 } from "./ingest-core";
+import { listJournalObjects } from "./journal-listing";
+import type { JournalObjectInfo } from "./journal-listing";
 
 /** The single compaction partition (one active compactor per installation). */
 export const COMPACTION_PARTITION = "primary";
@@ -53,6 +61,11 @@ export const COMPACTOR_DO_NAME = "compactor-primary";
 export interface CompactorConfig {
   windowMs: number;
   graceMs: number;
+  /**
+   * Lookback re-list window (spec 023, D3.1). Must be at least 2 x grace; a
+   * smaller configured value is raised to that floor.
+   */
+  lookbackMs: number;
   retentionMs: number;
   gcEnabled: boolean;
   batchObjects: number;
@@ -69,6 +82,7 @@ export function defaultCompactorConfig(): CompactorConfig {
   return {
     windowMs: 60_000,
     graceMs: 90_000,
+    lookbackMs: 180_000,
     retentionMs: 24 * 60 * 60 * 1000,
     gcEnabled: false,
     batchObjects: 2048,
@@ -83,7 +97,7 @@ export function defaultCompactorConfig(): CompactorConfig {
 }
 
 export interface CompactorDeps {
-  /** Durable coordinator: plan, lease, publish, GC, status. */
+  /** Durable control plane: lease, publish, GC, discovery cursor, status. */
   ingest: IngestNamespaceLike;
   /** Durable object bucket binding. Required to read the journal and store segments. */
   bucket?: R2BucketLike;
@@ -115,9 +129,15 @@ export interface TickReport {
   segments_published: number;
   bytes_published: number;
   journal_objects: number;
+  discovered_objects: number;
+  /** Objects excluded because their token was revoked before receipt (D3.2). */
+  excluded_revoked: number;
   gc_deleted: number;
   gc_protected: number;
   duration_ms: number;
+  watermark: number;
+  lookback_ms: number;
+  lookback_truncated: boolean;
   error?: string;
 }
 
@@ -139,6 +159,19 @@ interface BuildResponse {
   download_token: string;
 }
 
+interface DiscoveryResult {
+  batches: CompactionBatch[];
+  /** Every finalized, eligible object before batch caps were applied. */
+  objects: CompactionObject[];
+  /** How many of `objects` were assigned to `batches`. */
+  batched: number;
+  excluded: number;
+  watermark: number;
+  floor: number | null;
+  truncated: boolean;
+  lookback_truncated: boolean;
+}
+
 export class CompactorCore {
   private readonly ingest: IngestNamespaceLike;
   private readonly bucket?: R2BucketLike;
@@ -154,6 +187,7 @@ export class CompactorCore {
 
   private lastTickAt: number | null = null;
   private lastError: string | null = null;
+  private lastReport: TickReport | null = null;
   private schedulerActive = false;
 
   constructor(deps: CompactorDeps) {
@@ -166,6 +200,9 @@ export class CompactorCore {
     this.now = deps.now ?? (() => Date.now());
     this.holder = deps.holder;
     this.config = { ...defaultCompactorConfig(), ...(deps.config ?? {}) };
+    // A lookback shorter than two grace windows could finalize an object before
+    // a late arrival in its time bucket is visible. Raise it, never lower it.
+    this.config.lookbackMs = Math.max(this.config.lookbackMs, 2 * this.config.graceMs);
     this.scheduler = deps.scheduler;
     this.log = deps.log ?? (() => undefined);
   }
@@ -175,15 +212,21 @@ export class CompactorCore {
   /** Runs one bounded compaction tick and arms the next one. */
   async tick(): Promise<TickReport> {
     const start = Date.now();
+    const watermark = this.now() - Math.max(0, this.config.graceMs);
     const report: TickReport = {
       ok: true,
       batches: 0,
       segments_published: 0,
       bytes_published: 0,
       journal_objects: 0,
+      discovered_objects: 0,
+      excluded_revoked: 0,
       gc_deleted: 0,
       gc_protected: 0,
       duration_ms: 0,
+      watermark,
+      lookback_ms: this.config.lookbackMs,
+      lookback_truncated: false,
     };
     this.lastTickAt = this.now();
 
@@ -203,6 +246,8 @@ export class CompactorCore {
     }
 
     let lease: CompactionLease | null = null;
+    let discovery: DiscoveryResult | null = null;
+    let lastCompactedAt: number | null = null;
     try {
       lease = await this.acquireLease();
       if (!lease.ok) {
@@ -211,21 +256,32 @@ export class CompactorCore {
         return report;
       }
 
-      const plan = await this.plan();
+      discovery = await this.discover(watermark);
+      report.discovered_objects = discovery.objects.length;
+      report.excluded_revoked = discovery.excluded;
+      report.lookback_truncated = discovery.lookback_truncated;
       const deadline = start + this.config.tickBudgetMs;
-      for (const batch of plan.batches) {
-        if (Date.now() >= deadline) break;
+      let failed = false;
+      for (const batch of discovery.batches) {
+        if (Date.now() >= deadline) {
+          failed = true;
+          break;
+        }
         try {
           const published = await this.compactBatch(batch);
           report.batches += 1;
           report.segments_published += 1;
           report.bytes_published += published.size_bytes;
           report.journal_objects += batch.objects.length;
+          for (const obj of batch.objects) {
+            lastCompactedAt = Math.max(lastCompactedAt ?? obj.received_at, obj.received_at);
+          }
         } catch (error) {
           report.ok = false;
           report.error = errorMessage(error);
           this.lastError = report.error;
           this.log("burstel: compaction batch failed", { error: report.error });
+          failed = true;
           break;
         }
       }
@@ -238,6 +294,25 @@ export class CompactorCore {
         report.gc_deleted = gc.deleted;
         report.gc_protected = gc.protected;
       }
+
+      // Advance the discovery cursor only after a fully successful tick, and
+      // only past what was actually handled. A failed/truncated run leaves the
+      // cursor in place so the same objects are re-listed next time.
+      if (report.ok && !failed) {
+        // Advance the cursor only past everything that was actually handed to
+        // a batch. A time-bucket split can stop at maxBatches before the
+        // listing is exhausted; advancing to the watermark there would skip
+        // discovered-but-uncompacted objects forever.
+        const incomplete = discovery.truncated || discovery.batched < discovery.objects.length;
+        const nextFloor = incomplete
+          ? lastCompactedAt !== null
+            ? lastCompactedAt + 1
+            : (discovery.objects[discovery.batched]?.received_at ?? fromFloor(discovery))
+          : watermark;
+        await this.setFloor(nextFloor).catch((error) => {
+          this.log("burstel: discovery cursor update failed", { error: errorMessage(error) });
+        });
+      }
     } catch (error) {
       report.ok = false;
       report.error = errorMessage(error);
@@ -249,6 +324,7 @@ export class CompactorCore {
       }
       await this.finish(report, start);
     }
+    this.lastReport = report;
     return report;
   }
 
@@ -261,8 +337,6 @@ export class CompactorCore {
     report.duration_ms = Date.now() - start;
     await this.armNext();
     // Report the outcome (best effort; a stale holder is ignored by the DO).
-    // Only meaningful when a lease was actually held; skipped ticks carry no
-    // result.
     if (!report.skipped) {
       await this.ingestCall("/internal/compaction/result", "POST", {
         holder: this.holder,
@@ -270,6 +344,7 @@ export class CompactorCore {
         ok: report.ok,
         segments_published: report.segments_published,
         bytes_published: report.bytes_published,
+        excluded_revoked: report.excluded_revoked,
         error: report.error ?? null,
       }).catch(() => undefined);
     }
@@ -295,14 +370,13 @@ export class CompactorCore {
     });
   }
 
-  private plan(): Promise<CompactionPlan> {
-    return this.ingestCall<CompactionPlan>("/internal/compaction/plan", "POST", {
-      grace_ms: this.config.graceMs,
-      window_ms: this.config.windowMs,
-      max_objects: this.config.batchObjects,
-      max_bytes: this.config.batchBytes,
-      max_batches: this.config.maxBatchesPerTick,
-    });
+  private async setFloor(floorMs: number): Promise<void> {
+    await this.ingestCall("/internal/compaction/discovery", "POST", { floor_ms: floorMs });
+  }
+
+  private async discoveryFloor(): Promise<number | null> {
+    const state = await this.ingestCall<{ floor_ms: number | null }>("/internal/compaction/discovery", "GET");
+    return typeof state.floor_ms === "number" && Number.isFinite(state.floor_ms) ? state.floor_ms : null;
   }
 
   private async armNext(): Promise<void> {
@@ -319,9 +393,175 @@ export class CompactorCore {
     }
   }
 
+  // ---------------------------------------------------------- discovery (D3)
+
+  /**
+   * Lists and classifies the finalized journal:
+   *   * `received_at < watermark` (grace);
+   *   * **main range** `[cursor, watermark)` for never-seen objects;
+   *   * **lookback range** `[now - lookback, cursor)` re-listed every run so a
+   *     late object is picked up after a previous run's cursor;
+   *   * covered and revoked objects are removed/deduplicated;
+   *   * the remainder is grouped into cross-instance time buckets.
+   *
+   * The two ranges have separate scan budgets: an already-covered lookback
+   * prefix can never starve the main range (or vice versa).
+   */
+  private async discover(watermark: number): Promise<DiscoveryResult> {
+    const now = this.now();
+    const floor = await this.discoveryFloor().catch(() => null);
+    const mainFrom = floor === null ? 0 : floor;
+    const lookbackFrom = Math.min(mainFrom, now - this.config.lookbackMs);
+    const maxObjects = Math.max(1, this.config.batchObjects * this.config.maxBatchesPerTick);
+
+    const main = await listJournalObjects(this.bucket!, {
+      fromMs: mainFrom,
+      toMs: watermark,
+      maxObjects,
+      maxScan: maxObjects * 4,
+      pageSize: 1000,
+    });
+    const lookback =
+      lookbackFrom < mainFrom
+        ? await listJournalObjects(this.bucket!, {
+            fromMs: lookbackFrom,
+            toMs: mainFrom,
+            maxObjects,
+            maxScan: maxObjects * 4,
+            pageSize: 1000,
+          })
+        : { objects: [], truncated: false, scanned: 0 };
+    const merged = new Map<string, JournalObjectInfo>();
+    for (const info of [...main.objects, ...lookback.objects]) merged.set(info.key, info);
+
+    let objects: CompactionObject[] = [...merged.values()].map(journalToCompactionObject);
+
+    // De-duplicate against the verified manifest and previously excluded keys.
+    const coverage = await this.ingestCall<{ covered: string[]; excluded: string[] }>(
+      "/internal/compaction/coverage",
+      "POST",
+      { keys: objects.map((o) => o.key) },
+    ).catch(() => ({ covered: [] as string[], excluded: [] as string[] }));
+    const covered = new Set(coverage.covered);
+    const alreadyExcluded = new Set(coverage.excluded);
+    objects = objects.filter((o) => !covered.has(o.key) && !alreadyExcluded.has(o.key));
+
+    // Revocation correctness (D3.2): exclude everything written at/after the
+    // token's effective revocation instant, record it, and GC it immediately.
+    const tokenIds = [...new Set(objects.map((o) => o.token_id ?? "").filter((id) => id !== ""))];
+    let excluded = 0;
+    if (tokenIds.length > 0) {
+      const revocation = await this.ingestCall<{ revocations: Array<{ token_id: string; revoked_at: number | null }> }>(
+        "/internal/instance/token/revocations",
+        "POST",
+        { token_ids: tokenIds },
+      ).catch(() => ({ revocations: [] }));
+      const revokedAt = new Map<string, number | null>();
+      for (const row of revocation.revocations) revokedAt.set(row.token_id, row.revoked_at);
+      if (revokedAt.size > 0) {
+        const toExclude: CompactionObject[] = [];
+        objects = objects.filter((o) => {
+          const tokenId = o.token_id ?? "";
+          if (!tokenId || !revokedAt.has(tokenId)) return true;
+          const revoked = revokedAt.get(tokenId) ?? null;
+          // `null` (legacy) is treated as revoked from the beginning.
+          if (revoked !== null && revoked > o.received_at) return true;
+          toExclude.push(o);
+          return false;
+        });
+        if (toExclude.length > 0) {
+          excluded = toExclude.length;
+          const entries: ExcludedJournalInput[] = toExclude.map((o) => ({
+            key: o.key,
+            token_id: o.token_id ?? "",
+            instance_id: o.instance_id,
+            received_at: o.received_at,
+            size: o.size,
+          }));
+          await this.ingestCall("/internal/compaction/excluded", "POST", { entries }).catch((error) => {
+            this.log("burstel: failed to record revoked exclusion", { error: errorMessage(error) });
+          });
+          // Revoked data must never be analysed; delete it as soon as it is
+          // proven final. This is the GC path for excluded objects.
+          if (this.bucket?.delete) {
+            for (const entry of toExclude) {
+              try {
+                await this.bucket.delete(entry.key);
+              } catch (error) {
+                this.log("burstel: failed to delete revoked journal object", {
+                  key: entry.key,
+                  error: errorMessage(error),
+                });
+              }
+            }
+            await this.ingestCall("/internal/compaction/gc/delete", "POST", {
+              keys: toExclude.map((o) => o.key),
+            }).catch(() => undefined);
+          }
+        }
+      }
+    }
+
+    const batches = this.groupBatches(objects);
+    const batched = batches.reduce((n, batch) => n + batch.objects.length, 0);
+    return {
+      batches,
+      objects,
+      batched,
+      excluded,
+      watermark,
+      floor,
+      // Only the main range gates the cursor; the lookback is always re-listed.
+      truncated: main.truncated,
+      lookback_truncated: lookback.truncated,
+    };
+  }
+
+  /** Groups objects into cross-instance time buckets (spec 023, D3.3). */
+  private groupBatches(objects: CompactionObject[]): CompactionBatch[] {
+    const bucketMs = Math.max(1, this.config.windowMs);
+    const maxObjects = Math.max(1, this.config.batchObjects);
+    const maxBytes = Math.max(1, this.config.batchBytes);
+    const batches: CompactionBatch[] = [];
+    let current: CompactionBatch | null = null;
+    let currentBytes = 0;
+    let currentBucket = -1;
+
+    for (const object of objects) {
+      if (batches.length >= this.config.maxBatchesPerTick) break;
+      const bucket = Math.floor(object.received_at / bucketMs) * bucketMs;
+      const split =
+        current === null ||
+        bucket !== currentBucket ||
+        current.objects.length >= maxObjects ||
+        currentBytes + object.size > maxBytes;
+      if (split) {
+        if (current !== null) batches.push(current);
+        if (batches.length >= this.config.maxBatchesPerTick) {
+          current = null;
+          break;
+        }
+        current = {
+          scope_id: MULTI_INSTANCE_SCOPE,
+          first_received_at: object.received_at,
+          last_received_at: object.received_at,
+          objects: [],
+        };
+        currentBucket = bucket;
+        currentBytes = 0;
+      }
+      current!.objects.push(object);
+      current!.first_received_at = Math.min(current!.first_received_at, object.received_at);
+      current!.last_received_at = Math.max(current!.last_received_at, object.received_at);
+      currentBytes += object.size;
+    }
+    if (current !== null && batches.length < this.config.maxBatchesPerTick) batches.push(current);
+    return batches;
+  }
+
   // -------------------------------------------------------------- compact
 
-  /** Streams one window into the container and publishes the verified segment. */
+  /** Streams one cross-instance time bucket into the container and publishes it. */
   private async compactBatch(batch: CompactionBatch): Promise<{ size_bytes: number }> {
     await this.ensureContainer();
 
@@ -350,12 +590,22 @@ export class CompactorCore {
         content_type: obj.content_type,
         size: bytes.byteLength,
         sha256: gotSha,
+        // Per-object trusted attribution: one segment may span instances.
+        instance_id: obj.instance_id,
+        instance: obj.instance,
         body_base64: bytesToBase64(bytes),
       });
     }
 
     const built = await this.buildSegment(batch, objects);
     await this.assertTrustedBuild(batch, built, expectedKeys);
+    // Preserve each object's real instance in the coverage atoms so GC/pins
+    // remain instance-scoped even though the segment scope is cross-instance.
+    const objectByKey = new Map(batch.objects.map((o) => [o.key, o]));
+    const coverage: SegmentCoverageInput[] = built.coverage.map((cov) => ({
+      ...cov,
+      instance_id: objectByKey.get(cov.journal_key)?.instance_id,
+    }));
 
     const objectKey = built.segment_key;
     const putResp = await this.bucket!.put(objectKey, await this.segmentStream(built.download_token), {
@@ -363,7 +613,7 @@ export class CompactorCore {
       httpMetadata: { contentType: "application/vnd.duckdb" },
       customMetadata: {
         sha256: built.sha256,
-        instance_id: batch.instance_id,
+        instance_id: batch.scope_id,
         segment_key: objectKey,
         first_received_at: String(built.first_received_at),
         last_received_at: String(built.last_received_at),
@@ -387,7 +637,7 @@ export class CompactorCore {
 
     const publish: SegmentPublishInput = {
       segment_key: built.segment_key,
-      instance_id: batch.instance_id,
+      instance_id: batch.scope_id,
       object_key: objectKey,
       size_bytes: built.size_bytes,
       sha256: built.sha256,
@@ -401,7 +651,7 @@ export class CompactorCore {
       event_min_ns: built.event_min_ns,
       event_max_ns: built.event_max_ns,
       late: false,
-      coverage: built.coverage,
+      coverage,
     };
     const result = await this.ingestCall<SegmentPublishResult>("/internal/segment/publish", "POST", publish);
     await this.discardSegment(built.download_token);
@@ -436,13 +686,13 @@ export class CompactorCore {
       if (!obj) throw new Error(`compactor claimed unrequested coverage ${cov.journal_key}`);
       if (seen.has(cov.journal_key)) throw new Error(`compactor returned duplicate coverage ${cov.journal_key}`);
       if (cov.signal !== obj.signal || cov.received_at !== obj.received_at) {
-        throw new Error(`compactor coverage for ${cov.journal_key} disagrees with the ledger`);
+        throw new Error(`compactor coverage for ${cov.journal_key} disagrees with the journal`);
       }
       seen.add(cov.journal_key);
     }
     const first = Math.min(...batch.objects.map((o) => o.received_at));
     const last = Math.max(...batch.objects.map((o) => o.received_at));
-    const expected = await expectedSegmentKey(batch.instance_id, first, last, batch.objects.map((o) => o.key));
+    const expected = await expectedSegmentKey(batch.scope_id, first, last, batch.objects.map((o) => o.key));
     if (built.segment_key !== expected) {
       throw new Error("compactor returned a non-deterministic segment key");
     }
@@ -463,7 +713,7 @@ export class CompactorCore {
     const resp = await this.container.request("/v1/segments", {
       method: "POST",
       headers: this.containerHeaders({ "content-type": "application/json" }),
-      body: JSON.stringify({ instance_id: batch.instance_id, instance: batch.instance, objects }),
+      body: JSON.stringify({ instance_id: batch.scope_id, instance: "", objects }),
     });
     return (await parseJson<BuildResponse>(resp, "compactor build")) as BuildResponse;
   }
@@ -521,10 +771,12 @@ export class CompactorCore {
 
   async status(): Promise<Record<string, unknown>> {
     let ingestStatus: Record<string, unknown> = {};
+    let ingestStatusError = "";
     try {
       ingestStatus = await this.ingestCall<Record<string, unknown>>("/internal/compaction/status", "GET");
-    } catch {
+    } catch (error) {
       ingestStatus = {};
+      ingestStatusError = errorMessage(error);
     }
     return {
       ...ingestStatus,
@@ -532,9 +784,12 @@ export class CompactorCore {
       scheduler_active: this.schedulerActive,
       last_tick_at: this.lastTickAt,
       last_error: this.lastError,
+      ingest_status_error: ingestStatusError,
+      last_report: this.lastReport,
       config: {
         window_ms: this.config.windowMs,
         grace_ms: this.config.graceMs,
+        lookback_ms: this.config.lookbackMs,
         retention_ms: this.config.retentionMs,
         gc_enabled: this.config.gcEnabled,
         schedule_ms: this.config.scheduleMs,
@@ -584,6 +839,21 @@ export class CompactorCore {
 
 // ---------------------------------------------------------------- helpers
 
+function journalToCompactionObject(info: JournalObjectInfo): CompactionObject {
+  return {
+    key: info.key,
+    instance_id: info.instance_id,
+    instance: info.instance,
+    signal: info.signal,
+    size: info.size,
+    sha256: info.sha256,
+    content_type: info.content_type,
+    content_encoding: info.content_encoding,
+    received_at: info.received_at,
+    token_id: info.token_id,
+  };
+}
+
 async function parseJson<T>(resp: Response, what: string): Promise<T> {
   if (resp.status >= 200 && resp.status < 300) {
     return (await resp.json()) as T;
@@ -618,16 +888,21 @@ export function bytesToBase64(bytes: Uint8Array): string {
  * returns a different key for the same source keys.
  */
 export async function expectedSegmentKey(
-  instanceId: string,
+  scopeId: string,
   firstMS: number,
   lastMS: number,
   sourceKeys: string[],
 ): Promise<string> {
   const sorted = [...sourceKeys].sort();
   const digest = await sha256HexBytes(new TextEncoder().encode(sorted.join("\n") + "\n"));
-  return `segments/${instanceId}/${firstMS}-${lastMS}-${digest.slice(0, 16)}.duckdb`;
+  return `segments/${scopeId}/${firstMS}-${lastMS}-${digest.slice(0, 16)}.duckdb`;
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/** First eligible-but-unbatched object's receive time, or the listing floor. */
+function fromFloor(discovery: DiscoveryResult): number {
+  return discovery.objects[discovery.batched]?.received_at ?? discovery.floor ?? 0;
 }

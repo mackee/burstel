@@ -20,6 +20,7 @@ import { sha256Hex, sha256HexBytes } from "../src/crypto";
 import type { IngestCore } from "../src/ingest-core";
 import { INSTANCE_TOKEN_TTL_MS, newInstanceToken } from "../src/instance-core";
 import { handleMcp } from "../src/mcp";
+import { resetAdmissionCache } from "../src/admission";
 import {
   FakeArtifacts,
   FakeAuthNamespace,
@@ -80,12 +81,14 @@ function nextAuthId(): string {
 }
 
 function setup(): Setup {
+  resetAdmissionCache();
   let clock = 1_700_000_000_000;
   const now = () => clock;
   const shots = new FakeShotNamespace();
   const bucket = new FakeBucket();
   const ingest = makeIngest({
     now,
+    bucket,
     generateToken: nextToken,
     generateInstanceId: nextInstanceId,
     generateTokenId: nextTokenId,
@@ -98,6 +101,7 @@ function setup(): Setup {
     BUCKET: bucket,
     BURSTEL_API_TOKEN: ENV_ADMIN,
     PUBLIC_BASE_URL: "https://burstel.example",
+    now,
   };
   return { env, shots, bucket, ingest: ingest.core, setClock: (v) => (clock = v), now };
 }
@@ -211,16 +215,18 @@ describe("named instances and credentials", () => {
     expect(((await expired.json()) as { reason: string }).reason).toBe("expired");
   });
 
-  test("revocation is immediate; rotation is bounded and instance-scoped", async () => {
+  test("revocation converges at the edge; rotation is bounded and instance-scoped", async () => {
     const { env, setClock, now } = setup();
     await createInstance(env, "web-1");
     await createInstance(env, "db-1");
     const web = await issue(env, "web-1");
     const db = await issue(env, "db-1");
 
-    // Immediate revocation.
+    // Revocation is authoritative immediately; a positive edge cache may still
+    // admit for at most the KV propagation window (spec 023 D1/D3.2).
     const revoked = await handleRequest(req("DELETE", `/api/instances/web-1/tokens/${web.id}`), env);
     expect(revoked.status).toBe(200);
+    resetAdmissionCache();
     expect((await handleRequest(push(String(web.token)), env)).status).toBe(401);
     // Another instance is untouched.
     expect((await handleRequest(push(String(db.token)), env)).status).toBe(200);
@@ -228,10 +234,13 @@ describe("named instances and credentials", () => {
     // Rotation: previous token keeps working for the bounded overlap, then dies.
     const rotated = await issue(env, "db-1", { rotate: true, overlap_seconds: 60 });
     const rotatedAt = now();
+    resetAdmissionCache();
     expect((await handleRequest(push(String(db.token)), env)).status).toBe(200);
     setClock(rotatedAt + 59_000);
+    resetAdmissionCache();
     expect((await handleRequest(push(String(db.token)), env)).status).toBe(200);
     setClock(rotatedAt + 61_000);
+    resetAdmissionCache();
     expect((await handleRequest(push(String(db.token)), env)).status).toBe(401);
     expect((await handleRequest(push(String(rotated.token)), env)).status).toBe(200);
   });
@@ -280,18 +289,23 @@ describe("durable continuous OTLP intake", () => {
     expect(shots.shots.size).toBe(0);
     expect(bucket.objects.size).toBe(3);
 
-    const ledger = await ingest.listJournal({ limit: 50, offset: 0 });
-    expect(ledger.total).toBe(3);
-    // R2 keys and ledger rows carry the trusted instance id, not a shot.
-    for (const entry of ledger.entries) {
-      expect(entry.key.startsWith(`journal/${entry.instance_id}/`)).toBe(true);
-      expect(entry.instance_id).toBe(entry.instance === "web-1" ? webId : entry.instance_id);
+    // Spec 023: no per-request ledger; the durable objects are the record.
+    const journal = await ingest.journalStats();
+    expect(journal.objects).toBe(3);
+    expect(journal.pending).toBe(3);
+    expect(journal.by_signal).toEqual({ metrics: 1, logs: 1, traces: 1 });
+    // R2 keys carry the trusted instance id, not a shot.
+    for (const key of bucket.objects.keys()) {
+      expect(key.startsWith("journal/")).toBe(true);
+      const meta = bucket.objects.get(key)!.customMetadata!;
+      expect(meta.instance_id).toBe(meta.instance === "web-1" ? webId : meta.instance_id);
+      expect(typeof meta.token_id).toBe("string");
     }
-    const webEntries = ledger.entries.filter((e) => e.instance === "web-1");
+    const webEntries = [...bucket.objects.values()].filter((o) => o.customMetadata?.instance === "web-1");
     expect(webEntries).toHaveLength(2);
-    expect(new Set(webEntries.map((e) => e.instance_id))).toEqual(new Set([webId]));
+    expect(new Set(webEntries.map((o) => o.customMetadata?.instance_id))).toEqual(new Set([webId]));
     // Distinct payloads never merge.
-    expect(new Set(ledger.entries.map((e) => e.key)).size).toBe(3);
+    expect(new Set(bucket.objects.keys()).size).toBe(3);
   });
 
   test("valid OTLP is persisted byte-for-byte before 200 with trusted instance fields", async () => {
@@ -313,8 +327,9 @@ describe("durable continuous OTLP intake", () => {
     expect(object.customMetadata?.instance).toBe("web-1");
     expect(object.customMetadata?.signal).toBe("traces");
 
-    const ledger = await ingest.listJournal({ limit: 10, offset: 0 });
-    expect(ledger.entries[0]!.sha256).toBe(await sha256HexBytes(payload));
+    const ledger = await bucket.objects.get(keys[0]!);
+    expect(ledger!.customMetadata?.sha256).toBe(await sha256HexBytes(payload));
+    expect(ledger!.customMetadata?.token_id).toBe(String(issued.id));
   });
 
   test("gzip bodies are verified and the original compressed bytes are preserved", async () => {
@@ -354,8 +369,8 @@ describe("durable continuous OTLP intake", () => {
     await handleRequest(req("POST", `/api/shots/${shot.shot_id}/stop`, { body: {} }), env);
     expect((await handleRequest(push(String(issued.token)), env)).status).toBe(200);
 
-    const ledger = await ingest.listJournal({ limit: 10, offset: 0 });
-    expect(ledger.total).toBe(2);
+    const journal = await ingest.journalStats();
+    expect(journal.objects).toBe(2);
   });
 
   test("malformed bodies are rejected with 4xx and nothing is persisted", async () => {
@@ -406,8 +421,8 @@ describe("durable continuous OTLP intake", () => {
   });
 });
 
-describe("durability failures and reconciliation", () => {
-  test("an R2 write failure returns a retryable 503 and commits no ledger row", async () => {
+describe("durability failures (ledger-free hot path)", () => {
+  test("an R2 write failure returns a retryable 503 and stores nothing", async () => {
     const { env, bucket, ingest } = setup();
     await createInstance(env, "web-1");
     const issued = await issue(env, "web-1");
@@ -416,89 +431,25 @@ describe("durability failures and reconciliation", () => {
     const resp = await handleRequest(push(String(issued.token)), env);
     expect(resp.status).toBe(503);
     expect(((await resp.json()) as { code: string }).code).toBe("journal_write_failed");
-    const ledger = await ingest.listJournal({ limit: 10, offset: 0 });
-    expect(ledger.total).toBe(0);
+    expect(bucket.objects.size).toBe(0);
+    expect((await ingest.journalStats()).objects).toBe(0);
   });
 
-  test("a ledger commit failure returns 503 and reconciliation recovers the durable object", async () => {
-    const { env, bucket, ingest } = setup();
+  test("a warm admission makes no ControlDO call and never commits a ledger row", async () => {
+    const { env, bucket } = setup();
     await createInstance(env, "web-1");
     const issued = await issue(env, "web-1");
+    const namespace = env.INGEST_DO as FakeIngestNamespace;
 
-    const original = ingest.commitJournal;
-    ingest.commitJournal = (() => {
-      throw new Error("ledger unavailable");
-    }) as typeof ingest.commitJournal;
+    expect((await handleRequest(push(String(issued.token)), env)).status).toBe(200);
+    const afterFirst = namespace.calls.length;
+    expect(namespace.calls).toContain("/internal/instance/admit");
 
-    const resp = await handleRequest(push(String(issued.token)), env);
-    expect(resp.status).toBe(503);
-    // The raw bytes are durable even though the ACK failed.
-    expect(bucket.objects.size).toBe(1);
-    expect((await ingest.listJournal({ limit: 10, offset: 0 })).total).toBe(0);
-
-    ingest.commitJournal = original;
-    const key = [...bucket.objects.keys()][0]!;
-    const bytes = bucket.objects.get(key)!.bytes;
-    const reconciled = await ingest.reconcileJournal([
-      {
-        key,
-        instance_id: String(issued.instance_id),
-        instance: "web-1",
-        signal: "traces",
-        size: bytes.byteLength,
-        sha256: await sha256HexBytes(bytes),
-        content_type: "application/x-protobuf",
-        content_encoding: "",
-        received_at: Date.now(),
-      },
-    ]);
-    expect(reconciled.reconciled).toBe(1);
-    expect((await ingest.listJournal({ limit: 10, offset: 0 })).total).toBe(1);
-  });
-
-  test("a lost ledger write is recovered by reconciliation without re-writing the payload", async () => {    const { env, bucket, ingest } = setup();
-    await createInstance(env, "web-1");
-    const issued = await issue(env, "web-1");
-
-    // Simulate raw bytes durable in R2 but the ledger commit lost.
-    const key = `journal/${issued.instance_id}/traces/1700000000000-orphan.bin`;
-    const bytes = new Uint8Array([0x0a, 0x00]);
-    await bucket.put(key, bytes);
-
-    const before = await ingest.listJournal({ limit: 10, offset: 0 });
-    expect(before.total).toBe(0);
-
-    const reconciled = await ingest.reconcileJournal([
-      {
-        key,
-        instance_id: String(issued.instance_id),
-        instance: "web-1",
-        signal: "traces",
-        size: bytes.byteLength,
-        sha256: await sha256HexBytes(bytes),
-        content_type: "application/x-protobuf",
-        content_encoding: "",
-        received_at: 1_700_000_000_000,
-      },
-    ]);
-    expect(reconciled).toEqual({ reconciled: 1, skipped: 0 });
-
-    // Idempotent: a replay does not double count.
-    const replay = await ingest.reconcileJournal([
-      {
-        key,
-        instance_id: String(issued.instance_id),
-        instance: "web-1",
-        signal: "traces",
-        size: bytes.byteLength,
-        sha256: await sha256HexBytes(bytes),
-        content_type: "application/x-protobuf",
-        content_encoding: "",
-        received_at: 1_700_000_000_000,
-      },
-    ]);
-    expect(replay).toEqual({ reconciled: 0, skipped: 1 });
-    expect((await ingest.listJournal({ limit: 10, offset: 0 })).total).toBe(1);
+    expect((await handleRequest(push(String(issued.token)), env)).status).toBe(200);
+    // Spec 023 D2: no Durable Object call on the hot path.
+    expect(namespace.calls.length).toBe(afterFirst);
+    expect(namespace.calls).not.toContain("/internal/journal/commit");
+    expect(bucket.objects.size).toBe(2);
   });
 });
 

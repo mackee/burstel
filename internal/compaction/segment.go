@@ -231,6 +231,11 @@ func BuildSegment(ctx context.Context, path, key, instanceID, instanceName strin
 		if o.ReceivedAtMS > info.LastReceivedAt {
 			info.LastReceivedAt = o.ReceivedAtMS
 		}
+		// A cross-instance bucket keeps each row's real instance attribution.
+		rowInstanceID := o.InstanceID
+		if rowInstanceID == "" {
+			rowInstanceID = instanceID
+		}
 		wireSHA := sha256Hex(rec.Wire)
 		payloadSHA := sha256Hex(rec.Payload)
 		rq := rec.Decoded
@@ -239,7 +244,7 @@ func BuildSegment(ctx context.Context, path, key, instanceID, instanceName strin
 			recordCount = rq.RecordCount
 		}
 		if _, err := insertBatch.ExecContext(ctx,
-			instanceID, o.Key, o.RequestID, string(o.Signal), o.ReceivedAt.UTC(),
+			rowInstanceID, o.Key, o.RequestID, string(o.Signal), o.ReceivedAt.UTC(),
 			o.ContentEncoding, wireSHA, payloadSHA, recordCount, int64(len(rec.Payload)),
 			resourceSummaryOf(rq), rec.Wire, rec.Payload,
 		); err != nil {
@@ -252,7 +257,7 @@ func BuildSegment(ctx context.Context, path, key, instanceID, instanceName strin
 			continue
 		}
 		for i, sp := range rq.Spans {
-			if _, err := insertSpan.ExecContext(ctx, append([]any{instanceID, o.Key, int64(i)}, spanArgs(sp)...)...); err != nil {
+			if _, err := insertSpan.ExecContext(ctx, append([]any{rowInstanceID, o.Key, int64(i)}, spanArgs(sp)...)...); err != nil {
 				return SegmentInfo{}, fmt.Errorf("compaction: insert span: %w", err)
 			}
 			if sp.StartTimeUnixNano > 0 {
@@ -264,7 +269,7 @@ func BuildSegment(ctx context.Context, path, key, instanceID, instanceName strin
 		}
 		info.SpanCount += int64(len(rq.Spans))
 		for i, lr := range rq.LogRecords {
-			if _, err := insertLog.ExecContext(ctx, append([]any{instanceID, o.Key, int64(i)}, logArgs(lr)...)...); err != nil {
+			if _, err := insertLog.ExecContext(ctx, append([]any{rowInstanceID, o.Key, int64(i)}, logArgs(lr)...)...); err != nil {
 				return SegmentInfo{}, fmt.Errorf("compaction: insert log: %w", err)
 			}
 			if lr.TimeUnixNano > 0 {
@@ -276,7 +281,7 @@ func BuildSegment(ctx context.Context, path, key, instanceID, instanceName strin
 		}
 		info.LogCount += int64(len(rq.LogRecords))
 		for i, mp := range rq.MetricPoints {
-			if _, err := insertMetric.ExecContext(ctx, append([]any{instanceID, o.Key, int64(i)}, metricArgs(mp)...)...); err != nil {
+			if _, err := insertMetric.ExecContext(ctx, append([]any{rowInstanceID, o.Key, int64(i)}, metricArgs(mp)...)...); err != nil {
 				return SegmentInfo{}, fmt.Errorf("compaction: insert metric: %w", err)
 			}
 			if mp.StartTimeUnixNano > 0 {

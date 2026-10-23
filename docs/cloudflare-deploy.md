@@ -1,7 +1,11 @@
 # Cloudflare deployment runbook (spec 009)
 
 This runbook deploys the burstel Worker + per-shot `ShotDO` Containers + SQLite
-`IngestDO` + R2 freeze layer. **Nothing in this repository performs a Cloudflare
+`ControlDO` (formerly `IngestDO`) + R2 freeze layer. Since spec 023 the ingest
+hot path is authenticated from KV `INSTANCE_TOKENS` and performs one R2 PUT;
+the deployment must create that namespace and the `INGEST_ANALYTICS` dataset
+(see the bindings in `wrangler.jsonc`) and, for an existing installation, apply
+a Durable Object `renamed_classes` migration from `IngestDO` to `ControlDO`. **Nothing in this repository performs a Cloudflare
 mutation on its own**: the preflight script is strictly read-only, and the
 deploy sequence is an explicit operator action.
 
@@ -32,7 +36,7 @@ runs as the nonroot user `burstel` (uid 10001).
 | --- | --- | --- |
 | `BURSTEL_API_TOKEN` | admin: `/api/*`, `/mcp`, legacy per-shot path | Worker secret |
 | `BURSTEL_INTERNAL_TOKEN` | recorder `/internal/*` defense-in-depth | Worker secret, injected into the container by the `ShotDO` |
-| instance push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its named instance | minted at runtime by `POST /api/instances/{name}/tokens` (admin\|member), shown **once**; only its digest is stored in `IngestDO` |
+| instance push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its named instance | minted at runtime by `POST /api/instances/{name}/tokens` (admin\|member), shown **once**; only its digest is stored in `ControlDO` (and positively cached in KV) |
 | per-person token | `/api/*` + `/mcp` as `admin` or `member` (member = full operational, no registry) | minted at runtime by `POST /api/tokens` (admin only), shown **once**; only its digest is stored in `AuthDO` |
 
 Rules (all fail closed): the internal token must be non-empty and **different**
@@ -110,7 +114,7 @@ The full preflight checks, without mutating anything:
   are never read or printed);
 * `docker`/`buildx`/`linux/amd64` compatibility;
 * the `wrangler.jsonc` invariants: `ShotDO` container on `standard-1`, bounded
-  `max_instances`, SQLite `ShotDO`/`IngestDO`/`AuthDO` exports,
+  `max_instances`, SQLite `ShotDO`/`ControlDO`/`AuthDO` exports,
   `BUCKET -> burstel-shots`, no `BURSTEL_DEV_INSECURE_AUTH`, no plaintext tokens
   in `vars`.
 
@@ -189,7 +193,9 @@ Containers are ephemeral and are destroyed on freeze/idle.
 * Stop shots promptly; a recording Container holds an ephemeral disk.
 * The durable raw journal writes one R2 object per accepted export under
   `journal/*`; add an R2 lifecycle rule for old `shots/*` **and** `journal/*`
-  objects if long-term retention is not required.
+  objects if long-term retention is not required. Compaction discovers these
+  objects by listing (spec 023), so never delete `journal/*` before the
+  compactor has published (or explicitly excluded) the object.
 * Containers require Workers Paid; do not leave test Containers running.
 
 ## 9. Non-goals

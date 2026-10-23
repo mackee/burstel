@@ -1,14 +1,18 @@
 // Worker entrypoint for burstel.
 //
 // The Worker receives public HTTP traffic, authenticates it, and routes each
-// shot to its own named ShotDO. A singleton IngestDO coordinates per-shot
-// push-only ingest tokens (token -> shot), the shot registry and the
-// concurrent-recording cap. The ShotDO owns the Container and R2 freeze logic;
-// see src/app.ts, src/ingest-do.ts and src/shot-do.ts.
+// shot to its own named ShotDO. A singleton ControlDO (formerly IngestDO)
+// coordinates named instances, authoritative tokens, the shot registry, the
+// segment manifest and the compaction lease. The ShotDO owns the Container and
+// R2 freeze logic; see src/app.ts, src/control-do.ts and src/shot-do.ts.
+//
+// Spec 023 removes the Durable Object from the ingest hot path: instance tokens
+// are admitted from memory -> KV, exports are one R2 PUT, and compaction
+// discovers work by listing R2.
 //
 // Spec 018 adds the singleton CompactorDO: a short-lived Container coordinator
 // that turns the durable raw journal into verified R2 segments and publishes
-// them to the IngestDO, driven by a Cron `scheduled` trigger and its own DO
+// them to the ControlDO, driven by a Cron `scheduled` trigger and its own DO
 // alarm. It never touches ShotDO storage or the legacy recording image.
 
 import { handleRequest } from "./app";
@@ -16,7 +20,7 @@ import { COMPACTOR_DO_NAME } from "./compactor-core";
 import type { Env } from "./shot-do";
 
 export { ShotDO } from "./shot-do";
-export { IngestDO } from "./ingest-do";
+export { ControlDO } from "./control-do";
 export { AuthDO } from "./auth-do";
 export { CompactorDO } from "./compactor-do";
 export type { Env } from "./shot-do";

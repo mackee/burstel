@@ -45,6 +45,26 @@ export interface R2ObjectBodyLike extends R2ObjectLike {
   customMetadata?: Record<string, string>;
 }
 
+/** Bounded R2 listing request (spec 023, D3). */
+export interface R2ListOptionsLike {
+  prefix?: string;
+  cursor?: string;
+  /** Exclusive key cursor. Keys sort lexicographically. */
+  startAfter?: string;
+  limit?: number;
+  /** "/" turns deeper keys into `delimitedPrefixes` instead of objects. */
+  delimiter?: string;
+  /** `["customMetadata"]` asks R2 to return per-object metadata. */
+  include?: string[];
+}
+
+export interface R2ListResultLike {
+  objects: R2ObjectLike[];
+  truncated: boolean;
+  cursor?: string;
+  delimitedPrefixes?: string[];
+}
+
 /** Structural subset of the platform `R2Bucket` type. */
 export interface R2BucketLike {
   put(
@@ -60,6 +80,11 @@ export interface R2BucketLike {
    */
   head?(key: string): Promise<R2ObjectLike | null>;
   delete?(key: string): Promise<void>;
+  /**
+   * Prefix listing. Compaction discovers finalized journal objects directly
+   * from R2 (spec 023, D3) instead of a per-request ledger.
+   */
+  list?(options?: R2ListOptionsLike): Promise<R2ListResultLike>;
   createMultipartUpload(key: string, options?: R2PutOptionsLike): Promise<R2MultipartUploadLike>;
 }
 

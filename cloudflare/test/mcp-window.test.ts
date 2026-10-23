@@ -253,17 +253,18 @@ describe("MCP window analysis over segments", () => {
     const bytes = new TextEncoder().encode("otlp");
     const sha = await sha256Hex(bytes);
     const key = `journal/${instance.instance_id}/traces/${receivedAt}-a.bin`;
-    await bucket.put(key, bytes, { sha256: sha, customMetadata: { sha256: sha } });
-    await ingest.core.commitJournal({
-      key,
-      instance_id: instance.instance_id,
-      instance: "web-1",
-      signal: "traces",
-      size: bytes.byteLength,
+    await bucket.put(key, bytes, {
       sha256: sha,
-      content_type: "application/x-protobuf",
-      content_encoding: "",
-      received_at: receivedAt,
+      customMetadata: {
+        sha256: sha,
+        signal: "traces",
+        instance_id: instance.instance_id,
+        instance: "web-1",
+        received_at: String(receivedAt),
+        token_id: "tok-mcp",
+        content_encoding: "",
+        content_type: "application/x-protobuf",
+      },
     });
 
     const compactor = new CompactorCore({
@@ -305,17 +306,18 @@ describe("MCP window analysis over segments", () => {
     const bytes = new TextEncoder().encode("x");
     const sha = await sha256Hex(bytes);
     const key = `journal/${instance.instance_id}/traces/${start}-p.bin`;
-    await bucket.put(key, bytes, { sha256: sha, customMetadata: { sha256: sha } });
-    await ingest.core.commitJournal({
-      key,
-      instance_id: instance.instance_id,
-      instance: "web-1",
-      signal: "traces",
-      size: bytes.byteLength,
+    await bucket.put(key, bytes, {
       sha256: sha,
-      content_type: "application/x-protobuf",
-      content_encoding: "",
-      received_at: start,
+      customMetadata: {
+        sha256: sha,
+        signal: "traces",
+        instance_id: instance.instance_id,
+        instance: "web-1",
+        received_at: String(start),
+        token_id: "tok-mcp",
+        content_encoding: "",
+        content_type: "application/x-protobuf",
+      },
     });
 
     const env = makeEnv({}, ingest, bucket);

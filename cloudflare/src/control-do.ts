@@ -1,25 +1,33 @@
-// The singleton, SQLite-backed ingest coordinator Durable Object.
+// The singleton, SQLite-backed control-plane Durable Object (spec 023, D4).
 //
-// One `IngestDO` per installation owns the per-shot push token digests, the
-// shot registry and the concurrent-recording cap. It is *not* a container: it is
-// a lightweight coordinator so the stable `/ingest` endpoint never needs
-// shot-specific exporter config. The real telemetry recorder still runs in a
-// per-shot `ShotDO`/Container; this DO only decides whether a request is
-// admitted and which shot its token belongs to.
+// Formerly `IngestDO`. It owns the named-instance registry, the authoritative
+// instance tokens, the shot registry, the segment manifest, the compaction
+// lease/pins and the discovery cursor. It is *not* on the ingest hot path: the
+// Worker authenticates from KV and writes exactly one R2 object per accepted
+// export.
+//
+// A `ControlDO` is not a container. The real telemetry recorder still runs in a
+// per-shot `ShotDO`/Container.
 
 import { DurableObject } from "cloudflare:workers";
 
+import type { R2BucketLike } from "./artifacts";
 import { IngestCore } from "./ingest-core";
 import type { SqlCursor, SqlValue, SyncSql } from "./store";
 import type { Env } from "./shot-do";
 
-export class IngestDO extends DurableObject<Env> {
+export class ControlDO extends DurableObject<Env> {
   private readonly core: IngestCore;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const sql = createSqlAdapter(ctx.storage.sql);
-    this.core = new IngestCore({ sql, now: () => Date.now() });
+    this.core = new IngestCore({
+      sql,
+      now: () => Date.now(),
+      // Spec 023 D3.4: pending/backlog counts come from the R2 listing.
+      bucket: env.BUCKET as unknown as R2BucketLike,
+    });
     ctx.blockConcurrencyWhile(async () => {
       await this.core.load();
     });

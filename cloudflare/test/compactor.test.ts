@@ -62,10 +62,10 @@ function makeHarness(options: {
 
 let seq = 0;
 
-/** Durably writes one raw journal object and its ledger row. */
+/** Durably writes one raw journal object exactly as the ingest path does. */
 async function seed(
   h: Harness,
-  opts: { instanceId: string; instance: string; signal: string; receivedAt: number; bytes?: Uint8Array },
+  opts: { instanceId: string; instance: string; signal: string; receivedAt: number; bytes?: Uint8Array; tokenId?: string },
 ): Promise<{ key: string; sha: string; size: number }> {
   seq += 1;
   const bytes = opts.bytes ?? new TextEncoder().encode(`payload-${opts.signal}-${seq}`);
@@ -74,18 +74,16 @@ async function seed(
   await h.bucket.put(key, bytes, {
     sha256: sha,
     httpMetadata: { contentType: "application/x-protobuf" },
-    customMetadata: { sha256: sha, signal: opts.signal, instance_id: opts.instanceId, received_at: String(opts.receivedAt) },
-  });
-  await h.ingest.commitJournal({
-    key,
-    instance_id: opts.instanceId,
-    instance: opts.instance,
-    signal: opts.signal,
-    size: bytes.byteLength,
-    sha256: sha,
-    content_type: "application/x-protobuf",
-    content_encoding: "",
-    received_at: opts.receivedAt,
+    customMetadata: {
+      sha256: sha,
+      signal: opts.signal,
+      instance_id: opts.instanceId,
+      instance: opts.instance,
+      received_at: String(opts.receivedAt),
+      token_id: opts.tokenId ?? "tok-seed",
+      content_encoding: "",
+      content_type: "application/x-protobuf",
+    },
   });
   return { key, sha, size: bytes.byteLength };
 }
@@ -105,11 +103,13 @@ describe("compactor coordinator (spec 018)", () => {
 
     const report = await h.compactor.tick();
     expect(report.ok).toBe(true);
-    expect(report.segments_published).toBe(2); // one window per instance
+    // Spec 023 D3.3: one cross-instance time-bucket segment, not one per instance.
+    expect(report.segments_published).toBe(1);
     expect(report.journal_objects).toBe(6);
 
     const segments = await h.ingest.listSegments({ limit: 50, offset: 0 });
-    expect(segments.total).toBe(2);
+    expect(segments.total).toBe(1);
+    expect(segments.segments[0]!.instance_id).toBe("all");
     for (const seg of segments.segments) {
       expect(seg.status).toBe("verified");
       const stored = await h.bucket.get(seg.object_key);
@@ -124,13 +124,14 @@ describe("compactor coordinator (spec 018)", () => {
     expect(h.armed.length).toBe(1);
   });
 
-  test("is idempotent across repeated ticks", async () => {
+  test("is idempotent across repeated ticks (lookback re-list de-duplicates)", async () => {
     const h = makeHarness();
-    await seed(h, { instanceId: "inst-a", instance: "inst-a", signal: "traces", receivedAt: h.clock.now - 600_000 });
+    await seed(h, { instanceId: "inst-a", instance: "inst-a", signal: "traces", receivedAt: h.clock.now - 130_000 });
     const first = await h.compactor.tick();
     expect(first.segments_published).toBe(1);
     const second = await h.compactor.tick();
     expect(second.segments_published).toBe(0);
+    expect(second.discovered_objects).toBe(0);
     const segments = await h.ingest.listSegments({ limit: 50, offset: 0 });
     expect(segments.total).toBe(1);
   });
@@ -188,7 +189,7 @@ describe("compactor coordinator (spec 018)", () => {
     expect((await h.ingest.listSegments({ limit: 10, offset: 0 })).total).toBe(0);
   });
 
-  test("fails safely when a journal object is missing from R2", async () => {
+  test("fails safely when a listed journal object disappears before the build", async () => {
     const h = makeHarness();
     const seeded = await seed(h, {
       instanceId: "inst-a",
@@ -196,7 +197,7 @@ describe("compactor coordinator (spec 018)", () => {
       signal: "traces",
       receivedAt: h.clock.now - 600_000,
     });
-    await h.bucket.delete(seeded.key);
+    h.bucket.failGetForKey = seeded.key;
     const report = await h.compactor.tick();
     expect(report.ok).toBe(false);
     expect((await h.ingest.listSegments({ limit: 10, offset: 0 })).total).toBe(0);
@@ -239,15 +240,14 @@ describe("compactor coordinator (spec 018)", () => {
 
     const report = await h.compactor.tick();
     expect(report.ok).toBe(true);
-    expect(report.segments_published).toBe(2);
+    expect(report.segments_published).toBe(1);
     expect(report.gc_deleted).toBe(1);
     expect(report.gc_protected).toBe(1);
 
-    // The pinned object survives; the unpinned one is gone from R2 + ledger.
+    // The pinned object survives; the unpinned one is gone from R2.
     expect(await h.bucket.get(b.key)).not.toBeNull();
     expect(await h.bucket.get(a.key)).toBeNull();
-    const journal = await h.ingest.listJournal({ limit: 50, offset: 0 });
-    expect(journal.entries.map((e) => e.key)).toEqual([b.key]);
+    expect([...h.bucket.objects.keys()].filter((key) => key.startsWith("journal/"))).toEqual([b.key]);
   });
 
   test("a window shot auto-pins its receive-time range from GC", async () => {
@@ -271,14 +271,16 @@ describe("compactor coordinator (spec 018)", () => {
     expect(await h.bucket.get(a.key)).not.toBeNull();
   });
 
-  test("late/backdated data becomes its own segment without duplicate coverage", async () => {
+  test("late/backdated data inside the lookback becomes its own segment without duplicate coverage", async () => {
     const h = makeHarness();
-    const old = h.clock.now - 600_000;
+    // Both receive times are already past the grace watermark but inside the
+    // 2 x grace lookback that every run re-lists (spec 023 D3.1).
+    const old = h.clock.now - 130_000;
     await seed(h, { instanceId: "inst-a", instance: "inst-a", signal: "traces", receivedAt: old });
     const first = await h.compactor.tick();
     expect(first.segments_published).toBe(1);
 
-    // A late arrival inside the already-finalized receive-time window.
+    // A late arrival inside the already-scanned receive-time range.
     await seed(h, { instanceId: "inst-a", instance: "inst-a", signal: "traces", receivedAt: old + 1000 });
     const second = await h.compactor.tick();
     expect(second.segments_published).toBe(1);
@@ -287,6 +289,7 @@ describe("compactor coordinator (spec 018)", () => {
     expect(segments.total).toBe(2);
     const status = await h.ingest.compactionStatus();
     expect(status.coverage_rows).toBe(2);
+    expect(status.unprocessed_journal).toBe(0);
   });
 
   test("compaction_status/compaction_run tools proxy to the coordinator", async () => {

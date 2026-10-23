@@ -1,16 +1,16 @@
-# burstel Cloudflare layer — Worker + ShotDO + SQLite IngestDO + R2
+# burstel Cloudflare layer — Worker + ShotDO + SQLite ControlDO + R2
 
 This directory contains the Phase 2 Cloudflare layer for **burstel**. It builds
 on the Phase 1 Go recorder (`../cmd/burstel`, `../Dockerfile`); it does **not**
 replace it.
 
 ```
-                 public HTTPS                       Worker           coordinator / per-shot DO
- exporter ──► POST /ingest/v1/{traces,metrics,logs} ─► token→instance ─► IngestDO ─► R2 raw journal + ledger (durable ACK)
- rec client ─► POST /api/shots            ──► admin|member ────► IngestDO (window marker by default;
+                 public HTTPS                     Worker                    control / per-shot DO
+ exporter ──► POST /ingest/v1/{traces,metrics,logs} ─► memory→KV token ─► R2 raw journal (one PUT, durable ACK)
+ rec client ─► POST /api/shots            ──► admin|member ────► ControlDO (window marker by default;
                                                                   mode=recording → register + ShotDO)
- rec client ─► POST /api/instances/{n}/tokens ─► admin|member ► IngestDO (issue/rotate 24h token)
- rec client ─► GET  /api/shots            ──► admin|member ────► IngestDO (shot registry, ?owner= filter)
+ rec client ─► POST /api/instances/{n}/tokens ─► admin|member ► ControlDO (issue/rotate 24h token + KV)
+ rec client ─► GET  /api/shots            ──► admin|member ────► ControlDO (shot registry, ?owner= filter)
  rec client ─► POST /api/shots/{id}/stop  ──► admin|member ────► ShotDO ─► GET /internal/stop
  rec client ─► POST /api/tokens           ──► admin ──────────► AuthDO (digest + scope + owner)
                                                                   │        GET /internal/artifact
@@ -26,6 +26,16 @@ replace it.
 * `src/auth-do.ts` — singleton SQLite `AuthDO` holding the per-person token registry (digest + scope + attribution-only owner).
 * `src/shot-do.ts` — `ShotDO extends DurableObject`, wires `ctx.storage.sql`,
   `ctx.container` and the `BUCKET` R2 binding into the core.
+* `src/control-do.ts` — the singleton `ControlDO` (formerly `IngestDO`). It owns
+  instances, authoritative tokens, the shot registry, the segment manifest and
+  the compaction lease/pins, and is **never** on the ingest hot path.
+* `src/admission.ts` — memory -> KV -> authoritative token admission with exact
+  local expiry and no negative caching (spec 023 D1).
+* `src/journal-listing.ts` — R2 prefix/time-seek discovery shared by the
+  compactor, window "pending journal" disclosure and operational counts.
+* `src/compactor-core.ts` — spec-018/023 compaction: listing discovery, grace +
+  lookback re-list, revoked-token exclusion, cross-instance time-bucket
+  segments, verified publication and GC.
 
 ## Public HTTP API
 

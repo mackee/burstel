@@ -8,6 +8,7 @@
 
 import { describe, expect, test } from "bun:test";
 
+import { resetAdmissionCache } from "../src/admission";
 import { handleRequest } from "../src/app";
 import type { AppEnv, DoStubLike, ShotNamespaceLike } from "../src/env";
 import type { AuthCore, AuthTokenIssue } from "../src/auth-core";
@@ -56,6 +57,7 @@ function nextId(): string {
 }
 
 function setup(): Setup {
+  resetAdmissionCache();
   let clock = 1_700_000_000_000;
   const now = () => clock;
   const shots = new FakeShotNamespace();
@@ -68,6 +70,7 @@ function setup(): Setup {
     BUCKET: new FakeBucket(),
     BURSTEL_API_TOKEN: ENV_ADMIN,
     PUBLIC_BASE_URL: "https://burstel.example",
+    now,
   };
   return {
     env,

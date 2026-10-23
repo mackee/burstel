@@ -11,13 +11,15 @@
 //   1. exactly-24h credential boundary at +/-1ms, persisted across a restart;
 //   2. digest-only persistence and no secret leakage in any list/response;
 //   3. admin|member|push scope separation in both directions (REST + MCP);
-//   4. durable R2 ACK ordering (write + ledger before 200) and fail-closed 5xx;
+//   4. durable R2 ACK ordering (one object, no per-request ledger) and
+//      fail-closed 5xx (spec 023 supersedes the spec-017 ledger guarantee);
 //   5. non-shot idle intake is retained, never silently discarded;
 //   6. bounded rotation grace boundary;
 //   7. legacy migration: a pre-016 shot registry and existing credential rows.
 
 import { describe, expect, test } from "bun:test";
 
+import { resetAdmissionCache } from "../src/admission";
 import { handleRequest } from "../src/app";
 import { AuthCore } from "../src/auth-core";
 import type { AppEnv, DoStubLike, ShotNamespaceLike } from "../src/env";
@@ -66,10 +68,11 @@ interface Setup {
 }
 
 function setup(): Setup {
+  resetAdmissionCache();
   let clock = 1_700_000_000_000;
   const now = () => clock;
   const bucket = new FakeBucket();
-  const ingest = makeIngest({ now });
+  const ingest = makeIngest({ now, bucket });
   const auth = makeAuth({ now });
   const env: AppEnv = {
     SHOT_DO: new FakeShotNamespace(),
@@ -78,6 +81,7 @@ function setup(): Setup {
     BUCKET: bucket,
     BURSTEL_API_TOKEN: ENV_ADMIN,
     PUBLIC_BASE_URL: "https://burstel.example",
+    now,
   };
   return {
     env,
@@ -219,80 +223,49 @@ describe("audit 017: scope separation", () => {
   });
 });
 
-describe("audit 017: durable ACK ordering and failure injection", () => {
-  test("the ledger row exists only after 200, and an R2 failure is a retryable 503", async () => {
+describe("audit 023: durable ACK ordering without a ledger", () => {
+  test("a 200 means the R2 object is durable; an R2 failure is a retryable 503", async () => {
     const { env, bucket, ingest } = setup();
     await createInstance(env, "web-1");
-    const token = String((await issue(env, "web-1")).token);
+    const issued = await issue(env, "web-1");
+    const token = String(issued.token);
 
-    // Non-shot idle intake is retained, never discarded.
+    // Non-shot idle intake is retained, never discarded: one object per 200.
     expect((await handleRequest(push(token, "traces"), env)).status).toBe(200);
-    const afterOk = await ingest.listJournal({ limit: 10, offset: 0 });
-    expect(afterOk.total).toBe(1);
+    expect(bucket.objects.size).toBe(1);
+    expect((await ingest.journalStats()).objects).toBe(1);
+    // Spec 023 D2: there is no durable ledger row on the ingest path.
+    expect((await ingest.listJournal({ limit: 10, offset: 0 })).total).toBe(0);
 
-    // R2 failure: no 200, no ledger row, no orphan.
+    // R2 failure: no 200, no object, no orphan.
     bucket.failPut = new Error("injected R2 outage");
     const failed = await handleRequest(push(token, "metrics"), env);
     expect(failed.status).toBe(503);
     expect(((await failed.json()) as { code: string }).code).toBe("journal_write_failed");
-    expect((await ingest.listJournal({ limit: 10, offset: 0 })).total).toBe(1);
+    expect(bucket.objects.size).toBe(1);
     bucket.failPut = undefined;
   });
 
-  test("a ledger-commit failure is 503 but the raw bytes are durable and reconciliation recovers them", async () => {
-    const { env, bucket, ingest } = setup();
+  test("the Trusted token id and checksum are recorded with every journal object", async () => {
+    const { env, bucket } = setup();
     await createInstance(env, "web-1");
-    const token = String((await issue(env, "web-1")).token);
+    const issued = await issue(env, "web-1");
     const payload = new Uint8Array([0x0a, 0x02, 0x07, 0x09]);
 
-    const original = ingest.commitJournal;
-    ingest.commitJournal = (() => {
-      throw new Error("injected ledger outage");
-    }) as typeof ingest.commitJournal;
-
-    const failed = await handleRequest(push(token, "logs", payload), env);
-    expect(failed.status).toBe(503);
-    expect((await ingest.listJournal({ limit: 10, offset: 0 })).total).toBe(0);
-    // The original bytes are durable in R2 despite the failed ACK.
+    expect((await handleRequest(push(String(issued.token), "logs", payload), env)).status).toBe(200);
     const key = [...bucket.objects.keys()][0]!;
-    expect([...bucket.objects.get(key)!.bytes]).toEqual([...payload]);
-
-    ingest.commitJournal = original;
-    const recovered = await ingest.reconcileJournal([
-      {
-        key,
-        instance_id: key.split("/")[1]!,
-        instance: "web-1",
-        signal: "logs",
-        size: payload.byteLength,
-        sha256: await sha256HexBytes(payload),
-        content_type: "application/x-protobuf",
-        content_encoding: "",
-        received_at: Date.now(),
-      },
-    ]);
-    expect(recovered).toEqual({ reconciled: 1, skipped: 0 });
-    // Idempotent replay never double counts.
-    const replay = await ingest.reconcileJournal([
-      {
-        key,
-        instance_id: key.split("/")[1]!,
-        instance: "web-1",
-        signal: "logs",
-        size: payload.byteLength,
-        sha256: await sha256HexBytes(payload),
-        content_type: "application/x-protobuf",
-        content_encoding: "",
-        received_at: Date.now(),
-      },
-    ]);
-    expect(replay).toEqual({ reconciled: 0, skipped: 1 });
-    expect((await ingest.listJournal({ limit: 10, offset: 0 })).total).toBe(1);
+    const stored = bucket.objects.get(key)!;
+    expect([...stored.bytes]).toEqual([...payload]);
+    expect(stored.customMetadata?.instance_id).toBe(String(issued.instance_id));
+    expect(stored.customMetadata?.instance).toBe("web-1");
+    expect(stored.customMetadata?.signal).toBe("logs");
+    expect(stored.customMetadata?.token_id).toBe(String(issued.id));
+    expect(stored.customMetadata?.sha256).toBe(await sha256HexBytes(payload));
   });
 });
 
-describe("audit 017: bounded rotation grace", () => {
-  test("the previous token works until exactly the grace instant, then is revoked", async () => {
+describe("audit 023: bounded rotation grace with edge propagation", () => {
+  test("the previous token works until the grace instant, then is revoked", async () => {
     const { env, setClock, now } = setup();
     await createInstance(env, "web-1");
     const first = await issue(env, "web-1");
@@ -300,8 +273,11 @@ describe("audit 017: bounded rotation grace", () => {
     const rotatedAt = now();
 
     setClock(rotatedAt + 59_999);
+    resetAdmissionCache();
     expect((await handleRequest(push(String(first.token)), env)).status).toBe(200);
     setClock(rotatedAt + 60_000);
+    // Revocation is absolute once the propagation window has elapsed.
+    resetAdmissionCache();
     expect((await handleRequest(push(String(first.token)), env)).status).toBe(401);
     expect((await handleRequest(push(String(rotated.token)), env)).status).toBe(200);
   });

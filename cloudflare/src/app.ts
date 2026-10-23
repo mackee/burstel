@@ -23,6 +23,7 @@
 //   POST   /api/shots/{id}/analyze          (admin|member)
 //   GET    /api/shots/{id}/schema           (admin|member)
 //   POST   /api/shots/{id}/compare          (admin|member)
+//   GET    /api/ingest/status               (admin|member) listing-based journal counts
 //   POST   /ingest/v1/{traces,metrics,logs}  (push-only instance token)
 //   POST   /shots/{id}/v1/{traces,metrics,logs} (admin|member, legacy per-shot path)
 //   POST   /mcp                             (admin|member)
@@ -44,6 +45,7 @@ import { handleMcp } from "./mcp";
 import type { Signal } from "./store";
 import {
   analyzeShot,
+  backfillInstanceTokens,
   compareShots,
   compactionRun,
   compactionStatus,
@@ -51,6 +53,7 @@ import {
   createWindowShot,
   dispatchGet,
   dispatchStop,
+  ingestStatus,
   issueInstanceToken,
   listInstanceTokens,
   listInstances,
@@ -155,6 +158,14 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
       return json(200, { revoked: true, id: result.id });
     }
 
+    // Spec 023 D1.4: one-shot KV backfill for pre-023 `bit_` tokens. Admin only
+    // (it touches the credential cache); idempotent and safe to re-run.
+    if (path === "/api/instance-tokens/backfill") {
+      if (!isRegistryAdmin(principal)) throw forbidden();
+      if (request.method !== "POST") throw badRequest("method not allowed");
+      return json(200, await backfillInstanceTokens(ctx));
+    }
+
     // ---------------------------------------------- person token registry
     // Admin-only (spec 013, Part B). A member token is denied here with 403
     // before any DO work.
@@ -196,6 +207,12 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
     if (path === "/api/compaction/status") {
       if (request.method !== "GET") throw badRequest("method not allowed");
       return json(200, await compactionStatus(ctx));
+    }
+    // Spec 023: listing-based ingest/journal counts. This is the benchmark
+    // verification surface even when no compactor container is available.
+    if (path === "/api/ingest/status") {
+      if (request.method !== "GET") throw badRequest("method not allowed");
+      return json(200, await ingestStatus(ctx));
     }
     if (path === "/api/compaction/run") {
       if (!isRegistryAdmin(principal)) throw forbidden();
@@ -354,6 +371,7 @@ function toolContext(env: AppEnv, url: URL): ToolContext {
     origin: url.origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
     bucket: env.BUCKET,
+    tokens: env.INSTANCE_TOKENS,
   };
 }
 

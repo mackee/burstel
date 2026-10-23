@@ -139,17 +139,18 @@ describe.skipIf(!goAvailable)("compactor Go service bridge (spec 018)", () => {
       const bytes = new Uint8Array(0);
       const sha = await sha256Hex(bytes);
       const key = `journal/inst-go/${signal}/${receivedAt}-${signal}.bin`;
-      await bucket.put(key, bytes, { sha256: sha, customMetadata: { sha256: sha } });
-      await ingest.commitJournal({
-        key,
-        instance_id: "inst-go",
-        instance: "go-1",
-        signal,
-        size: 0,
+      await bucket.put(key, bytes, {
         sha256: sha,
-        content_type: "application/x-protobuf",
-        content_encoding: "",
-        received_at: receivedAt,
+        customMetadata: {
+          sha256: sha,
+          signal,
+          instance_id: "inst-go",
+          instance: "go-1",
+          received_at: String(receivedAt),
+          token_id: "tok-go",
+          content_encoding: "",
+          content_type: "application/x-protobuf",
+        },
       });
     }
 

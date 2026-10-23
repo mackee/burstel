@@ -63,6 +63,11 @@ type BuildObject struct {
 	ContentType     string `json:"content_type"`
 	Size            int64  `json:"size"`
 	SHA256          string `json:"sha256"`
+	// InstanceID/Instance are the object's own trusted attribution. A segment
+	// aggregates a cross-instance time bucket (spec 023 D3.3), so they may differ
+	// from the request scope. Empty means "use the request scope".
+	InstanceID string `json:"instance_id"`
+	Instance   string `json:"instance"`
 	// BodyBase64 is the exact stored wire bytes (possibly gzip), base64-encoded.
 	BodyBase64 string `json:"body_base64"`
 }
@@ -254,11 +259,19 @@ func (s *Service) Build(ctx context.Context, req BuildRequest) (BuildResponse, e
 		if err != nil {
 			return BuildResponse{}, badReq(fmt.Sprintf("object %s: decode: %v", o.Key, err))
 		}
+		objectInstanceID := strings.TrimSpace(o.InstanceID)
+		if objectInstanceID == "" {
+			objectInstanceID = req.InstanceID
+		}
+		objectInstance := o.Instance
+		if objectInstance == "" {
+			objectInstance = req.Instance
+		}
 		rec := JournalRecord{
 			Object: JournalObject{
 				Key:             o.Key,
-				InstanceID:      req.InstanceID,
-				Instance:        req.Instance,
+				InstanceID:      objectInstanceID,
+				Instance:        objectInstance,
 				Signal:          signal,
 				ReceivedAt:      time.UnixMilli(o.ReceivedAt).UTC(),
 				ReceivedAtMS:    o.ReceivedAt,

@@ -1,9 +1,14 @@
 # ADR-003: Named instances and durable continuous OTLP intake
 
-Status: accepted (spec 014). Supersedes the per-shot ingest-token and
-token→shot ingest-routing design from spec 013 and the installation-wide token
-from spec 006, while preserving spec 013's per-person `admin`/`member`
-credentials and the existing frozen-shot read/compare behavior.
+Status: accepted (spec 014). Superseded in part by ADR-007 (spec 023): the
+per-request ledger and the immediate-at-the-edge revocation wording are
+replaced by KV token admission, one R2 object per acknowledged export, and
+compaction-time revocation exclusion. Named instances, token -> instance
+routing and the 24 h token lifetime are unchanged. It still supersedes the
+per-shot ingest-token and token→shot ingest-routing design from spec 013 and
+the installation-wide token from spec 006, while preserving spec 013's
+per-person `admin`/`member` credentials and the existing frozen-shot
+read/compare behavior.
 
 ## Context
 
@@ -45,6 +50,12 @@ retained even when no shot is active, and a shot later selects a time window.
    and documented (the ledger is idempotent on the object key, and
    reconciliation recovers an object whose ledger row was lost). No runtime
    Container is required to acknowledge intake.
+
+   > **Amended by ADR-007 / spec 023.** Step (c) is gone: the ACK now depends on
+   > one durable R2 object only, and compaction discovers it by listing. Every
+   > 200 is a durable object that is either in a verified segment or explicitly
+   > reported as `excluded_revoked`. See ADR-007 for the late-write guard and
+   > the revised revocation guarantee.
 
 4. **Trusted identity.** The server assigns `burstel.instance_id` and
    `burstel.instance` as trusted, separate fields in R2 metadata and the ledger.

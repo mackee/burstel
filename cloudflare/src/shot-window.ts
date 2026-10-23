@@ -8,6 +8,8 @@
 // This module is pure (no Cloudflare globals) so the exact same validation and
 // candidate-segment selection run in production and in unit tests.
 
+import { isCrossInstanceScope } from "./segment-scope";
+
 /** Who assigned a window's timestamps. */
 export type Provenance = "server" | "external";
 
@@ -181,7 +183,14 @@ export function selectSegments(
   const selected: WindowSegmentMeta[] = [];
   const missing: string[] = [];
   for (const seg of segments) {
-    if (want.size > 0 && !want.has(seg.instance.toLowerCase()) && !want.has(seg.instance_id.toLowerCase())) {
+    // A cross-instance bucket may contain the requested instance; the analysis
+    // query filters rows by `instance_id` (spec 023 D3.3).
+    if (
+      want.size > 0 &&
+      !isCrossInstanceScope(seg.instance_id) &&
+      !want.has(seg.instance.toLowerCase()) &&
+      !want.has(seg.instance_id.toLowerCase())
+    ) {
       continue;
     }
     const receiveOverlap = seg.last_received_at >= lo && seg.first_received_at < hi;

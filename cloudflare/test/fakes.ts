@@ -11,6 +11,8 @@ import type {
   ArtifactSink,
   ArtifactSource,
   R2BucketLike,
+  R2ListOptionsLike,
+  R2ListResultLike,
   R2ObjectBodyLike,
   R2ObjectLike,
   R2PutOptionsLike,
@@ -25,6 +27,7 @@ import type {
   CompactorNamespaceLike,
   DoStubLike,
   IngestNamespaceLike,
+  KVNamespaceLike,
 } from "../src/env";
 import { IngestCore } from "../src/ingest-core";
 import type { SqlCursor, SqlRow, SqlValue, SyncSql } from "../src/store";
@@ -531,6 +534,8 @@ export class FakeBucket implements R2BucketLike {
   >();
   putCalls = 0;
   failPut: Error | undefined;
+  /** Keys whose body read fails (simulates a race/outage after listing). */
+  failGetForKey: string | undefined;
 
   async put(key: string, value: unknown, options?: R2PutOptionsLike): Promise<R2ObjectLike | null> {
     this.putCalls += 1;
@@ -551,6 +556,7 @@ export class FakeBucket implements R2BucketLike {
   }
 
   async get(key: string): Promise<R2ObjectBodyLike | null> {
+    if (this.failGetForKey === key) throw new Error(`simulated R2 read failure for ${key}`);
     const object = this.objects.get(key);
     if (!object) return null;
     const copy = new Uint8Array(object.bytes.byteLength);
@@ -579,6 +585,61 @@ export class FakeBucket implements R2BucketLike {
 
   async delete(key: string): Promise<void> {
     this.objects.delete(key);
+  }
+
+  /**
+   * Prefix listing with the R2 semantics the journal discovery relies on:
+   * `prefix`, exclusive `startAfter`, `delimiter` -> `delimitedPrefixes`,
+   * cursor pagination and `include: ["customMetadata"]`.
+   */
+  async list(options?: R2ListOptionsLike): Promise<R2ListResultLike> {
+    const prefix = options?.prefix ?? "";
+    const delimiter = options?.delimiter;
+    const limit = Math.max(1, Math.min(options?.limit ?? 1000, 1000));
+    const all = [...this.objects.keys()].sort();
+    let keys = all.filter((key) => key.startsWith(prefix));
+    if (options?.startAfter) keys = keys.filter((key) => key > options.startAfter!);
+
+    const delimitedPrefixes = new Set<string>();
+    const objects: R2ObjectLike[] = [];
+    let lastKey = "";
+    let offset = 0;
+    if (options?.cursor) {
+      const cursorIndex = keys.findIndex((key) => key === options.cursor);
+      offset = cursorIndex >= 0 ? cursorIndex + 1 : 0;
+    }
+    let truncated = false;
+    for (let i = offset; i < keys.length; i++) {
+      const key = keys[i]!;
+      if (delimiter) {
+        const rest = key.slice(prefix.length);
+        const idx = rest.indexOf(delimiter);
+        if (idx >= 0) {
+          delimitedPrefixes.add(prefix + rest.slice(0, idx + delimiter.length));
+          lastKey = key;
+          continue;
+        }
+      }
+      if (objects.length >= limit) {
+        truncated = true;
+        break;
+      }
+      const stored = this.objects.get(key)!;
+      objects.push({
+        key,
+        size: stored.bytes.byteLength,
+        etag: `"${key}"`,
+        sha256: stored.sha256,
+        customMetadata: stored.customMetadata,
+      });
+      lastKey = key;
+    }
+    return {
+      objects,
+      truncated,
+      cursor: truncated ? lastKey : undefined,
+      delimitedPrefixes: delimiter ? [...delimitedPrefixes].sort() : undefined,
+    };
   }
 
   async createMultipartUpload(): Promise<never> {
@@ -641,12 +702,55 @@ export function makeIngest(
   return { core, sql };
 }
 
-/** Namespace stand-in for the singleton IngestDO binding. */
+/** Namespace stand-in for the singleton ControlDO (formerly IngestDO) binding. */
 export class FakeIngestNamespace implements IngestNamespaceLike {
+  /** Every internal path requested, in order (tests assert hot-path freedom). */
+  readonly calls: string[] = [];
+
   constructor(readonly core: IngestCore) {}
 
+  admitCalls(): number {
+    return this.calls.filter((path) => path === "/internal/instance/admit").length;
+  }
+
   getByName(): DoStubLike {
-    return { fetch: (request: Request) => this.core.handleInternal(request) };
+    return {
+      fetch: (request: Request) => {
+        this.calls.push(new URL(request.url).pathname);
+        return this.core.handleInternal(request);
+      },
+    };
+  }
+}
+
+/** In-memory KV namespace with observable calls and optional get failures. */
+export class FakeKV implements KVNamespaceLike {
+  readonly values = new Map<string, string>();
+  getCalls = 0;
+  putCalls = 0;
+  deleteCalls = 0;
+  failGet: Error | undefined;
+
+  async get(key: string, _options?: { type?: "text" | "json"; cacheTtl?: number }): Promise<unknown> {
+    this.getCalls += 1;
+    if (this.failGet) throw this.failGet;
+    const raw = this.values.get(key);
+    if (raw === undefined) return null;
+    try {
+      return JSON.parse(raw) as unknown;
+    } catch {
+      return raw;
+    }
+  }
+
+  async put(key: string, value: string, _options?: { expiration?: number; expirationTtl?: number }): Promise<void> {
+    this.putCalls += 1;
+    this.values.set(key, value);
+  }
+
+  async delete(key: string): Promise<void> {
+    this.deleteCalls += 1;
+    this.values.delete(key);
   }
 }
 

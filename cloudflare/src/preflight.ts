@@ -42,6 +42,16 @@ export interface R2Binding {
   bucket_name?: string;
 }
 
+export interface KVBinding {
+  binding?: string;
+  id?: string;
+}
+
+export interface AnalyticsEngineBinding {
+  binding?: string;
+  dataset?: string;
+}
+
 export interface WranglerConfig {
   name?: string;
   main?: string;
@@ -50,6 +60,8 @@ export interface WranglerConfig {
   durable_objects?: { bindings?: DoBinding[] };
   exports?: Record<string, DoExport>;
   r2_buckets?: R2Binding[];
+  kv_namespaces?: KVBinding[];
+  analytics_engine_datasets?: AnalyticsEngineBinding[];
   vars?: Record<string, unknown>;
   triggers?: { crons?: string[] };
   workers_dev?: boolean;
@@ -287,9 +299,9 @@ export function validateWranglerConfig(
   );
   add(
     "do_binding_ingestdo",
-    bindings.some((b) => b.name === "INGEST_DO" && b.class_name === "IngestDO"),
+    bindings.some((b) => b.name === "INGEST_DO" && b.class_name === "ControlDO"),
     true,
-    "INGEST_DO -> IngestDO durable object binding",
+    "INGEST_DO -> ControlDO durable object binding (spec 023 D4)",
   );
   add(
     "do_binding_authdo",
@@ -307,9 +319,9 @@ export function validateWranglerConfig(
   );
   add(
     "export_ingestdo_sqlite",
-    exports["IngestDO"]?.type === "durable-object" && exports["IngestDO"]?.storage === "sqlite",
+    exports["ControlDO"]?.type === "durable-object" && exports["ControlDO"]?.storage === "sqlite",
     true,
-    `exports.IngestDO=${JSON.stringify(exports["IngestDO"] ?? null)}`,
+    `exports.ControlDO=${JSON.stringify(exports["ControlDO"] ?? null)}`,
   );
   add(
     "export_authdo_sqlite",
@@ -339,7 +351,30 @@ export function validateWranglerConfig(
     `BUCKET -> ${expectedBucket}`,
   );
 
+  const kv = cfg.kv_namespaces ?? [];
+  add(
+    "kv_instance_tokens_binding",
+    kv.some((b) => b.binding === "INSTANCE_TOKENS" && typeof b.id === "string" && b.id.trim() !== ""),
+    true,
+    "INSTANCE_TOKENS KV namespace binding (spec 023 D1)",
+  );
+
+  const analytics = cfg.analytics_engine_datasets ?? [];
+  add(
+    "analytics_ingest_binding",
+    analytics.some((b) => b.binding === "INGEST_ANALYTICS" && typeof b.dataset === "string" && b.dataset.trim() !== ""),
+    true,
+    "INGEST_ANALYTICS Analytics Engine dataset (spec 023 D2)",
+  );
+
   const vars = isPlainObject(cfg.vars) ? cfg.vars : {};
+  const lateWrite = Number.parseInt(String(vars["LATE_WRITE_LIMIT_MS"] ?? ""), 10);
+  add(
+    "late_write_limit_configured",
+    Number.isFinite(lateWrite) && lateWrite > 0,
+    true,
+    "LATE_WRITE_LIMIT_MS must be a positive number of milliseconds (spec 023 D2.2)",
+  );
   const insecure = vars["BURSTEL_DEV_INSECURE_AUTH"];
   add(
     "no_anonymous_admin",

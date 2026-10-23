@@ -64,6 +64,7 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
     origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
     bucket: env.BUCKET,
+    tokens: env.INSTANCE_TOKENS,
   });
   const isAdmin = isRegistryAdmin(principal);
 

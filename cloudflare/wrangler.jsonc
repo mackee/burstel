@@ -26,8 +26,12 @@
   // when COMPACTION_GC is explicitly enabled.
   "vars": {
     "MAX_INGEST_BYTES": "8388608",
+    // Spec 023 D2.2: late-write guard = COMPACTION_GRACE_MS / 2 by default.
+    "LATE_WRITE_LIMIT_MS": "45000",
     "COMPACTION_WINDOW_MS": "60000",
     "COMPACTION_GRACE_MS": "90000",
+    // Spec 023 D3.1: every run re-lists this lookback (>= 2 x grace).
+    "COMPACTION_LOOKBACK_MS": "180000",
     "COMPACTION_RETENTION_MS": "86400000",
     "COMPACTION_GC": "0",
     "COMPACTION_BATCH_OBJECTS": "2048",
@@ -73,7 +77,7 @@
       },
       {
         "name": "INGEST_DO",
-        "class_name": "IngestDO"
+        "class_name": "ControlDO"
       },
       {
         "name": "AUTH_DO",
@@ -91,7 +95,7 @@
       "type": "durable-object",
       "storage": "sqlite"
     },
-    "IngestDO": {
+    "ControlDO": {
       "type": "durable-object",
       "storage": "sqlite"
     },
@@ -111,6 +115,23 @@
   "triggers": {
     "crons": ["*/5 * * * *"]
   },
+
+  // Spec 023 D1: instance-token admission cache. Key `sha256(token)`, positive
+  // entries only; deleted on revoke/rotate.
+  "kv_namespaces": [
+    {
+      "binding": "INSTANCE_TOKENS",
+      "id": "00000000000000000000000000000000"
+    }
+  ],
+
+  // Spec 023 D2: ledger-free ingest counters (accepted/rejected/bytes/recency).
+  "analytics_engine_datasets": [
+    {
+      "binding": "INGEST_ANALYTICS",
+      "dataset": "burstel_ingest"
+    }
+  ],
 
   "r2_buckets": [
     {

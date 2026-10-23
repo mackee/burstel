@@ -82,6 +82,7 @@ function compactorConfigFromEnv(env: CompactorEnv): Partial<CompactorConfig> {
   return {
     windowMs: num(env.COMPACTION_WINDOW_MS, 60_000),
     graceMs: num(env.COMPACTION_GRACE_MS, 90_000),
+    lookbackMs: num(env.COMPACTION_LOOKBACK_MS, 180_000),
     retentionMs: num(env.COMPACTION_RETENTION_MS, 24 * 60 * 60 * 1000),
     gcEnabled: bool(env.COMPACTION_GC),
     batchObjects: num(env.COMPACTION_BATCH_OBJECTS, 2048),
