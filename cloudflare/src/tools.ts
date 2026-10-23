@@ -22,11 +22,11 @@ import type {
   IngestNamespaceLike,
   ShotNamespaceLike,
 } from "./env";
-import { badRequest, conflict, HttpError } from "./errors";
+import { badRequest, conflict, HttpError, unknownInstance } from "./errors";
 import { INGEST_DO_NAME, isValidInstanceName, normalizeInstanceName } from "./ingest-core";
 import type { CreateWindowShotInput, InstanceMetadata, InstanceTokenIssue, InstanceTokenMetadata, SegmentManifestRow, StartWindowShotInput, WindowShotRecord } from "./ingest-core";
 import { isShotId, newShotId } from "./ids";
-import { selectSegments } from "./shot-window";
+import { isValidInstanceLabel, normalizeInstances, selectSegments } from "./shot-window";
 import type { ShotWindow, WindowSegmentMeta } from "./shot-window";
 
 export interface ToolContext {
@@ -125,10 +125,22 @@ export interface MintTokenInput {
 
 // ---------------------------------------------------------------- start/stop
 
+/** The only supported shot modes. `window` is the default (spec 022). */
+export type ShotMode = "window" | "recording";
+
+function resolveMode(mode: string | undefined): ShotMode {
+  if (mode === undefined || mode === "") return "window";
+  if (mode === "window" || mode === "recording") return mode;
+  throw badRequest(`unknown mode ${JSON.stringify(mode)}; use "window" (default) or "recording"`);
+}
+
 /**
- * Creates and starts a shot. Spec 014 removed the application-level recording
- * cap, so this always registers the shot and starts recording; concurrency is
- * bounded only by the explicit backend container capacity controls.
+ * Creates and starts a shot.
+ *
+ * Spec 022, Part A: the default mode is `window` — a logical half-open
+ * `[start,end)` marker over the continuous instance streams. The legacy
+ * per-container `recording` shot is only created when the caller explicitly
+ * asks for `mode=recording`; its response is flagged `deprecated: true`.
  */
 export async function startShot(
   ctx: ToolContext,
@@ -138,8 +150,9 @@ export async function startShot(
 ): Promise<Record<string, unknown>> {
   const shotId = newShotId();
   const principal = normalizeOwner(owner);
+  const mode = resolveMode(opts.mode);
 
-  if (opts.mode === "window") {
+  if (mode === "window") {
     const record = await startWindowShot(ctx, {
       shot_id: shotId,
       owner: principal,
@@ -161,18 +174,42 @@ export async function startShot(
     throw error;
   }
 
-  return withIngestEndpoints(info, ctx);
+  return { ...withIngestEndpoints(info, ctx), deprecated: true };
+}
+
+/**
+ * Rejects window instance subsets that name unregistered instances. Spec 022
+ * Part A4: an unknown name is a 400 `unknown_instance`, never a silently empty
+ * window.
+ */
+async function requireKnownInstances(ctx: ToolContext, instances: unknown): Promise<void> {
+  // Invalid labels are dropped by normalizeInstances; surface them instead of
+  // silently widening the window to every instance.
+  const malformed = (Array.isArray(instances) ? instances : [])
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => value !== "" && !isValidInstanceLabel(value));
+  if (malformed.length > 0) throw unknownInstance(malformed);
+
+  const requested = normalizeInstances(instances);
+  if (requested.length === 0) return;
+  const listed = await ingestCall<{ instances: InstanceMetadata[] }>(ctx, "/internal/instance/list", "GET");
+  const known = new Set(listed.instances.map((instance) => instance.name));
+  const missing = requested.filter((name) => !known.has(name));
+  if (missing.length > 0) throw unknownInstance(missing);
 }
 
 /** Creates an externally supplied, backdated complete window shot. */
 export async function createWindowShot(ctx: ToolContext, input: CreateWindowShotInput): Promise<WindowShotRecord> {
   if (typeof input.shot_id !== "string" || !isShotId(input.shot_id)) throw badRequest("invalid shot id");
+  await requireKnownInstances(ctx, input.instances);
   return ingestCall<WindowShotRecord>(ctx, "/internal/shot/window/create", "POST", input);
 }
 
 /** Opens a server-clock window marker. */
 export async function startWindowShot(ctx: ToolContext, input: StartWindowShotInput): Promise<WindowShotRecord> {
   if (typeof input.shot_id !== "string" || !isShotId(input.shot_id)) throw badRequest("invalid shot id");
+  await requireKnownInstances(ctx, input.instances);
   return ingestCall<WindowShotRecord>(ctx, "/internal/shot/window/start", "POST", input);
 }
 

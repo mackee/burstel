@@ -5,6 +5,9 @@
 *.duckdb.tmp
 coverage.out
 
+# Local toolchain/scratch used by sandboxed agents (never committed)
+/.scratch/
+
 # Local field trial scratch (scripts/local-trial.sh)
 /.trial/
 

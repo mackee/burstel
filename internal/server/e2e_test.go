@@ -242,9 +242,10 @@ func TestShotEndToEnd(t *testing.T) {
 	if status2 != http.StatusOK || stopRes2.SHA256 != stopRes.SHA256 || stopRes2.SizeBytes != stopRes.SizeBytes {
 		t.Fatalf("second stop = %d %+v", status2, stopRes2)
 	}
-	// New OTLP after stop is refused, not silently dropped.
-	if got := h.postOTLP("/v1/traces", "application/x-protobuf", traceBytes, "").StatusCode; got == http.StatusOK {
-		t.Fatalf("post after stop status = %d, want non-200", got)
+	// New OTLP after stop is acknowledged with OTLP partial_success and discarded
+	// (spec 022, Part C), never retried or silently recorded.
+	if got := h.postOTLP("/v1/traces", "application/x-protobuf", traceBytes, "").StatusCode; got != http.StatusOK {
+		t.Fatalf("post after stop status = %d, want 200 + partial_success", got)
 	}
 
 	// Artifact bytes match size and checksum.

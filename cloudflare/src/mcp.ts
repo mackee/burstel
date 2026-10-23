@@ -93,13 +93,19 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
     {
       title: "Start a shot",
       description:
-        "Create a new recording shot and return its id plus the stable OTLP/HTTP ingest URL (legacy mode). With mode=window, open a server-clock logical time window [start,end) marker instead; ingestion stays continuous and no per-shot token is issued. metadata may carry the commit SHA, benchmark/scenario and a note; owner is an optional attribution label.",
+        "Open a logical window shot (default): a half-open [start,end) marker over the continuous instance streams. Ingestion stays continuous and no per-shot token is issued. Pass mode=recording only for the deprecated legacy recording shot (a per-shot container that must be stopped to freeze an artifact). metadata may carry the commit SHA, benchmark/scenario and a note; owner is an optional attribution label; instances restricts the window to known instance names.",
       inputSchema: {
         metadata: z.record(z.string(), z.any()).optional(),
         owner: z.string().optional().describe("Attribution-only owner label; never an authorization boundary"),
-        mode: z.enum(["recording", "window"]).optional().describe("recording (default) or window"),
+        mode: z
+          .enum(["window", "recording"])
+          .optional()
+          .describe("window (default) | recording (legacy, deprecated)"),
         name: z.string().optional().describe("Window marker label (mode=window)"),
-        instances: z.array(z.string()).optional().describe("Instance subset (mode=window); default all"),
+        instances: z
+          .array(z.string())
+          .optional()
+          .describe("Instance subset (mode=window); default all. Unknown names are rejected with 400 unknown_instance"),
       },
     },
     async ({ metadata, owner, mode, name, instances }) => {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	colltrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/mackee/burstel/internal/fixtures"
@@ -49,9 +50,10 @@ func TestFailureModesInvalidExportPayloadRejected(t *testing.T) {
 	}
 }
 
-// TestFailureModesIngestAfterStopRejected verifies that once a shot is frozen,
-// new OTLP exports are refused (503) so an exporter can detect the teardown.
-func TestFailureModesIngestAfterStopRejected(t *testing.T) {
+// TestFailureModesIngestAfterStopAcknowledged verifies that once a shot is
+// frozen, new OTLP exports are acknowledged with an OTLP partial_success and
+// discarded (spec 022, Part C) instead of provoking an exporter retry storm.
+func TestFailureModesIngestAfterStopAcknowledged(t *testing.T) {
 	h := newHarness(t)
 	if got := h.start("shot-1", nil); got != http.StatusOK {
 		t.Fatalf("start = %d", got)
@@ -66,10 +68,15 @@ func TestFailureModesIngestAfterStopRejected(t *testing.T) {
 		t.Fatalf("stop = %d", status)
 	}
 	after := h.postOTLP("/v1/traces", "application/x-protobuf", mustMarshal(t, fixtures.TraceExport()), "")
-	_, _ = io.Copy(io.Discard, after.Body)
-	after.Body.Close()
-	if after.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("post-stop ingest = %d, want 503", after.StatusCode)
+	if after.StatusCode != http.StatusOK {
+		t.Fatalf("post-stop ingest = %d, want 200 + partial_success", after.StatusCode)
+	}
+	var out colltrace.ExportTraceServiceResponse
+	if err := proto.Unmarshal(readAll(t, after), &out); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if out.GetPartialSuccess() == nil || out.GetPartialSuccess().GetRejectedSpans() == 0 {
+		t.Fatalf("post-stop ingest must report rejected spans, got %v", out.GetPartialSuccess())
 	}
 }
 

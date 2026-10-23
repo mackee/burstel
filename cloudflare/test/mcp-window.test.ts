@@ -97,6 +97,7 @@ describe("MCP window shots and token tools", () => {
 
   test("creates a window shot, lists it, gets it and stops it", async () => {
     const env = makeEnv();
+    await callTool(env, "instance_create", { name: "web-1" });
     const now = Date.now();
     const created = await callTool(env, "shot_create", {
       name: "bench",
@@ -121,12 +122,41 @@ describe("MCP window shots and token tools", () => {
 
   test("server-clock window start/stop via shot_start mode=window", async () => {
     const env = makeEnv();
+    await callTool(env, "instance_create", { name: "web-1" });
     const started = await callTool(env, "shot_start", { mode: "window", name: "run", instances: ["web-1"] });
     expect(started["kind"]).toBe("window");
     expect(started["state"]).toBe("open");
     const shotId = String(started["shot_id"]);
     const stopped = await callTool(env, "shot_stop", { shot_id: shotId });
     expect(["ready", "incomplete"]).toContain(String(stopped["state"]));
+  });
+
+  test("shot_start defaults to a window shot when mode is omitted", async () => {
+    const env = makeEnv();
+    const started = await callTool(env, "shot_start", { metadata: { scenario: "bench" } });
+    expect(started["kind"]).toBe("window");
+    expect(started["state"]).toBe("open");
+    expect(started["otlp_endpoints"]).toBeUndefined();
+    // No legacy ShotDO / recording container is created for the default path.
+    expect((env.SHOT_DO as unknown as FakeShotNamespace).shots.size).toBe(0);
+  });
+
+  test("explicit mode=recording still works and is flagged deprecated", async () => {
+    const env = makeEnv();
+    const started = await callTool(env, "shot_start", { mode: "recording", metadata: {} });
+    expect(started["deprecated"]).toBe(true);
+    expect(started["kind"]).toBeUndefined();
+    expect((started["otlp_endpoints"] as Record<string, string>)["traces"]).toContain("/ingest/v1/traces");
+    expect((env.SHOT_DO as unknown as FakeShotNamespace).shots.size).toBe(1);
+  });
+
+  test("shot_start rejects unknown window instance names with unknown_instance", async () => {
+    const env = makeEnv();
+    await expect(callTool(env, "shot_start", { instances: ["nope"] })).rejects.toThrow(/unknown instance/);
+    await callTool(env, "instance_create", { name: "web-1" });
+    const ok = await callTool(env, "shot_start", { instances: ["web-1"] });
+    expect(ok["kind"]).toBe("window");
+    expect((ok["window"] as Record<string, unknown>)["instances"]).toEqual(["web-1"]);
   });
 
   test("instance token tools require an existing instance and never leak secrets in lists", async () => {

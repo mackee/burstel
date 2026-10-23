@@ -178,14 +178,21 @@ export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_EXPORTER_OTLP_ENDPOINT=$BURSTEL_BASE_URL/ingest
 export OTEL_EXPORTER_OTLP_HEADERS="X-Burstel-Token=$PUSH"
 
-# shot は計測ウィンドウの周りで開始/停止する (取り込みは shot に依存しない)
+# shot は既定で「論理ウィンドウ」(mode 省略 = window)。取り込みは shot に依存しない。
 SHOT=$(burstel-cli shot start --metadata commit=abc123 --metadata scenario=bench)
 SHOT_ID=$(printf '%s' "$SHOT" | jq -r .shot_id)
 
-# ベンチマーク実行後、freeze する
+# ベンチマーク実行後、ウィンドウを確定する
 burstel-cli shot stop "$SHOT_ID"
 
-# freeze 済み snapshot の解析
+# もしくは、外部で採取した区間を後から指定する(時計ずれの余白を前後に入れる)
+burstel-cli shot create --name load --instances web-1 \
+  --started-at 2026-01-01T11:59:55Z --ended-at 2026-01-01T12:03:05Z
+
+# 旧来の recording shot は明示時のみ (非推奨)
+# burstel-cli shot start --mode recording
+
+# ウィンドウの解析
 burstel-cli shot get "$SHOT_ID"
 burstel-cli shot schema "$SHOT_ID"
 burstel-cli shot analyze "$SHOT_ID" --top-n 10
@@ -352,13 +359,19 @@ scripts/local-trial.sh                # 60s baseline + 180s regressed
 
 ## Ingest セマンティクスと耐久性
 
-- 受理は **all-or-nothing**。partial success は返さない。
+- recording 中の受理は **all-or-nothing**。生バッチと射影行は 1 トランザクションで
+  コミットするか、リクエスト全体を失敗させる。
 - `200` は「生バッチが DuckDB トランザクションとしてコミットされた後」にのみ返す
   (キューに積んだだけで ack しない)。`stop` の `CHECKPOINT` は、この時点で
   WAL にコミット済みの内容を本体ファイルへ反映する。
+- **shot 外のデータは 200 + OTLP `partial_success`(rejected 件数 +
+  `"no active shot; data discarded"`)で受理し、破棄する。**
+  503 を返して exporter を再試行ループに落とし、BSP キュー溢れと
+  `Shutdown` のハングを招かないため。破棄件数は
+  `/internal/metadata` の `dropped_outside_shot` で確認できる。
 - 不正な protobuf / gzip → `400`、未対応 `Content-Encoding` / `Content-Type` → `415`、
-  サイズ超過 → `413`、recording 中でない / stopping / storage エラー → `503`
-  (exporter が再試行できる)。
+  サイズ超過 → `413`、一時的な過負荷 (in-flight 上限 / stopping / storage busy) →
+  `503` + `Retry-After`。
 - **exact-once は保証しない。** HTTP 応答が曖昧なまま exporter が再送した場合、
   同じ論理レコードが複数回保存され得る。受理したリクエストは必ず完全な形で保持するが、
   ネットワーク断を越えた losslessness は主張しない。
@@ -442,6 +455,7 @@ preflight・bounded E2E は [`docs/cloudflare-deploy.md`](./docs/cloudflare-depl
 | `BURSTEL_DEV_INSECURE_AUTH` | `-dev-insecure-auth` | `false` (明示時のみトークン無しを許可) |
 | `BURSTEL_MAX_REQUEST_BYTES` | `-max-request-bytes` | `67108864` (64 MiB) |
 | `BURSTEL_MAX_INFLIGHT` | `-max-inflight` | `8` |
+| `BURSTEL_MAX_QUEUE_WAIT` | `-max-queue-wait` | `500ms` (書き込みスロット待ち。超過で `503` + `Retry-After`) |
 | `BURSTEL_WRITE_TIMEOUT` | `-write-timeout` | `30s` |
 | `BURSTEL_ANALYSIS_TIMEOUT` | — | `15s` (read-only analysis query/restore) |
 

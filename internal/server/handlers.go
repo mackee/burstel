@@ -25,7 +25,18 @@ import (
 	"github.com/mackee/burstel/internal/storage"
 )
 
-const maxJSONBodyBytes = 1 << 20 // 1 MiB for internal JSON endpoints
+const (
+	maxJSONBodyBytes = 1 << 20 // 1 MiB for internal JSON endpoints
+
+	// retryAfterSeconds is the advisory backoff on a transient 503. One second
+	// matches the OTLP exporter's minimum retry interval and keeps a client
+	// responsive once the server recovers.
+	retryAfterSeconds = 1
+
+	// noActiveShotMessage is the stable OTLP partial_success message for data
+	// that arrived outside any shot window (spec 022, Part C).
+	noActiveShotMessage = "no active shot; data discarded"
+)
 
 var (
 	errTooLarge             = errors.New("payload exceeds configured limit")
@@ -108,7 +119,9 @@ func (s *Server) handleArtifact(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) otlpHandler(signal otlp.Signal) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !s.acquire(r.Context()) {
-			writeError(w, http.StatusServiceUnavailable, errors.New("server is shutting down"))
+			// Transient overload (in-flight limit / shutting down): retryable with
+			// explicit backoff guidance so a client never waits unboundedly.
+			writeRetryableError(w, http.StatusServiceUnavailable, errors.New("server is busy or shutting down"), retryAfterSeconds)
 			return
 		}
 		defer s.release()
@@ -125,9 +138,25 @@ func (s *Server) otlpHandler(signal otlp.Signal) http.HandlerFunc {
 			return
 		}
 
+		// Spec 022, Part C: outside an active shot the standalone recorder
+		// acknowledges the export with an OTLP partial_success and discards it.
+		// Returning 503 here makes BSP retry with backoff until its queue
+		// overflows and TracerProvider.Shutdown hangs.
+		switch s.rec.State() {
+		case recorder.StateCreated, recorder.StateFrozen:
+			s.discardOutsideShot(w, signal, decoded.RecordCount)
+			return
+		case recorder.StateFailed:
+			writeRetryableError(w, http.StatusServiceUnavailable, recorder.ErrStorageUnavailable, retryAfterSeconds)
+			return
+		case recorder.StateStopping:
+			writeRetryableError(w, http.StatusServiceUnavailable, recorder.ErrNotRecording, retryAfterSeconds)
+			return
+		}
+
 		shotID, ok := s.rec.ShotID()
 		if !ok {
-			writeRecorderError(w, recorder.ErrNotRecording)
+			s.discardOutsideShot(w, signal, decoded.RecordCount)
 			return
 		}
 
@@ -146,12 +175,27 @@ func (s *Server) otlpHandler(signal otlp.Signal) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), s.cfg.WriteTimeout)
 		defer cancel()
 		if err := s.rec.Ingest(ctx, batch); err != nil {
+			if errors.Is(err, recorder.ErrNotRecording) {
+				// The shot stopped between the state check and the write. Nothing
+				// was committed, so acknowledge-and-discard like any other
+				// out-of-shot export (never a retry storm).
+				s.discardOutsideShot(w, signal, decoded.RecordCount)
+				return
+			}
 			writeRecorderError(w, err)
 			return
 		}
 
 		writeOTLPResponse(w, signal)
 	}
+}
+
+// discardOutsideShot accounts for and acknowledges records that arrived with no
+// active shot. The OTLP partial_success reports the rejected count and a stable
+// message so an operator can tell deliberate discards from real loss.
+func (s *Server) discardOutsideShot(w http.ResponseWriter, signal otlp.Signal, records int64) {
+	s.rec.RecordDroppedOutsideShot(records)
+	writeOTLPPartialSuccess(w, signal, records, noActiveShotMessage)
 }
 
 // readPayload reads and bounds the request body, decompressing gzip when the
@@ -234,16 +278,76 @@ func writeOTLPResponse(w http.ResponseWriter, signal otlp.Signal) {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
+	writeProtobuf(w, body)
+}
+
+// writeOTLPPartialSuccess returns an OTLP 200 whose signal-specific
+// partial_success reports `rejected` records and the given message. This is how
+// the standalone recorder acknowledges data it deliberately discarded outside a
+// shot (spec 022, Part C), mirroring the Cloudflare legacy behavior.
+func writeOTLPPartialSuccess(w http.ResponseWriter, signal otlp.Signal, rejected int64, message string) {
+	var (
+		body []byte
+		err  error
+	)
+	switch signal {
+	case otlp.Traces:
+		body, err = proto.Marshal(&colltrace.ExportTraceServiceResponse{
+			PartialSuccess: &colltrace.ExportTracePartialSuccess{
+				RejectedSpans: rejected,
+				ErrorMessage:  message,
+			},
+		})
+	case otlp.Metrics:
+		body, err = proto.Marshal(&collmetrics.ExportMetricsServiceResponse{
+			PartialSuccess: &collmetrics.ExportMetricsPartialSuccess{
+				RejectedDataPoints: rejected,
+				ErrorMessage:       message,
+			},
+		})
+	case otlp.Logs:
+		body, err = proto.Marshal(&colllogs.ExportLogsServiceResponse{
+			PartialSuccess: &colllogs.ExportLogsPartialSuccess{
+				RejectedLogRecords: rejected,
+				ErrorMessage:       message,
+			},
+		})
+	default:
+		err = fmt.Errorf("unknown signal %q", signal)
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	writeProtobuf(w, body)
+}
+
+func writeProtobuf(w http.ResponseWriter, body []byte) {
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(body)
 }
 
+// acquire reserves an in-flight write slot. It waits at most cfg.MaxQueueWait
+// (zero means fail fast) so overload is reported as a retryable 503 instead of
+// an unbounded queue behind a slow/failed write.
 func (s *Server) acquire(ctx context.Context) bool {
 	select {
 	case s.sem <- struct{}{}:
 		return true
+	default:
+	}
+	if s.cfg.MaxQueueWait <= 0 {
+		return false
+	}
+	timer := time.NewTimer(s.cfg.MaxQueueWait)
+	defer timer.Stop()
+	select {
+	case s.sem <- struct{}{}:
+		return true
+	case <-timer.C:
+		return false
 	case <-ctx.Done():
 		return false
 	}
@@ -303,8 +407,17 @@ func writeRecorderError(w http.ResponseWriter, err error) {
 		errors.Is(err, recorder.ErrStorageUnavailable),
 		errors.Is(err, context.DeadlineExceeded),
 		errors.Is(err, context.Canceled):
-		writeError(w, http.StatusServiceUnavailable, err)
+		writeRetryableError(w, http.StatusServiceUnavailable, err, retryAfterSeconds)
 	default:
-		writeError(w, http.StatusServiceUnavailable, err)
+		writeRetryableError(w, http.StatusServiceUnavailable, err, retryAfterSeconds)
 	}
+}
+
+// writeRetryableError writes a transient failure with an explicit Retry-After
+// so clients back off instead of hammering a busy or stopping server.
+func writeRetryableError(w http.ResponseWriter, status int, err error, retryAfterSeconds int) {
+	if retryAfterSeconds > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds))
+	}
+	writeError(w, status, err)
 }

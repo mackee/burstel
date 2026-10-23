@@ -38,6 +38,7 @@ func main() {
 	flag.BoolVar(&cfg.DevInsecureAuth, "dev-insecure-auth", cfg.DevInsecureAuth, "trusted local development: allow /internal/* without a token (never in production)")
 	flag.Int64Var(&cfg.MaxRequestBytes, "max-request-bytes", cfg.MaxRequestBytes, "max decompressed OTLP request size in bytes")
 	flag.IntVar(&cfg.MaxInflight, "max-inflight", cfg.MaxInflight, "max concurrent durable writes")
+	flag.DurationVar(&cfg.MaxQueueWait, "max-queue-wait", cfg.MaxQueueWait, "how long an OTLP request waits for a write slot before 503 + Retry-After")
 	flag.DurationVar(&cfg.WriteTimeout, "write-timeout", cfg.WriteTimeout, "timeout for a single durable write")
 	flag.Parse()
 

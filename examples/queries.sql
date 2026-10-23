@@ -1,4 +1,13 @@
 -- Example read-only analysis queries for a frozen burstel shot database.
+--
+-- Shot capture (spec 022): a shot is a logical window by default, so no `mode`
+-- is needed — e.g. `burstel-cli shot start --name bench` then
+-- `burstel-cli shot stop <shot-id>`. For an externally marked run, leave a
+-- margin for clock skew:
+--   burstel-cli shot create --name load --instances web-1 \
+--     --started-at 2026-01-01T11:59:55Z --ended-at 2026-01-01T12:03:05Z
+-- (the deprecated legacy recording shot is `burstel-cli shot start --mode recording`).
+--
 -- Open with:
 --   duckdb -readonly /data/<shot>/telemetry.duckdb
 -- or from the Go driver:

@@ -17,6 +17,10 @@ const (
 	DefaultMaxInflight     = 8
 	DefaultWriteTimeout    = 30 * time.Second
 	DefaultAnalysisTimeout = 15 * time.Second
+	// DefaultMaxQueueWait is how long an OTLP request may wait for an in-flight
+	// write slot before the server answers 503 + Retry-After instead of queueing
+	// unboundedly (spec 022, Part C).
+	DefaultMaxQueueWait = 500 * time.Millisecond
 )
 
 // Config describes a running burstel recorder.
@@ -43,6 +47,9 @@ type Config struct {
 	MaxRequestBytes int64
 	// MaxInflight bounds concurrent durable writes.
 	MaxInflight int
+	// MaxQueueWait bounds how long an OTLP request waits for an in-flight slot.
+	// Zero means fail fast with 503 + Retry-After.
+	MaxQueueWait time.Duration
 	// WriteTimeout bounds a single durable write (and the DB lock wait).
 	WriteTimeout time.Duration
 	// AnalysisTimeout bounds a single read-only analysis query/restore.
@@ -58,6 +65,7 @@ func Load() Config {
 		DevInsecureAuth: envBool("BURSTEL_DEV_INSECURE_AUTH"),
 		MaxRequestBytes: envInt64("BURSTEL_MAX_REQUEST_BYTES", DefaultMaxRequestBytes),
 		MaxInflight:     envInt("BURSTEL_MAX_INFLIGHT", DefaultMaxInflight),
+		MaxQueueWait:    envDuration("BURSTEL_MAX_QUEUE_WAIT", DefaultMaxQueueWait),
 		WriteTimeout:    envDuration("BURSTEL_WRITE_TIMEOUT", DefaultWriteTimeout),
 		AnalysisTimeout: envDuration("BURSTEL_ANALYSIS_TIMEOUT", DefaultAnalysisTimeout),
 	}

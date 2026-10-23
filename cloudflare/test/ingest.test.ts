@@ -68,7 +68,7 @@ function admin(method: string, path: string, body?: unknown, token: string | nul
 }
 
 async function createShot(env: AppEnv, owner?: string): Promise<{ id: string; body: Record<string, unknown> }> {
-  const payload: Record<string, unknown> = { metadata: { scenario: "bench" } };
+  const payload: Record<string, unknown> = { mode: "recording", metadata: { scenario: "bench" } };
   if (owner !== undefined) payload.owner = owner;
   const resp = await handleRequest(admin("POST", "/api/shots", payload), env);
   expect(resp.status).toBe(201);

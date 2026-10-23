@@ -227,6 +227,12 @@ differ and that deltas are observations, not causes.
 | Dangerous read-only SQL: file/network/mutation/unknown table (Go test) | HTTP 400 |
 | Two independent recorder processes, different shots | both frozen |
 
+> The post-stop row records the behavior at trial time. Since spec 022 (rev 2)
+> the standalone recorder answers exports outside an active shot with `200` +
+> OTLP `partial_success` (`"no active shot; data discarded"`) and counts them in
+> `/internal/metadata` as `dropped_outside_shot`, so a default-BSP exporter never
+> enters a retry/backoff storm after `shot stop`.
+
 ## Test commands
 
 ```text

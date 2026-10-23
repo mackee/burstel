@@ -6,12 +6,13 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
 
-	_ "github.com/duckdb/duckdb-go/v2"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 
 	"github.com/mackee/burstel/internal/otlp"
 )
@@ -48,49 +49,78 @@ func (b *Batch) RecordCount() int64 {
 	}
 }
 
+// Table names used by the DuckDB appender path.
+const (
+	tableBatches = "otlp_batches"
+	tableSpans   = "spans"
+	tableLogs    = "log_records"
+	tableMetrics = "metric_points"
+)
+
 // Storage is a single-writer DuckDB wrapper. DuckDB itself serializes writers;
-// we additionally cap the sql.DB pool at one connection and guard ordinal
-// assignment with a mutex so ordinal numbers are gap-free per process run.
+// we additionally pin the database to exactly one connection, hold it for the
+// lifetime of the Storage and serialise every batch behind one mutex so ordinal
+// numbers stay gap-free and BEGIN/COMMIT never interleave.
+//
+// Writes use the DuckDB Appender (a chunk-based bulk path) instead of
+// row-at-a-time prepared INSERTs. Every batch still runs inside one explicit
+// transaction on the single writer connection, so the raw payload row and its
+// projection rows commit atomically or not at all.
 type Storage struct {
 	db   *sql.DB
+	conn *sql.Conn
 	path string
 
 	mu          sync.Mutex
 	nextOrdinal int64
 	closed      bool
 
-	insertBatch  *sql.Stmt
-	insertSpan   *sql.Stmt
-	insertLog    *sql.Stmt
-	insertMetric *sql.Stmt
+	driverConn driver.Conn
+	appenders  map[string]*duckdb.Appender
 }
 
 // Open creates (or opens) the DuckDB file at dbPath, applies the schema and
-// prepares the write statements.
+// prepares the write path.
 func Open(ctx context.Context, dbPath string) (*Storage, error) {
 	db, err := sql.Open("duckdb", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("storage: open %s: %w", dbPath, err)
 	}
 	// DuckDB allows a single writer. Serialising the pool also makes the
-	// CHECKPOINT/close sequence deterministic.
+	// CHECKPOINT/close sequence deterministic, and lets the appender and the
+	// transaction share one session.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
 
-	if err := db.PingContext(ctx); err != nil {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("storage: connect %s: %w", dbPath, err)
+	}
+	if err := conn.PingContext(ctx); err != nil {
+		conn.Close()
 		db.Close()
 		return nil, fmt.Errorf("storage: ping %s: %w", dbPath, err)
 	}
 
-	s := &Storage{db: db, path: dbPath}
+	s := &Storage{db: db, conn: conn, path: dbPath, appenders: map[string]*duckdb.Appender{}}
 	for _, stmt := range schemaStatements {
-		if _, err := db.ExecContext(ctx, stmt); err != nil {
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			s.Close()
 			return nil, fmt.Errorf("storage: apply schema: %w", err)
 		}
 	}
-	if _, err := db.ExecContext(ctx,
+	// Ingest must stay predictable: DuckDB's default 16MB WAL auto-checkpoint
+	// blocks a commit for hundreds of milliseconds, which overflows an OTLP
+	// exporter's batch queue and silently drops spans. Push the checkpoint to
+	// the explicit Checkpoint at Stop instead (the WAL still guarantees
+	// durability of every acknowledged batch).
+	if _, err := conn.ExecContext(ctx, `SET wal_autocheckpoint='1GB'`); err != nil {
+		s.Close()
+		return nil, fmt.Errorf("storage: configure WAL checkpoint threshold: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx,
 		`INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)
 		 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, SchemaVersion); err != nil {
 		s.Close()
@@ -104,35 +134,18 @@ func Open(ctx context.Context, dbPath string) (*Storage, error) {
 	return s, nil
 }
 
-func (s *Storage) prepare(ctx context.Context) error {
-	var err error
-	if s.insertBatch, err = s.db.PrepareContext(ctx, `INSERT INTO otlp_batches
-		(shot_id, ordinal, signal, received_at, content_encoding, record_count, payload_length, resource_summary, payload)
-		VALUES (?,?,?,?,?,?,?,?,?)`); err != nil {
-		return fmt.Errorf("storage: prepare batch insert: %w", err)
-	}
-	if s.insertSpan, err = s.db.PrepareContext(ctx, `INSERT INTO spans
-		(shot_id, ordinal, trace_id, span_id, parent_span_id, trace_state, name, kind,
-		 start_time_unix_nano, end_time_unix_nano, status_code, status_message,
-		 service_name, scope_name, scope_version, resource_attributes, scope_attributes, attributes,
-		 flags, dropped_attributes_count, dropped_events_count, dropped_links_count, events_count, links_count)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`); err != nil {
-		return fmt.Errorf("storage: prepare span insert: %w", err)
-	}
-	if s.insertLog, err = s.db.PrepareContext(ctx, `INSERT INTO log_records
-		(shot_id, ordinal, time_unix_nano, observed_time_unix_nano, severity_number, severity_text, body,
-		 service_name, scope_name, scope_version, resource_attributes, scope_attributes, attributes,
-		 trace_id, span_id, event_name, flags, dropped_attributes_count)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`); err != nil {
-		return fmt.Errorf("storage: prepare log insert: %w", err)
-	}
-	if s.insertMetric, err = s.db.PrepareContext(ctx, `INSERT INTO metric_points
-		(shot_id, ordinal, metric_name, metric_type, metric_unit, metric_description,
-		 service_name, scope_name, scope_version, resource_attributes, scope_attributes, attributes,
-		 start_time_unix_nano, time_unix_nano, flags, value_double, value_int,
-		 aggregation_temporality, is_monotonic, count, sum, min, max, bucket_counts, explicit_bounds, detail)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`); err != nil {
-		return fmt.Errorf("storage: prepare metric insert: %w", err)
+// prepare resolves the raw driver connection the DuckDB appender needs. The
+// appenders themselves are created lazily per table on first use.
+func (s *Storage) prepare(_ context.Context) error {
+	if err := s.conn.Raw(func(dc any) error {
+		driverConn, ok := dc.(driver.Conn)
+		if !ok {
+			return fmt.Errorf("storage: unexpected driver connection type %T", dc)
+		}
+		s.driverConn = driverConn
+		return nil
+	}); err != nil {
+		return fmt.Errorf("storage: resolve driver connection: %w", err)
 	}
 	return nil
 }
@@ -140,62 +153,182 @@ func (s *Storage) prepare(ctx context.Context) error {
 // Path returns the on-disk DuckDB file path.
 func (s *Storage) Path() string { return s.path }
 
+// appenderLocked returns the cached appender for table, creating it on first
+// use. Callers must hold s.mu and must not keep the appender across Close.
+func (s *Storage) appenderLocked(table string) (*duckdb.Appender, error) {
+	if a, ok := s.appenders[table]; ok {
+		return a, nil
+	}
+	a, err := duckdb.NewAppenderFromConn(s.driverConn, "", table)
+	if err != nil {
+		return nil, fmt.Errorf("storage: open appender for %s: %w", table, err)
+	}
+	s.appenders[table] = a
+	return a, nil
+}
+
+// dropAppendersLocked discards every cached appender. A failed append leaves an
+// appender in an invalidated state, so the next batch starts from a fresh one.
+func (s *Storage) dropAppendersLocked() {
+	for table, a := range s.appenders {
+		_ = a.Close()
+		delete(s.appenders, table)
+	}
+}
+
 // InsertBatch durably writes the raw batch and its projections in one
 // transaction. A nil return means the data is committed to the DuckDB WAL and
 // will survive CHECKPOINT/close (and a crash, given DuckDB's WAL).
 func (s *Storage) InsertBatch(ctx context.Context, b *Batch) error {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
-		s.mu.Unlock()
 		return ErrClosed
 	}
-	ordinal := s.nextOrdinal
-	s.nextOrdinal++
-	s.mu.Unlock()
-
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("storage: begin tx: %w", err)
-	}
-	defer tx.Rollback() //nolint:errcheck // rollback after commit is a no-op
 
 	receivedAt := b.ReceivedAt
 	if receivedAt.IsZero() {
 		receivedAt = time.Now().UTC()
 	}
-	if _, err := tx.StmtContext(ctx, s.insertBatch).ExecContext(ctx,
-		b.ShotID, ordinal, string(b.Signal), receivedAt.UTC(), b.ContentEncoding,
-		b.RecordCount(), int64(len(b.Payload)), b.ResourceSummary, b.Payload,
-	); err != nil {
-		return fmt.Errorf("storage: insert batch: %w", err)
+
+	if _, err := s.conn.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {
+		return fmt.Errorf("storage: begin tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			// The connection is serialised by s.mu, so a best-effort rollback on
+			// a background context cannot race another writer.
+			_, _ = s.conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	ordinal := s.nextOrdinal
+	// The raw payload row keeps the batch-level metadata; the projections are
+	// appended through the same transaction.
+	if err := s.appendBatchRowLocked(ctx, b, ordinal, receivedAt); err != nil {
+		s.dropAppendersLocked()
+		return err
 	}
 
 	switch b.Signal {
 	case otlp.Traces:
-		stmt := tx.StmtContext(ctx, s.insertSpan)
-		for _, sp := range b.Spans {
-			if _, err := stmt.ExecContext(ctx, spanArgs(b.ShotID, ordinal, sp)...); err != nil {
-				return fmt.Errorf("storage: insert span: %w", err)
-			}
+		if err := s.appendSpansLocked(ctx, b.ShotID, ordinal, b.Spans); err != nil {
+			s.dropAppendersLocked()
+			return err
 		}
 	case otlp.Logs:
-		stmt := tx.StmtContext(ctx, s.insertLog)
-		for _, lr := range b.LogRecords {
-			if _, err := stmt.ExecContext(ctx, logArgs(b.ShotID, ordinal, lr)...); err != nil {
-				return fmt.Errorf("storage: insert log: %w", err)
-			}
+		if err := s.appendLogsLocked(ctx, b.ShotID, ordinal, b.LogRecords); err != nil {
+			s.dropAppendersLocked()
+			return err
 		}
 	case otlp.Metrics:
-		stmt := tx.StmtContext(ctx, s.insertMetric)
-		for _, mp := range b.MetricPoints {
-			if _, err := stmt.ExecContext(ctx, metricArgs(b.ShotID, ordinal, mp)...); err != nil {
-				return fmt.Errorf("storage: insert metric point: %w", err)
-			}
+		if err := s.appendMetricsLocked(ctx, b.ShotID, ordinal, b.MetricPoints); err != nil {
+			s.dropAppendersLocked()
+			return err
 		}
 	}
 
-	if err := tx.Commit(); err != nil {
+	if err := s.flushAppendersLocked(tableBatches); err != nil {
+		s.dropAppendersLocked()
+		return err
+	}
+	switch b.Signal {
+	case otlp.Traces:
+		if err := s.flushAppendersLocked(tableSpans); err != nil {
+			s.dropAppendersLocked()
+			return err
+		}
+	case otlp.Logs:
+		if err := s.flushAppendersLocked(tableLogs); err != nil {
+			s.dropAppendersLocked()
+			return err
+		}
+	case otlp.Metrics:
+		if err := s.flushAppendersLocked(tableMetrics); err != nil {
+			s.dropAppendersLocked()
+			return err
+		}
+	}
+
+	if _, err := s.conn.ExecContext(ctx, "COMMIT"); err != nil {
+		s.dropAppendersLocked()
 		return fmt.Errorf("storage: commit: %w", err)
+	}
+	committed = true
+	s.nextOrdinal++
+	return nil
+}
+
+func (s *Storage) appendBatchRowLocked(ctx context.Context, b *Batch, ordinal int64, receivedAt time.Time) error {
+	a, err := s.appenderLocked(tableBatches)
+	if err != nil {
+		return err
+	}
+	if err := a.AppendRow(
+		b.ShotID, ordinal, string(b.Signal), receivedAt.UTC(), b.ContentEncoding,
+		b.RecordCount(), int64(len(b.Payload)), b.ResourceSummary, b.Payload,
+	); err != nil {
+		return fmt.Errorf("storage: append batch: %w", err)
+	}
+	return nil
+}
+
+func (s *Storage) appendSpansLocked(_ context.Context, shotID string, ordinal int64, spans []otlp.Span) error {
+	if len(spans) == 0 {
+		return nil
+	}
+	a, err := s.appenderLocked(tableSpans)
+	if err != nil {
+		return err
+	}
+	for _, sp := range spans {
+		if err := a.AppendRow(spanArgs(shotID, ordinal, sp)...); err != nil {
+			return fmt.Errorf("storage: append span: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Storage) appendLogsLocked(_ context.Context, shotID string, ordinal int64, records []otlp.LogRecord) error {
+	if len(records) == 0 {
+		return nil
+	}
+	a, err := s.appenderLocked(tableLogs)
+	if err != nil {
+		return err
+	}
+	for _, lr := range records {
+		if err := a.AppendRow(logArgs(shotID, ordinal, lr)...); err != nil {
+			return fmt.Errorf("storage: append log: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Storage) appendMetricsLocked(_ context.Context, shotID string, ordinal int64, points []otlp.MetricPoint) error {
+	if len(points) == 0 {
+		return nil
+	}
+	a, err := s.appenderLocked(tableMetrics)
+	if err != nil {
+		return err
+	}
+	for _, mp := range points {
+		if err := a.AppendRow(metricArgs(shotID, ordinal, mp)...); err != nil {
+			return fmt.Errorf("storage: append metric point: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Storage) flushAppendersLocked(table string) error {
+	a, ok := s.appenders[table]
+	if !ok {
+		return nil
+	}
+	if err := a.Flush(); err != nil {
+		return fmt.Errorf("storage: flush %s: %w", table, err)
 	}
 	return nil
 }
@@ -208,14 +341,14 @@ func (s *Storage) Checkpoint(ctx context.Context) error {
 	if s.closed {
 		return ErrClosed
 	}
-	if _, err := s.db.ExecContext(ctx, "CHECKPOINT"); err != nil {
+	if _, err := s.conn.ExecContext(ctx, "CHECKPOINT"); err != nil {
 		return fmt.Errorf("storage: checkpoint: %w", err)
 	}
 	return nil
 }
 
-// Close releases prepared statements and the underlying connection. It is safe
-// to call more than once.
+// Close releases appenders, prepared statements and the underlying connection.
+// It is safe to call more than once.
 func (s *Storage) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -223,16 +356,15 @@ func (s *Storage) Close() error {
 		return nil
 	}
 	s.closed = true
-	for _, stmt := range []*sql.Stmt{s.insertBatch, s.insertSpan, s.insertLog, s.insertMetric} {
-		if stmt != nil {
-			_ = stmt.Close()
-		}
+	s.dropAppendersLocked()
+	if s.conn != nil {
+		_ = s.conn.Close()
 	}
 	return s.db.Close()
 }
 
-func spanArgs(shotID string, ordinal int64, sp otlp.Span) []any {
-	return []any{
+func spanArgs(shotID string, ordinal int64, sp otlp.Span) []driver.Value {
+	return []driver.Value{
 		shotID, ordinal,
 		sp.TraceID, sp.SpanID, sp.ParentSpanID, sp.TraceState, sp.Name, sp.Kind,
 		int64(sp.StartTimeUnixNano), int64(sp.EndTimeUnixNano),
@@ -244,8 +376,8 @@ func spanArgs(shotID string, ordinal int64, sp otlp.Span) []any {
 	}
 }
 
-func logArgs(shotID string, ordinal int64, lr otlp.LogRecord) []any {
-	return []any{
+func logArgs(shotID string, ordinal int64, lr otlp.LogRecord) []driver.Value {
+	return []driver.Value{
 		shotID, ordinal,
 		int64(lr.TimeUnixNano), int64(lr.ObservedTimeUnixNano),
 		lr.SeverityNumber, lr.SeverityText, lr.Body,
@@ -256,8 +388,8 @@ func logArgs(shotID string, ordinal int64, lr otlp.LogRecord) []any {
 	}
 }
 
-func metricArgs(shotID string, ordinal int64, mp otlp.MetricPoint) []any {
-	return []any{
+func metricArgs(shotID string, ordinal int64, mp otlp.MetricPoint) []driver.Value {
+	return []driver.Value{
 		shotID, ordinal,
 		mp.MetricName, mp.MetricType, mp.MetricUnit, mp.MetricDescription,
 		mp.ServiceName, mp.ScopeName, mp.ScopeVersion,
@@ -270,21 +402,21 @@ func metricArgs(shotID string, ordinal int64, mp otlp.MetricPoint) []any {
 	}
 }
 
-func float64Ptr(v *float64) any {
+func float64Ptr(v *float64) driver.Value {
 	if v == nil {
 		return nil
 	}
 	return *v
 }
 
-func int64Ptr(v *int64) any {
+func int64Ptr(v *int64) driver.Value {
 	if v == nil {
 		return nil
 	}
 	return *v
 }
 
-func uint64Ptr(v *uint64) any {
+func uint64Ptr(v *uint64) driver.Value {
 	if v == nil {
 		return nil
 	}

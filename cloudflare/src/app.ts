@@ -219,18 +219,17 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
           instances?: unknown;
         }>(request);
         const owner = typeof body.owner === "string" ? body.owner : undefined;
+        // Spec 022: `mode` is optional and defaults to `window` inside
+        // startShot. `mode=recording` remains available but is deprecated.
         const mode = typeof body.mode === "string" ? body.mode : undefined;
-        if (mode === "window") {
-          return json(
-            201,
-            await startShot(ctx, body.metadata ?? {}, owner, {
-              mode,
-              name: typeof body.name === "string" ? body.name : undefined,
-              instances: Array.isArray(body.instances) ? body.instances.map(String) : undefined,
-            }),
-          );
-        }
-        return json(201, await startShot(ctx, body.metadata ?? {}, owner));
+        return json(
+          201,
+          await startShot(ctx, body.metadata ?? {}, owner, {
+            mode,
+            name: typeof body.name === "string" ? body.name : undefined,
+            instances: Array.isArray(body.instances) ? body.instances.map(String) : undefined,
+          }),
+        );
       }
       throw badRequest("method not allowed");
     }

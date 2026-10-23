@@ -112,7 +112,7 @@ async function createShot(
   token = ENV_ADMIN,
   owner?: string,
 ): Promise<{ id: string; body: Record<string, unknown> }> {
-  const payload: Record<string, unknown> = { metadata: { scenario: "shared" } };
+  const payload: Record<string, unknown> = { mode: "recording", metadata: { scenario: "shared" } };
   if (owner !== undefined) payload.owner = owner;
   const resp = await handleRequest(req("POST", "/api/shots", { body: payload, token }), env);
   if (resp.status !== 201) throw new Error(`create failed: ${resp.status} ${await resp.text()}`);
@@ -360,7 +360,7 @@ describe("MCP surface", () => {
       expect(names).toContain(name);
     }
 
-    const started = await mcpCall(env, "shot_start", { metadata: { x: 1 }, owner: "alice" }, member.token);
+    const started = await mcpCall(env, "shot_start", { mode: "recording", metadata: { x: 1 }, owner: "alice" }, member.token);
     expect(started.isError).toBe(false);
     const shotId = String(started.data["shot_id"]);
 
@@ -385,7 +385,7 @@ describe("MCP surface", () => {
     expect((await mcpCall(env, "shot_analyze", { shot_id: shotId }, member.token)).isError).toBe(false);
     expect((await mcpCall(env, "shot_schema", { shot_id: shotId }, member.token)).isError).toBe(false);
 
-    const other = await mcpCall(env, "shot_start", { metadata: {} }, member.token);
+    const other = await mcpCall(env, "shot_start", { mode: "recording", metadata: {} }, member.token);
     const otherId = String(other.data["shot_id"]);
     await mcpCall(env, "shot_stop", { shot_id: otherId }, member.token);
     const cmp = await mcpCall(env, "shot_compare", { left_shot_id: shotId, right_shot_id: otherId }, member.token);
@@ -410,7 +410,7 @@ describe("MCP surface", () => {
     const token = String(minted.data["token"]);
     expect(token.startsWith("bta_")).toBe(true);
 
-    const started = await mcpCall(env, "shot_start", { metadata: {} }, token);
+    const started = await mcpCall(env, "shot_start", { mode: "recording", metadata: {} }, token);
     expect(started.isError).toBe(false);
     const shotId = String(started.data["shot_id"]);
     expect(String((await mcpCall(env, "shot_get", { shot_id: shotId }, token)).data["shot_id"])).toBe(shotId);

@@ -85,7 +85,8 @@ is rejected with an explicit error rather than a wrong result.
 
 ## Tooling
 
-MCP exposes `shots_list`, `shot_create`, `shot_start` (with `mode=window`),
+MCP exposes `shots_list`, `shot_create`, `shot_start` (`mode` defaults to
+`window` since spec 022),
 `shot_stop`, `shot_get`, `shot_query`, `shot_analyze`, `shot_compare`,
 `shot_schema`, `instances_list`, `instance_token_mint`/`_list`/`_revoke`.
 Operational instance and shot tools are available to `admin` and `member`;

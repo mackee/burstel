@@ -103,7 +103,7 @@ describe("MCP server", () => {
   test("full start/stop/query/analyze/schema/compare flow through tools/call", async () => {
     const env = makeEnv();
 
-    const started = await callTool(env, "shot_start", { metadata: { commit: "abc123", scenario: "bench" } });
+    const started = await callTool(env, "shot_start", { mode: "recording", metadata: { commit: "abc123", scenario: "bench" } });
     const shotId = String(started["shot_id"]);
     expect(shotId).toMatch(/^[A-Za-z0-9_-]{16,64}$/);
     expect((started["otlp_endpoints"] as Record<string, string>)["traces"]).toContain("/ingest/v1/traces");
@@ -126,7 +126,7 @@ describe("MCP server", () => {
     expect(Array.isArray(schema["tables"])).toBe(true);
 
     // A second shot to compare against.
-    const other = await callTool(env, "shot_start", { metadata: { scenario: "bench" } });
+    const other = await callTool(env, "shot_start", { mode: "recording", metadata: { scenario: "bench" } });
     const otherId = String(other["shot_id"]);
     await callTool(env, "shot_stop", { shot_id: otherId });
 

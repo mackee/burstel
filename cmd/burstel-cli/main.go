@@ -23,7 +23,7 @@
 //	token mint --scope admin|member [--owner NAME] [--ttl-seconds N] [--out FILE]
 //	token list [--out FILE]             list per-person tokens (metadata only)
 //	token revoke <token-id>             revoke a per-person token immediately
-//	shot start [--owner NAME] [--metadata k=v ...] [--window] [--name N] [--instances a,b]
+//	shot start [--owner NAME] [--metadata k=v ...] [--name N] [--instances a,b] [--mode window|recording]
 //	shot window [--name N] [--instances a,b] [--owner NAME] [--metadata k=v ...]
 //	shot create --started-at ISO --ended-at ISO [--name N] [--instances a,b]
 //	shot list [--owner NAME] [--limit N] [--offset N]
@@ -485,7 +485,7 @@ func (c *client) shotCommand(args []string) error {
 	action, rest := args[0], args[1:]
 	switch action {
 	case "start":
-		pos, opts, err := parseOpts(rest, map[string]bool{"metadata": true, "owner": true, "name": true, "instances": true})
+		pos, opts, err := parseOpts(rest, map[string]bool{"metadata": true, "owner": true, "name": true, "instances": true, "mode": true})
 		if err != nil {
 			return err
 		}
@@ -504,8 +504,16 @@ func (c *client) shotCommand(args []string) error {
 		if owner := last(opts, "owner"); owner != "" {
 			body["owner"] = owner
 		}
-		if _, ok := opts["window"]; ok {
-			body["mode"] = "window"
+		// Spec 022: a window shot is the default, so `mode` is omitted from the
+		// request body unless the caller explicitly asks for the deprecated
+		// legacy recording shot.
+		switch mode := last(opts, "mode"); mode {
+		case "", "window":
+			// default; --window is accepted as a no-op alias for compatibility
+		case "recording":
+			body["mode"] = "recording"
+		default:
+			return fmt.Errorf("--mode must be window or recording, got %q", mode)
 		}
 		if name := last(opts, "name"); name != "" {
 			body["name"] = name
@@ -742,7 +750,8 @@ Commands:
                                       mint a per-person token (prints the token once)
   token list                          list per-person token metadata (never values)
   token revoke <token-id>             revoke a per-person token immediately
-  shot start [--owner NAME] [--metadata k=v ...] [--window] [--name N] [--instances a,b]
+  shot start [--owner NAME] [--metadata k=v ...] [--name N] [--instances a,b] [--mode window|recording]
+                                      default: a window shot over the continuous instance streams
   shot window [--name N] [--instances a,b] [--owner NAME] [--metadata k=v ...]
   shot create --started-at ISO --ended-at ISO [--name N] [--instances a,b] [--metadata k=v ...]
   shot list [--owner NAME] [--limit N] [--offset N]
@@ -759,11 +768,15 @@ Examples:
   burstel-cli instance create db-1
   PUSH_WEB=$(burstel-cli instance token issue web-1 --out .secrets/web-1)
   PUSH_DB=$(burstel-cli instance token issue db-1 --out .secrets/db-1)
-  # exporters send continuously; no exporter change between shots
-  burstel-cli shot window --name before --instances web-1,db-1   # server-clock marker
+  # exporters send continuously; no exporter change between shots.
+  # A shot is a logical window by default (no --window needed).
+  burstel-cli shot start --name before --instances web-1,db-1
   burstel-cli shot stop <shot-id>
+  # Externally marked window: add a margin around the benchmark for clock skew.
   burstel-cli shot create --name load --instances web-1,db-1 \
-    --started-at 2026-01-01T12:00:00Z --ended-at 2026-01-01T12:03:00Z
+    --started-at 2026-01-01T11:59:55Z --ended-at 2026-01-01T12:03:05Z
+  # Legacy recording shot (deprecated): a per-shot container must be stopped.
+  burstel-cli shot start --mode recording
   burstel-cli shot analyze <shot-id> --sections latency,metric_cumulative_delta
   burstel-cli shot compare <shot-id> --other <other-shot-id>
   burstel-cli token mint --scope member --owner alice --out .secrets/member-alice

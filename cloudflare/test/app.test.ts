@@ -60,7 +60,8 @@ function get(path: string, token: string | null = TOKEN): Request {
 }
 
 async function createShot(env: AppEnv): Promise<{ id: string; body: Record<string, unknown> }> {
-  const resp = await handleRequest(post("/api/shots", { metadata: { scenario: "bench" } }), env);
+  // These tests exercise the legacy recording shot explicitly (spec 022 A2).
+  const resp = await handleRequest(post("/api/shots", { mode: "recording", metadata: { scenario: "bench" } }), env);
   expect(resp.status).toBe(201);
   const body = (await resp.json()) as Record<string, unknown>;
   return { id: String(body.shot_id), body };

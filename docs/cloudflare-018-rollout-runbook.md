@@ -92,8 +92,12 @@ curl -fsS https://<host>/api/compaction/status -H "Authorization: Bearer $ADMIN"
 curl -fsS -X POST https://<host>/api/compaction/run -H "Authorization: Bearer $ADMIN"
 
 # 5. Create a window shot over the data and analyze it — no manual publish.
+#    A shot is a window by default (no mode needed); this backdated form leaves a
+#    5s margin on both sides so client/server clock skew cannot clip the run.
 curl -fsS -X POST https://<host>/api/shots/window -H "Authorization: Bearer $ADMIN" \
-  -d '{"started_at":"...","ended_at":"...","instances":["web-1"]}'
+  -d '{"started_at":"...-5s","ended_at":"...","instances":["web-1"]}'
+# `instances` must name registered instances: an unknown name is a
+# 400 unknown_instance instead of a silently empty window.
 # then shot_query / shot_analyze / shot_compare / shot_schema, or the MCP tools.
 ```
 

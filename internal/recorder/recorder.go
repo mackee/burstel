@@ -115,6 +115,11 @@ type Metadata struct {
 	Counters      Counters       `json:"counters"`
 	Metadata      map[string]any `json:"metadata,omitempty"`
 	LastError     string         `json:"last_error,omitempty"`
+	// DroppedOutsideShot counts records that reached the standalone OTLP
+	// endpoint with no active shot. They were acknowledged (200 + OTLP
+	// partial_success) and discarded instead of provoking an exporter retry
+	// storm (spec 022, Part C).
+	DroppedOutsideShot int64 `json:"dropped_outside_shot"`
 }
 
 // Recorder owns the active shot.
@@ -145,6 +150,9 @@ type Recorder struct {
 	sha256hex string
 	counters  Counters
 	lastErr   string
+
+	// droppedOutsideShot counts records discarded because no shot was active.
+	droppedOutsideShot int64
 }
 
 // New creates a Recorder that has not started a shot yet.
@@ -306,17 +314,18 @@ func (r *Recorder) Metadata() Metadata {
 
 	counters := r.snapshotCountersLocked()
 	return Metadata{
-		ShotID:        r.shotID,
-		State:         r.state,
-		SchemaVersion: storage.SchemaVersion,
-		StartedAt:     r.startedAt,
-		StoppedAt:     r.stoppedAt,
-		Artifact:      artifactNameIfFrozen(r.state),
-		SizeBytes:     r.size,
-		SHA256:        r.sha256hex,
-		Counters:      counters,
-		Metadata:      r.meta,
-		LastError:     r.lastErr,
+		ShotID:             r.shotID,
+		State:              r.state,
+		SchemaVersion:      storage.SchemaVersion,
+		StartedAt:          r.startedAt,
+		StoppedAt:          r.stoppedAt,
+		Artifact:           artifactNameIfFrozen(r.state),
+		SizeBytes:          r.size,
+		SHA256:             r.sha256hex,
+		Counters:           counters,
+		Metadata:           r.meta,
+		LastError:          r.lastErr,
+		DroppedOutsideShot: r.snapshotDroppedOutsideShotLocked(),
 	}
 }
 
@@ -335,6 +344,31 @@ func (r *Recorder) ShotID() (string, bool) {
 		return "", false
 	}
 	return r.shotID, true
+}
+
+// State returns the current lifecycle state.
+func (r *Recorder) State() State {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.state
+}
+
+// RecordDroppedOutsideShot counts records that arrived while no shot was
+// active. Standalone ingest acknowledges and discards them (spec 022, Part C)
+// so an exporter never enters a retry/backoff storm outside a shot window.
+func (r *Recorder) RecordDroppedOutsideShot(records int64) {
+	if records <= 0 {
+		return
+	}
+	r.counterMu.Lock()
+	defer r.counterMu.Unlock()
+	r.droppedOutsideShot += records
+}
+
+func (r *Recorder) snapshotDroppedOutsideShotLocked() int64 {
+	r.counterMu.Lock()
+	defer r.counterMu.Unlock()
+	return r.droppedOutsideShot
 }
 
 func (r *Recorder) infoLocked() Info {

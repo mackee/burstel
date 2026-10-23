@@ -44,6 +44,7 @@ function get(path: string, token: string | null = TOKEN): Request {
 describe("REST logical windows", () => {
   test("POST /api/shots/window creates a backdated external window", async () => {
     const env = makeEnv();
+    await handleRequest(post("/api/instances", { name: "web-1" }), env);
     const now = Date.now();
     const resp = await handleRequest(
       post("/api/shots/window", {
@@ -68,6 +69,7 @@ describe("REST logical windows", () => {
 
   test("POST /api/shots with mode=window opens a server-clock marker and stops it", async () => {
     const env = makeEnv();
+    await handleRequest(post("/api/instances", { name: "web-1" }), env);
     const started = await handleRequest(post("/api/shots", { mode: "window", instances: ["web-1"] }), env);
     expect(started.status).toBe(201);
     const body = (await started.json()) as Record<string, unknown>;
@@ -78,6 +80,57 @@ describe("REST logical windows", () => {
     expect(stopped.status).toBe(200);
     const stoppedBody = (await stopped.json()) as Record<string, unknown>;
     expect(["ready", "incomplete"]).toContain(String(stoppedBody["state"]));
+  });
+
+  test("POST /api/shots defaults to a window shot when mode is omitted", async () => {
+    const env = makeEnv();
+    const resp = await handleRequest(post("/api/shots", { metadata: { scenario: "bench" } }), env);
+    expect(resp.status).toBe(201);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body["kind"]).toBe("window");
+    expect(body["state"]).toBe("open");
+    // No legacy ShotDO / recording container is created for the default path.
+    expect((env.SHOT_DO as unknown as FakeNamespace).shots.size).toBe(0);
+  });
+
+  test("explicit mode=recording still works and is flagged deprecated", async () => {
+    const env = makeEnv();
+    const resp = await handleRequest(post("/api/shots", { mode: "recording", metadata: {} }), env);
+    expect(resp.status).toBe(201);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body["deprecated"]).toBe(true);
+    expect(body["kind"]).toBeUndefined();
+    expect((body["otlp_endpoints"] as Record<string, string>)["traces"]).toContain("/ingest/v1/traces");
+    expect((env.SHOT_DO as unknown as FakeNamespace).shots.size).toBe(1);
+  });
+
+  test("unknown instance names are rejected with 400 unknown_instance", async () => {
+    const env = makeEnv();
+    const rejected = await handleRequest(post("/api/shots", { instances: ["nope"] }), env);
+    expect(rejected.status).toBe(400);
+    const body = (await rejected.json()) as { code: string; error: string };
+    expect(body.code).toBe("unknown_instance");
+    expect(body.error).toContain("nope");
+
+    const malformed = await handleRequest(post("/api/shots", { instances: ["Not A Name"] }), env);
+    expect(malformed.status).toBe(400);
+    expect(((await malformed.json()) as { code: string }).code).toBe("unknown_instance");
+
+    await handleRequest(post("/api/instances", { name: "web-1" }), env);
+    const accepted = await handleRequest(post("/api/shots", { instances: ["web-1"] }), env);
+    expect(accepted.status).toBe(201);
+    expect(((await accepted.json()) as Record<string, unknown>)["kind"]).toBe("window");
+
+    const unknownWindow = await handleRequest(
+      post("/api/shots/window", {
+        started_at: new Date(Date.now() - 120_000).toISOString(),
+        ended_at: new Date(Date.now() - 60_000).toISOString(),
+        instances: ["ghost"],
+      }),
+      env,
+    );
+    expect(unknownWindow.status).toBe(400);
+    expect(((await unknownWindow.json()) as { code: string }).code).toBe("unknown_instance");
   });
 
   test("rejects an unordered window", async () => {

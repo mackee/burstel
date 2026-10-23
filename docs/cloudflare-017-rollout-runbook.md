@@ -24,6 +24,13 @@ Phase 12 → 014/015/016 in one Worker deploy.
 | Frozen shots | `shots/{id}/telemetry.duckdb` in R2 | unchanged; legacy shots remain analyzable | **no data migration** |
 | Raw intake storage | n/a | `journal/{instance_id}/…` in the same bucket | additive prefix |
 | Durable Objects | `ShotDO` | `ShotDO` + `IngestDO` + `AuthDO` | additive classes; `ShotDO` storage preserved |
+| Shot creation | shot = recording container | shot = logical **window** by default (spec 022) | `mode=recording` keeps the legacy shot, flagged `deprecated: true` |
+
+> Since spec 022, `POST /api/shots`, MCP `shot_start` and
+> `burstel-cli shot start` open a logical window when `mode` is omitted, and
+> window `instances` must already exist (`400 unknown_instance` otherwise).
+> Operators should stop minting per-shot tokens and use one named-instance
+> token per host.
 
 The two real cutover risks are therefore:
 

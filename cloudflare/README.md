@@ -7,7 +7,8 @@ replace it.
 ```
                  public HTTPS                       Worker           coordinator / per-shot DO
  exporter ──► POST /ingest/v1/{traces,metrics,logs} ─► token→instance ─► IngestDO ─► R2 raw journal + ledger (durable ACK)
- rec client ─► POST /api/shots            ──► admin|member ────► IngestDO (register shot) + ShotDO
+ rec client ─► POST /api/shots            ──► admin|member ────► IngestDO (window marker by default;
+                                                                  mode=recording → register + ShotDO)
  rec client ─► POST /api/instances/{n}/tokens ─► admin|member ► IngestDO (issue/rotate 24h token)
  rec client ─► GET  /api/shots            ──► admin|member ────► IngestDO (shot registry, ?owner= filter)
  rec client ─► POST /api/shots/{id}/stop  ──► admin|member ────► ShotDO ─► GET /internal/stop
@@ -56,7 +57,7 @@ Three credential scopes exist after Phase 13:
 | `GET` | `/api/instances/{name}/tokens` | admin\|member | List token metadata (id/timestamps/revoked); never values |
 | `DELETE` | `/api/instances/{name}/tokens/{id}` | admin\|member | Revoke one instance token immediately |
 | `POST` | `/api/ingest-token` | authenticated | **Retired** (spec 014). Always `410 Gone`; use a named instance token. |
-| `POST` | `/api/shots` | admin\|member | Create a recording shot. Optional `owner` (attribution only). |
+| `POST` | `/api/shots` | admin\|member | Create a shot. Defaults to a logical window marker (`mode` omitted); `mode=recording` is the deprecated legacy recording shot. Optional `owner`, `name`, `instances` (unknown names → `400 unknown_instance`). |
 | `GET` | `/api/shots` | admin\|member | List shots newest first; optional `?owner=` filter and `?limit=`/`?offset=` pagination. |
 | `GET` | `/api/shots/{id}` | admin\|member | Lifecycle / metadata / counters |
 | `POST` | `/api/shots/{id}/ingest-token` | admin\|member | **Retired** (spec 014). Always `410 Gone`; use an instance token. |
@@ -246,7 +247,7 @@ bypass REST authentication.
 | Tool | Scope | Arguments | Result |
 | --- | --- | --- | --- |
 | `shots_list` | admin\|member | `owner?`, `limit?`, `offset?` | Shots newest first with state, owner, timings, size/SHA-256, counters |
-| `shot_start` | admin\|member | `metadata?`, `owner?` | New shot id + stable OTLP endpoints |
+| `shot_start` | admin\|member | `metadata?`, `owner?`, `mode?` (window default \| recording), `name?`, `instances?` | Window marker by default; `mode=recording` returns the deprecated legacy shot with OTLP endpoints |
 | `shot_stop` | admin\|member | `shot_id` | Frozen state, size, SHA-256 |
 | `shot_get` | admin\|member | `shot_id` | Lifecycle, metadata, counters, freeze info |
 | `shot_query` | admin\|member | `shot_id`, `sql`, `max_rows?` | Bounded typed rows |
@@ -288,11 +289,17 @@ for the full decision record.
 
 ## Logical window shots (spec 016)
 
-Since spec 016 a *shot* is an immutable, half-open `[start,end)` logical time
-window over the continuous instance streams — not an ingest target. Window
-shots carry no per-shot ingest token and no recording container; `shot_start`
-opens a server-clock marker, `shot_stop` finalizes it, and `shot_create` records
-an externally supplied (untrusted client-clock) window. `stop` is idempotent.
+Since spec 022 a *shot* is, by default, an immutable half-open
+`[start,end)` logical time window over the continuous instance streams — not an
+ingest target. `shot_start` (MCP), `POST /api/shots` and
+`burstel-cli shot start` create a window when `mode` is omitted. Window shots
+carry no per-shot ingest token and no recording container; `shot_stop`
+finalizes the server-clock marker, and `shot_create` records an externally
+supplied (untrusted client-clock) window. `instances` names must already exist:
+an unknown name is rejected with `400 unknown_instance` rather than producing a
+silently empty window. The legacy recording shot is available only with an
+explicit `mode=recording` and its response carries `deprecated: true`; `stop` is
+idempotent for both kinds.
 
 Analysis is segment-backed and read-only: candidate segments are selected from
 the durable manifest by receive-time overlap (widened by the ingest lag) or by
@@ -467,16 +474,26 @@ export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 export OTEL_EXPORTER_OTLP_ENDPOINT=https://<host>/ingest
 export OTEL_EXPORTER_OTLP_HEADERS="X-Burstel-Token=$PUSH"
 
-# 3. Start a shot around the benchmark window, then stop.
+# 3. Start a window shot around the benchmark (mode is omitted: window is the
+#    default) and stop it afterwards. Pass instances that already exist.
 SHOT_ID=$(curl -fsS -X POST https://<host>/api/shots \
-  -H "Authorization: Bearer $TOKEN" -d '{"owner":"alice","metadata":{"scenario":"bench"}}' | jq -r .shot_id)
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"owner":"alice","name":"bench","instances":["web-1"],"metadata":{"scenario":"bench"}}' | jq -r .shot_id)
 # ... run the benchmark ...
 curl -s -H "Authorization: Bearer $TOKEN" -X POST https://<host>/api/shots/$SHOT_ID/stop
 
-# Shots may record concurrently (no application cap); list them with
+# Externally marked window instead: leave a margin around the run for clock skew.
+curl -fsS -X POST https://<host>/api/shots/window -H "Authorization: Bearer $TOKEN" \
+  -d '{"name":"bench","instances":["web-1"],"started_at":"2026-01-01T11:59:55Z","ended_at":"2026-01-01T12:03:05Z"}'
+
+# The deprecated legacy recording shot still works (explicit mode).
+curl -fsS -X POST https://<host>/api/shots -H "Authorization: Bearer $TOKEN" \
+  -d '{"mode":"recording","metadata":{"scenario":"legacy"}}'
+
+# Windows may be open concurrently; list them with
 #   curl -s -H "Authorization: Bearer $TOKEN" 'https://<host>/api/shots?owner=alice'
 
-# 4. Query and analyze any frozen snapshot (no recording container is running).
+# 4. Query and analyze any window (or legacy frozen) shot.
 curl -s -H "Authorization: Bearer $TOKEN" -X POST \
   -d '{"sql":"SELECT service_name, count(*) AS n FROM spans GROUP BY 1 ORDER BY n DESC"}' \
   https://<host>/api/shots/<id>/query

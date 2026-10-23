@@ -55,7 +55,7 @@ function post(path: string, body: unknown): Request {
 }
 
 async function createShot(env: AppEnv): Promise<string> {
-  const resp = await handleRequest(post("/api/shots", { metadata: {} }), env);
+  const resp = await handleRequest(post("/api/shots", { mode: "recording", metadata: {} }), env);
   expect(resp.status).toBe(201);
   return String(((await resp.json()) as { shot_id: string }).shot_id);
 }
@@ -76,10 +76,10 @@ describe("concurrent recording (no application cap)", () => {
   test("concurrent starts all succeed", async () => {
     const { env } = setup();
     const results = await Promise.all([
-      handleRequest(post("/api/shots", { metadata: { n: 1 } }), env),
-      handleRequest(post("/api/shots", { metadata: { n: 2 } }), env),
-      handleRequest(post("/api/shots", { metadata: { n: 3 } }), env),
-      handleRequest(post("/api/shots", { metadata: { n: 4 } }), env),
+      handleRequest(post("/api/shots", { mode: "recording", metadata: { n: 1 } }), env),
+      handleRequest(post("/api/shots", { mode: "recording", metadata: { n: 2 } }), env),
+      handleRequest(post("/api/shots", { mode: "recording", metadata: { n: 3 } }), env),
+      handleRequest(post("/api/shots", { mode: "recording", metadata: { n: 4 } }), env),
     ]);
     expect(results.map((r) => r.status)).toEqual([201, 201, 201, 201]);
   });

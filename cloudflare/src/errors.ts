@@ -23,6 +23,21 @@ export function badRequest(message: string): HttpError {
   return new HttpError(400, message, false, "bad_request");
 }
 
+/**
+ * A window shot referenced instance names that are not registered. Rejecting is
+ * deliberate: a silently empty instance subset produces an empty window that
+ * looks like a successful measurement (spec 022, Part A4).
+ */
+export function unknownInstance(names: string[]): HttpError {
+  const list = names.join(", ");
+  return new HttpError(
+    400,
+    `unknown instance${names.length === 1 ? "" : "s"}: ${list}; create it first with POST /api/instances`,
+    false,
+    "unknown_instance",
+  );
+}
+
 export function unauthorized(): HttpError {
   return new HttpError(401, "missing or invalid bearer token", false, "unauthorized");
 }
