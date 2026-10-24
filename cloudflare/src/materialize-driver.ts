@@ -92,6 +92,10 @@ export interface MaterializeDriverConfig {
    * service's 64-part ceiling.
    */
   partsPerMember: number;
+  /** Spec 034: estimated spans per part ceiling (default 500k). */
+  partTargetSpans: number;
+  /** Spec 034: measured spans per KiB of stored journal bytes (default 40). */
+  partSpansPerKiB: number;
 }
 
 export interface MaterializeDriverDeps {
@@ -124,13 +128,18 @@ const DEFAULT_CONFIG: MaterializeDriverConfig = {
   parallelism: 3,
   maxInstances: 4,
   maxAttempts: 3,
-  leaseTtlMs: 120_000,
+  // Spec 034: must exceed the largest part timeout (120 s base + scaling)
+  // with room for container start, otherwise an expired lease retries a part
+  // that is still building.
+  leaseTtlMs: 300_000,
   retryDelayMs: 5_000,
   heartbeatMs: 30_000,
   lateWriteLimitMs: 10_000,
   keepAliveMs: 10 * 60 * 1000,
   capacityBackoffMs: 10_000,
   partsPerMember: 2,
+  partTargetSpans: 500_000,
+  partSpansPerKiB: 40,
 };
 
 interface PartOutcome {
@@ -189,6 +198,8 @@ export class MaterializeDriver {
       keepAliveMs: clampInt(config.keepAliveMs, 1_000, 3_600_000, DEFAULT_CONFIG.keepAliveMs),
       capacityBackoffMs: clampInt(config.capacityBackoffMs, 1_000, 3_600_000, DEFAULT_CONFIG.capacityBackoffMs),
       partsPerMember: clampInt(config.partsPerMember, 1, 8, DEFAULT_CONFIG.partsPerMember),
+      partTargetSpans: clampInt(config.partTargetSpans, 1_000, 10_000_000, DEFAULT_CONFIG.partTargetSpans),
+      partSpansPerKiB: clampInt(config.partSpansPerKiB, 1, 10_000, DEFAULT_CONFIG.partSpansPerKiB),
     };
   }
 
@@ -370,14 +381,24 @@ export class MaterializeDriver {
     try {
       const plan = await this.plan();
       // More parts than pool members keeps a freed member busy immediately
-      // (spec 033), and smaller parts also raise R2 GET concurrency.
-      const partCount = Math.min(64, this.parallelism() * this.config.partsPerMember);
-      const chunks = chunkMaterializationPlan(plan.objects, Math.max(1, partCount));
+      // (spec 033), while spec 034 sizes every part by its *estimated span
+      // count* so a ~1.3M-span part can never be planned again.
+      const minParts = Math.min(64, this.parallelism() * this.config.partsPerMember);
+      const chunks = chunkMaterializationPlan(plan.objects, minParts, {
+        targetSpans: this.config.partTargetSpans,
+        spansPerKiB: this.config.partSpansPerKiB,
+      });
+      const estimatedSpans = chunks.reduce((n, chunk) => n + chunk.spans, 0);
       this.log("materialize.plan", {
         shot_id: run.shot_id,
         objects: plan.objects.length,
         bytes: plan.total_bytes,
         parts: chunks.length,
+        min_parts: minParts,
+        estimated_spans: Math.round(estimatedSpans),
+        max_part_spans: Math.round(chunks.reduce((n, chunk) => Math.max(n, chunk.spans), 0)),
+        part_target_spans: this.config.partTargetSpans,
+        spans_per_kib: this.config.partSpansPerKiB,
         pool: this.parallelism(),
         truncated: plan.truncated,
       });

@@ -30,6 +30,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -169,6 +170,12 @@ func r2ClientFromEnv() (*r2s3.Client, error) {
 // Durable Object (spec 018). It fails closed without BURSTEL_INTERNAL_TOKEN
 // unless the explicit local-development opt-in is set.
 func runService(addr, workDir string) {
+	// The materializer builds a large, short-lived part: a higher GC target
+	// trades a bounded amount of heap for fewer collections during a burst
+	// (measured ~13% more spans/s, spec 034). Only this service is affected.
+	if percent := envInt("BURSTEL_GC_PERCENT", 400); percent > 0 {
+		debug.SetGCPercent(percent)
+	}
 	cfg := compaction.DefaultServiceConfig()
 	cfg.InternalToken = os.Getenv("BURSTEL_INTERNAL_TOKEN")
 	cfg.DevInsecureAuth = envBool("BURSTEL_DEV_INSECURE_AUTH")
@@ -179,6 +186,12 @@ func runService(addr, workDir string) {
 	cfg.MaxBatchObjects = envInt("BURSTEL_COMPACT_MAX_BATCH_OBJECTS", cfg.MaxBatchObjects)
 	cfg.MaxBatchBytes = envInt64("BURSTEL_COMPACT_MAX_BATCH_BYTES", cfg.MaxBatchBytes)
 	cfg.MaxSegmentBytes = envInt64("BURSTEL_COMPACT_MAX_SEGMENT_BYTES", cfg.MaxSegmentBytes)
+	// Spec 034: projection-only, row-planned parts have their own ceiling and
+	// pipeline sizing. The Worker forwards these variables into the container.
+	cfg.MaxPartBytes = envInt64("MATERIALIZE_MAX_PART_BYTES", cfg.MaxPartBytes)
+	cfg.MaterializeConcurrency = envInt("MATERIALIZE_CONCURRENCY", cfg.MaterializeConcurrency)
+	cfg.DecodeWorkers = envInt("MATERIALIZE_DECODE_WORKERS", cfg.DecodeWorkers)
+	cfg.AppendShards = envInt("MATERIALIZE_APPEND_SHARDS", cfg.AppendShards)
 	cfg.SegmentTTL = envDuration("BURSTEL_COMPACT_SEGMENT_TTL", cfg.SegmentTTL)
 
 	// Spec 031: shot-time materialization reads journal/ and writes shots/
@@ -192,15 +205,18 @@ func runService(addr, workDir string) {
 		remote = client
 	}
 
-	svc := compaction.NewServiceWithRemote(cfg, remote, envInt("BURSTEL_MATERIALIZE_CONCURRENCY", 32))
+	svc := compaction.NewServiceWithRemote(cfg, remote, envInt("MATERIALIZE_CONCURRENCY", 32))
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           svc.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       60 * time.Second,
-		WriteTimeout:      120 * time.Second,
-		IdleTimeout:       120 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		// Spec 034 R5: a part request timeout scales with the part size (the
+		// Worker default is 120 s and can reach 10 min), so the service must not
+		// cut a large part build short.
+		WriteTimeout:   15 * time.Minute,
+		IdleTimeout:    120 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

@@ -241,6 +241,38 @@ staging operator validates against the `client_drop` series; the previous
 one-exporter/131072 setting is not sufficient at 180 s even though it passed at
 60 s.
 
+## Shot materialization throughput (spec 034)
+
+Shot parts under `shots/<shot_id>/part-*.duckdb` are **projection-only**:
+
+* `spans`, `log_records`, `metric_points` (same columns as a compacted segment),
+  plus `schema_meta`/`segment_meta` and a small `part_meta` table with one
+  provenance row per journal object (`source_key`, `signal`, `received_at`,
+  `wire_sha256`, `payload_sha256`, `record_count`). The raw wire bytes and the
+  decompressed payload are **not** stored: they remain durable under
+  `journal/*` in R2. Continuous compaction segments keep their existing
+  raw+projection layout.
+* Analysis is unchanged: the analysis container detects each attached file's
+  tables and synthesizes the `otlp_batches` projection from `part_meta` when the
+  raw table is absent (batch counts and `record_count` stay exact; the payload
+  BLOB columns are empty).
+
+Planning is row-based. `MATERIALIZE_PART_TARGET_SPANS` (default 500,000) and
+`MATERIALIZE_SPANS_PER_KIB` (default 40, measured from the staging run: 196 MB
+gzip ≈ 8.0M spans) produce at least `MATERIALIZE_PARALLELISM ×
+MATERIALIZE_PARTS_PER_MEMBER` parts but enough that no part's estimated span
+count exceeds the target (hard cap 64). A part may grow to
+`MATERIALIZE_MAX_PART_BYTES` (default 1 GiB); its container timeout scales from
+`MATERIALIZE_PART_TIMEOUT_MS` (120 s) by `MATERIALIZE_PART_TIMEOUT_PER_MIB_MS`
+(500 ms/MiB) up to `MATERIALIZE_MAX_PART_TIMEOUT_MS` (10 min) and is logged as
+`materialize.part.timeout`.
+
+Inside the container, `burstel-compact` fetches with
+`MATERIALIZE_CONCURRENCY` parallel R2 GETs (default 32), gunzips and decodes on
+GOMAXPROCS workers, and appends with a single-writer goroutine per table (two
+per analysis table by default) into a part with **no secondary indexes**. The
+container class is `standard-4` (see the deploy doc's cost bounds).
+
 ## Shared multi-user access (spec 013, Part B)
 
 A deployment can be shared by several people, each with their **own revocable

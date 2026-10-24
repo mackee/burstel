@@ -156,7 +156,8 @@ The full preflight checks, without mutating anything:
   are never read or printed), including the spec-031 bucket-scoped
   `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_ACCOUNT_ID`;
 * `docker`/`buildx`/`linux/amd64` compatibility;
-* the `wrangler.jsonc` invariants: `ShotDO` container on `standard-1`, bounded
+* the `wrangler.jsonc` invariants: `ShotDO` container on `standard-1`, the
+  `CompactorDO`/materializer container on `standard-4` (spec 034), bounded
   `max_instances`, SQLite `ShotDO`/`IngestDO`/`AuthDO` exports, the deploy-safe
   `INGEST_DO -> IngestDO` binding (no `ControlDO` rename),
   `BUCKET -> burstel-shots`, a concrete (not all-zero) `INSTANCE_TOKENS` KV id,
@@ -295,7 +296,16 @@ Containers are ephemeral and are destroyed on freeze/idle.
 
 * `containers[].max_instances` is capped at 10 and validated by preflight; an
   account-level limit overrun surfaces to clients as a retryable `503`.
-* `instance_type` is `standard-1`.
+* `ShotDO` (`instance_type: standard-1`) is the recorder/analysis container.
+* `CompactorDO` (`instance_type: standard-4`, spec 034) also hosts the fixed
+  materializer pool (`MATERIALIZE_PARALLELISM=3`). It bills at 4 vCPU / 12 GiB
+  while any pool member is alive, and finished members are kept warm for
+  `MATERIALIZE_KEEPALIVE_MS` (10 min) to serve the next shot. That warm window
+  dominates cost for intermittent shots: lower `MATERIALIZE_KEEPALIVE_MS` (and,
+  if needed, `MATERIALIZE_PARALLELISM`) to trade materialization latency for
+  spend. `standard-4` is ~4x the compute of `standard-1` per second; the
+  projection-only part layout (spec 034) is what keeps the parts small enough
+  that a 3-container, ~30 s build replaces the previous ~90 s + failures.
 * Stop shots promptly; a recording Container holds an ephemeral disk.
 * The durable raw journal writes one R2 object per accepted export under
   `journal/*`; add an R2 lifecycle rule for old `shots/*` **and** `journal/*`

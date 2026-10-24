@@ -18,7 +18,15 @@ import type {
 import { chunkMaterializationPlan, materializeChunk } from "./materialize-part";
 import type { MaterializeChunk } from "./materialize-part";
 
-export { chunkMaterializationPlan, materializeChunk, materializerPoolName } from "./materialize-part";
+export {
+  MATERIALIZE_MAX_PARTS,
+  MATERIALIZE_PART_TARGET_SPANS,
+  MATERIALIZE_SPANS_PER_KIB,
+  chunkMaterializationPlan,
+  estimatePlanSpans,
+  materializeChunk,
+  materializerPoolName,
+} from "./materialize-part";
 export type { MaterializeChunk } from "./materialize-part";
 
 /**

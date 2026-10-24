@@ -4,8 +4,11 @@ import { describe, expect, test } from "bun:test";
 import type { CompactorNamespaceLike, DoStubLike } from "../src/env";
 import type { MaterializationObject } from "../src/ingest-core";
 import {
+  MATERIALIZE_MAX_PARTS,
+  MATERIALIZE_PART_TARGET_SPANS,
   chunkMaterializationPlan,
   ensureMaterialized,
+  estimatePlanSpans,
   materializeShot,
   waitForMaterialization,
 } from "../src/materialize";
@@ -226,5 +229,35 @@ describe("materialization state machine", () => {
     expect((await core.materializationYield()).yield).toBe(true);
     await core.endMaterializationRun("shot-yield");
     expect((await core.materializationYield()).yield).toBe(false);
+  });
+});
+
+describe("row-based part planning (spec 034)", () => {
+  test("splits by estimated spans, not bytes alone", () => {
+    // 8 x 5 MiB gzip objects = 40 MiB -> ~1.6M spans at the measured 40/KiB.
+    const objects = Array.from({ length: 8 }, (_, i) => obj(i, 5 * 1024 * 1024));
+    expect(estimatePlanSpans(objects)).toBe(8 * 5 * 1024 * 40);
+    const chunks = chunkMaterializationPlan(objects, 2, { targetSpans: MATERIALIZE_PART_TARGET_SPANS });
+    // 1.6M estimated spans / 500k target = 4 parts (more than the 2 x pool min).
+    expect(chunks.length).toBe(4);
+    expect(chunks.every((chunk) => chunk.spans <= MATERIALIZE_PART_TARGET_SPANS)).toBe(true);
+    // Contiguous in receive-time order and never empty.
+    expect(chunks.flatMap((c) => c.objects.map((o) => o.key))).toEqual(objects.map((o) => o.key));
+    expect(chunks.every((c) => c.objects.length > 0)).toBe(true);
+    expect(chunks.reduce((n, c) => n + c.bytes, 0)).toBe(40 * 1024 * 1024);
+  });
+
+  test("never plans more than the 64-part service ceiling", () => {
+    const objects = Array.from({ length: 200 }, (_, i) => obj(i, 1024 * 1024));
+    const chunks = chunkMaterializationPlan(objects, 3, { targetSpans: 1_000 });
+    expect(chunks.length).toBe(MATERIALIZE_MAX_PARTS);
+    expect(chunks.reduce((n, c) => n + c.objects.length, 0)).toBe(200);
+  });
+
+  test("honours a custom spans-per-KiB ratio", () => {
+    const objects = Array.from({ length: 4 }, (_, i) => obj(i, 1024 * 1024));
+    const chunks = chunkMaterializationPlan(objects, 1, { targetSpans: 100_000, spansPerKiB: 100 });
+    expect(chunks.length).toBe(4);
+    expect(chunks[0]!.spans).toBe(102_400);
   });
 });

@@ -137,3 +137,28 @@ describe("compactor start env (spec 028)", () => {
     expect(h.container.startEnv!.BURSTEL_DEV_INSECURE_AUTH).toBe("1");
   });
 });
+
+describe("materializer container env (spec 034)", () => {
+  test("forwards only explicitly configured part limits and pipeline concurrency", () => {
+    const { env } = resolveCompactorContainerEnv(
+      {
+        BURSTEL_INTERNAL_TOKEN: SECURE_TOKEN,
+        MATERIALIZE_MAX_PART_BYTES: "1073741824",
+        MATERIALIZE_CONCURRENCY: "32",
+        MATERIALIZE_DECODE_WORKERS: "4",
+        MATERIALIZE_APPEND_SHARDS: "2",
+      },
+      8080,
+    );
+    expect(env.MATERIALIZE_MAX_PART_BYTES).toBe("1073741824");
+    expect(env.MATERIALIZE_CONCURRENCY).toBe("32");
+    expect(env.MATERIALIZE_DECODE_WORKERS).toBe("4");
+    expect(env.MATERIALIZE_APPEND_SHARDS).toBe("2");
+  });
+
+  test("does not invent unset tuning values", () => {
+    const { env } = resolveCompactorContainerEnv({ BURSTEL_INTERNAL_TOKEN: SECURE_TOKEN }, 8080);
+    expect(env.MATERIALIZE_MAX_PART_BYTES).toBeUndefined();
+    expect(env.MATERIALIZE_CONCURRENCY).toBeUndefined();
+  });
+});

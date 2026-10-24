@@ -59,7 +59,7 @@
     // Spec 032: the coordinator DO alarm owns the run. Parts have a lease and
     // a bounded attempt count, so a lost alarm/container cannot wedge `running`.
     "MATERIALIZE_MAX_ATTEMPTS": "3",
-    "MATERIALIZE_LEASE_TTL_MS": "120000",
+    "MATERIALIZE_LEASE_TTL_MS": "300000",
     "MATERIALIZE_RETRY_MS": "5000",
     "MATERIALIZE_HEARTBEAT_MS": "30000",
     // Spec 033: keep a finished pool member warm for the next shot, and back
@@ -69,6 +69,20 @@
     // Spec 033: split into 2x pool parts so a freed member immediately takes a
     // queued part (and R2 GET concurrency doubles).
     "MATERIALIZE_PARTS_PER_MEMBER": "2",
+    // Spec 034: size parts by *estimated spans*, not bytes. 500k spans keeps a
+    // part inside the build budget; ~40 spans/KiB is the measured staging ratio
+    // (196 MB gzip -> ~8.0M spans).
+    "MATERIALIZE_PART_TARGET_SPANS": "500000",
+    "MATERIALIZE_SPANS_PER_KIB": "40",
+    // Spec 034: projection-only parts have their own 1 GiB ceiling (the old
+    // 256 MiB segment limit no longer applies), and the part request timeout
+    // scales from 120 s by 500 ms per MiB of input up to 10 min.
+    "MATERIALIZE_MAX_PART_BYTES": "1073741824",
+    "MATERIALIZE_PART_TIMEOUT_MS": "120000",
+    "MATERIALIZE_PART_TIMEOUT_PER_MIB_MS": "500",
+    "MATERIALIZE_MAX_PART_TIMEOUT_MS": "600000",
+    // Spec 034: parallel pipeline defaults (container-side).
+    "MATERIALIZE_CONCURRENCY": "32",
     // Spec 031 D1: the bucket whose scoped token is injected into the
     // compactor/materializer container. The credential itself is a Worker secret.
     "R2_BUCKET_NAME": "burstel-shots"
@@ -94,7 +108,10 @@
       "scheduling_policy": "default",
       "image": "../Dockerfile.compactor",
       "image_build_context": "..",
-      "instance_type": "standard-1",
+      // Spec 034 R2: the materializer containers build projection-only parts
+      // with a parallel appender pipeline. `standard-4` (4 vCPU / 8 GiB) is the
+      // documented cost/throughput choice; ShotDO stays on `standard-1`.
+      "instance_type": "standard-4",
       // Spec 031: up to four parallel materializer containers per shot. The
       // fenced lease still enforces a single active *compaction* per partition.
       "max_instances": 4

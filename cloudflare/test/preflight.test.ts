@@ -327,3 +327,38 @@ describe("cross-file deployment invariants", () => {
     expect(cfg.vars?.["BURSTEL_DEV_INSECURE_AUTH"]).toBeUndefined();
   });
 });
+
+describe("spec 034 materializer throughput configuration", () => {
+  test("the CompactorDO/materializer container uses standard-4 while ShotDO stays standard-1", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    const shot = cfg.containers?.find((c) => c.class_name === "ShotDO");
+    const compactor = cfg.containers?.find((c) => c.class_name === "CompactorDO");
+    expect(shot?.instance_type).toBe("standard-1");
+    expect(compactor?.instance_type).toBe("standard-4");
+    const report = finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true }));
+    expect(report.failed_required).not.toContain("container_compactor_instance_type");
+  });
+
+  test("rejects a standard-1 materializer instance and out-of-range part limits", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    cfg.containers!.find((c) => c.class_name === "CompactorDO")!.instance_type = "standard-1";
+    cfg.vars!["MATERIALIZE_PART_TARGET_SPANS"] = "0";
+    cfg.vars!["MATERIALIZE_MAX_PART_BYTES"] = "1024";
+    cfg.vars!["MATERIALIZE_PART_TIMEOUT_MS"] = "1000";
+    const report = finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true }));
+    expect(report.failed_required).toContain("container_compactor_instance_type");
+    expect(report.failed_required).toContain("materialize_part_target_spans_bounded");
+    expect(report.failed_required).toContain("materialize_max_part_bytes_bounded");
+    expect(report.failed_required).toContain("materialize_part_timeout_bounded");
+  });
+
+  test("row-planning defaults are configured (500k spans, 40 spans/KiB, 1 GiB parts)", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    expect(cfg.vars?.["MATERIALIZE_PART_TARGET_SPANS"]).toBe("500000");
+    expect(cfg.vars?.["MATERIALIZE_SPANS_PER_KIB"]).toBe("40");
+    expect(cfg.vars?.["MATERIALIZE_MAX_PART_BYTES"]).toBe(String(1 << 30));
+    expect(cfg.vars?.["MATERIALIZE_PART_TIMEOUT_MS"]).toBe("120000");
+    expect(cfg.vars?.["MATERIALIZE_MAX_PART_TIMEOUT_MS"]).toBe("600000");
+    expect(cfg.vars?.["MATERIALIZE_CONCURRENCY"]).toBe("32");
+  });
+});

@@ -8,7 +8,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/mackee/burstel/internal/otlp"
@@ -69,7 +68,7 @@ type MaterializeResponse struct {
 
 // MaterializeTimings is the per-phase latency breakdown of one part build
 // (spec 033 requirement 5). GET/decode are summed over the part's concurrent
-// object fetches; append/index/checkpoint/hash/put are wall-clock phases.
+// object fetches; append/checkpoint/hash/put are wall-clock phases.
 type MaterializeTimings struct {
 	Objects      int   `json:"objects"`
 	GetMS        int64 `json:"get_ms"`
@@ -85,9 +84,9 @@ type MaterializeTimings struct {
 var shotIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 
 // Materialize downloads one chunk of journal objects directly from R2, builds a
-// part DuckDB file and PUTs it back under `shots/`. Successful parts are
-// byte-for-byte reproducible for the same inputs (deterministic key, sorted
-// rows), which makes a re-run idempotent.
+// projection-only part DuckDB file and PUTs it back under `shots/`. Successful
+// parts are byte-for-byte reproducible for the same inputs (deterministic key,
+// stable row order), which makes a re-run idempotent.
 func (s *Service) Materialize(ctx context.Context, req MaterializeRequest) (MaterializeResponse, error) {
 	if s.remote == nil {
 		return MaterializeResponse{}, badReq("materialization requires bucket-scoped R2 credentials")
@@ -108,32 +107,45 @@ func (s *Service) Materialize(ctx context.Context, req MaterializeRequest) (Mate
 	for _, key := range req.Excluded {
 		excluded[key] = struct{}{}
 	}
-
-	started := time.Now()
-	records, getMS, decodeMS, err := s.fetchMaterializationRecords(ctx, req.Objects, excluded)
-	if err != nil {
-		return MaterializeResponse{}, err
-	}
-	sort.SliceStable(records, func(i, j int) bool {
-		a, b := records[i].Object, records[j].Object
-		if a.ReceivedAtMS != b.ReceivedAtMS {
-			return a.ReceivedAtMS < b.ReceivedAtMS
+	objects := make([]MaterializeObject, 0, len(req.Objects))
+	for _, obj := range req.Objects {
+		if _, skip := excluded[obj.Key]; skip {
+			continue
 		}
-		return a.Key < b.Key
+		if !strings.HasPrefix(obj.Key, "journal/") {
+			return MaterializeResponse{}, badReq(fmt.Sprintf("object %s is outside the journal/ prefix", obj.Key))
+		}
+		objects = append(objects, obj)
+	}
+	// The planner already sorts by receive time; sorting the (small) metadata
+	// slice here keeps a part byte-for-byte deterministic for any caller.
+	sort.SliceStable(objects, func(i, j int) bool {
+		if objects[i].ReceivedAt != objects[j].ReceivedAt {
+			return objects[i].ReceivedAt < objects[j].ReceivedAt
+		}
+		return objects[i].Key < objects[j].Key
 	})
 
+	started := time.Now()
 	partKey := MaterializationPartKey(req.ShotID, req.PartIndex)
 	scratch, cleanup, err := NewScratchSegment(s.cfg.WorkDir, partKey)
 	if err != nil {
 		return MaterializeResponse{}, err
 	}
 	defer cleanup()
-	info, profile, err := BuildPartProfile(ctx, scratch, partKey, "", "", records)
+
+	var getMS, decodeMS int64
+	var profile BuildProfile
+	info, err := buildPartStream(ctx, scratch, partKey, "", "", &profile, s.appendShards, func(emit func(JournalRecord) error) error {
+		var err error
+		getMS, decodeMS, err = s.runMaterializePipeline(ctx, objects, emit)
+		return err
+	})
 	if err != nil {
 		return MaterializeResponse{}, err
 	}
-	if info.Size > s.cfg.MaxSegmentBytes {
-		return MaterializeResponse{}, fmt.Errorf("materialization part %s exceeds the %d-byte limit", partKey, s.cfg.MaxSegmentBytes)
+	if info.Size > s.maxPartBytes() {
+		return MaterializeResponse{}, fmt.Errorf("materialization part %s exceeds the %d-byte limit", partKey, s.maxPartBytes())
 	}
 	data, err := os.ReadFile(scratch)
 	if err != nil {
@@ -144,7 +156,7 @@ func (s *Service) Materialize(ctx context.Context, req MaterializeRequest) (Mate
 		return MaterializeResponse{}, fmt.Errorf("upload part %s: %w", partKey, err)
 	}
 	timings := MaterializeTimings{
-		Objects:      len(records),
+		Objects:      len(objects),
 		GetMS:        getMS,
 		DecodeMS:     decodeMS,
 		AppendMS:     profile.AppendMS,
@@ -154,15 +166,15 @@ func (s *Service) Materialize(ctx context.Context, req MaterializeRequest) (Mate
 		PutMS:        time.Since(putStart).Milliseconds(),
 		TotalMS:      time.Since(started).Milliseconds(),
 	}
-	fmt.Printf("burstel-materialize: part=%s objects=%d get_ms=%d decode_ms=%d append_ms=%d checkpoint_ms=%d put_ms=%d total_ms=%d\n",
-		partKey, timings.Objects, timings.GetMS, timings.DecodeMS, timings.AppendMS, timings.CheckpointMS, timings.PutMS, timings.TotalMS)
+	fmt.Printf("burstel-materialize: part=%s objects=%d size_bytes=%d limit_bytes=%d get_ms=%d decode_ms=%d append_ms=%d checkpoint_ms=%d put_ms=%d total_ms=%d\n",
+		partKey, timings.Objects, info.Size, s.maxPartBytes(), timings.GetMS, timings.DecodeMS, timings.AppendMS, timings.CheckpointMS, timings.PutMS, timings.TotalMS)
 	return MaterializeResponse{
 		ShotID:          req.ShotID,
 		PartIndex:       req.PartIndex,
 		PartKey:         partKey,
 		SizeBytes:       info.Size,
 		SHA256:          info.SHA256,
-		ObjectCount:     int64(len(records)),
+		ObjectCount:     int64(len(objects)),
 		RequestCount:    info.RequestCount,
 		RecordCount:     info.RecordCount,
 		SpanCount:       info.SpanCount,
@@ -179,85 +191,192 @@ func MaterializationPartKey(shotID string, index int) string {
 	return fmt.Sprintf("shots/%s/part-%d.duckdb", shotID, index)
 }
 
-func (s *Service) fetchMaterializationRecords(
-	ctx context.Context,
-	objects []MaterializeObject,
-	excluded map[string]struct{},
-) ([]JournalRecord, int64, int64, error) {
-	records := make([]JournalRecord, 0, len(objects))
-	var mu sync.Mutex
-	var firstErr error
-	var getMS, decodeMS int64
-	sem := make(chan struct{}, s.materializeConcurrency)
-	var wg sync.WaitGroup
-
-	for _, obj := range objects {
-		if _, skip := excluded[obj.Key]; skip {
-			continue
-		}
-		if !strings.HasPrefix(obj.Key, "journal/") {
-			return nil, 0, 0, badReq(fmt.Sprintf("object %s is outside the journal/ prefix", obj.Key))
-		}
-		obj := obj
-		wg.Add(1)
-		sem <- struct{}{}
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
-			rec, getDuration, decodeDuration, err := fetchMaterializationRecord(ctx, s.remote, obj)
-			if err != nil {
-				mu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				mu.Unlock()
-				return
-			}
-			atomic.AddInt64(&getMS, getDuration)
-			atomic.AddInt64(&decodeMS, decodeDuration)
-			mu.Lock()
-			records = append(records, rec)
-			mu.Unlock()
-		}()
-	}
-	wg.Wait()
-	if firstErr != nil {
-		return nil, 0, 0, firstErr
-	}
-	return records, getMS, decodeMS, nil
+type fetchedMaterializeObject struct {
+	index int
+	obj   MaterializeObject
+	wire  []byte
+	getMS int64
 }
 
-func fetchMaterializationRecord(ctx context.Context, store RemoteStore, obj MaterializeObject) (JournalRecord, int64, int64, error) {
+type decodedMaterializeObject struct {
+	index    int
+	rec      JournalRecord
+	getMS    int64
+	decodeMS int64
+	err      error
+}
+
+// runMaterializePipeline fetches journal objects with bounded GET concurrency,
+// decodes them with a worker pool and emits fully decoded records in input
+// order. Bounded concurrency plus an in-order reorder buffer keeps memory
+// proportional to the in-flight window instead of the whole part (spec 034).
+func (s *Service) runMaterializePipeline(
+	ctx context.Context,
+	objects []MaterializeObject,
+	emit func(JournalRecord) error,
+) (int64, int64, error) {
+	getWorkers := s.materializeConcurrency
+	if getWorkers <= 0 {
+		getWorkers = 32
+	}
+	decodeWorkers := s.decodeWorkers
+	if decodeWorkers <= 0 {
+		decodeWorkers = 1
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var errOnce sync.Once
+	var firstErr error
+	fail := func(err error) {
+		errOnce.Do(func() {
+			firstErr = err
+			cancel()
+		})
+	}
+
+	fetched := make(chan fetchedMaterializeObject, getWorkers)
+	decodedCh := make(chan fetchedMaterializeObject, getWorkers)
+
+	go func() {
+		defer close(fetched)
+		for i, obj := range objects {
+			select {
+			case fetched <- fetchedMaterializeObject{index: i, obj: obj}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	var getWG sync.WaitGroup
+	for w := 0; w < getWorkers; w++ {
+		getWG.Add(1)
+		go func() {
+			defer getWG.Done()
+			for job := range fetched {
+				wire, getMS, err := fetchMaterializeWire(ctx, s.remote, job.obj)
+				if err != nil {
+					fail(err)
+					return
+				}
+				select {
+				case decodedCh <- fetchedMaterializeObject{index: job.index, obj: job.obj, wire: wire, getMS: getMS}:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		getWG.Wait()
+		close(decodedCh)
+	}()
+
+	var decodeWG sync.WaitGroup
+	results := make(chan decodedMaterializeObject, decodeWorkers*2)
+	for w := 0; w < decodeWorkers; w++ {
+		decodeWG.Add(1)
+		go func() {
+			defer decodeWG.Done()
+			for job := range decodedCh {
+				rec, decodeMS, err := decodeMaterializeObject(job.obj, job.wire)
+				result := decodedMaterializeObject{index: job.index, rec: rec, getMS: job.getMS, decodeMS: decodeMS, err: err}
+				select {
+				case results <- result:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		decodeWG.Wait()
+		close(results)
+	}()
+
+	// Reorder the concurrent decodes back into input order and hand each record
+	// to the appenders exactly once.
+	var getMS, decodeMS int64
+	next := 0
+	pending := make(map[int]JournalRecord, decodeWorkers+getWorkers)
+	emitErr := error(nil)
+	for result := range results {
+		if result.err != nil {
+			fail(result.err)
+			continue
+		}
+		getMS += result.getMS
+		decodeMS += result.decodeMS
+		pending[result.index] = result.rec
+		for {
+			rec, ok := pending[next]
+			if !ok {
+				break
+			}
+			if emitErr == nil && ctx.Err() == nil {
+				if err := emit(rec); err != nil {
+					emitErr = err
+					fail(err)
+				}
+			}
+			delete(pending, next)
+			next++
+		}
+	}
+	if firstErr != nil {
+		return getMS, decodeMS, firstErr
+	}
+	if emitErr != nil {
+		return getMS, decodeMS, emitErr
+	}
+	return getMS, decodeMS, nil
+}
+
+// fetchMaterializeWire downloads and verifies one journal object's stored
+// bytes. Verification happens before decode so a corrupt object never reaches
+// DuckDB.
+func fetchMaterializeWire(ctx context.Context, store RemoteStore, obj MaterializeObject) ([]byte, int64, error) {
 	signal := otlp.Signal(obj.Signal)
 	if !signal.Valid() {
-		return JournalRecord{}, 0, 0, badReq(fmt.Sprintf("object %s: invalid signal %q", obj.Key, obj.Signal))
+		return nil, 0, badReq(fmt.Sprintf("object %s: invalid signal %q", obj.Key, obj.Signal))
 	}
 	if obj.ReceivedAt <= 0 {
-		return JournalRecord{}, 0, 0, badReq(fmt.Sprintf("object %s: invalid received_at", obj.Key))
+		return nil, 0, badReq(fmt.Sprintf("object %s: invalid received_at", obj.Key))
 	}
 	getStart := time.Now()
 	wire, err := store.Get(ctx, obj.Key)
 	if err != nil {
-		return JournalRecord{}, 0, 0, fmt.Errorf("fetch %s: %w", obj.Key, err)
+		return nil, 0, fmt.Errorf("fetch %s: %w", obj.Key, err)
 	}
 	getMS := time.Since(getStart).Milliseconds()
 	if obj.Size > 0 && int64(len(wire)) != obj.Size {
-		return JournalRecord{}, 0, 0, fmt.Errorf("object %s: size mismatch", obj.Key)
+		return nil, 0, fmt.Errorf("object %s: size mismatch", obj.Key)
 	}
 	if obj.SHA256 != "" && !strings.EqualFold(sha256Hex(wire), obj.SHA256) {
-		return JournalRecord{}, 0, 0, fmt.Errorf("object %s: sha256 mismatch", obj.Key)
+		return nil, 0, fmt.Errorf("object %s: sha256 mismatch", obj.Key)
 	}
+	return wire, getMS, nil
+}
+
+// decodeMaterializeObject gunzips (when needed) and decodes one object. The raw
+// bytes are hashed and dropped: a projection-only part keeps the checksums, not
+// the blobs (spec 034, R1).
+func decodeMaterializeObject(obj MaterializeObject, wire []byte) (JournalRecord, int64, error) {
+	signal := otlp.Signal(obj.Signal)
 	decodeStart := time.Now()
 	payload := wire
+	var err error
 	if strings.EqualFold(obj.ContentEncoding, "gzip") {
 		payload, err = gunzipBytes(wire)
 		if err != nil {
-			return JournalRecord{}, 0, 0, fmt.Errorf("object %s: %w", obj.Key, err)
+			return JournalRecord{}, 0, fmt.Errorf("object %s: %w", obj.Key, err)
 		}
 	}
 	decoded, err := otlp.Decode(signal, payload)
 	if err != nil {
-		return JournalRecord{}, 0, 0, fmt.Errorf("object %s: decode: %w", obj.Key, err)
+		return JournalRecord{}, 0, fmt.Errorf("object %s: decode: %w", obj.Key, err)
 	}
 	decodeMS := time.Since(decodeStart).Milliseconds()
 	return JournalRecord{
@@ -274,8 +393,9 @@ func fetchMaterializationRecord(ctx context.Context, store RemoteStore, obj Mate
 			Size:            int64(len(wire)),
 			RequestID:       requestIDFromKey(obj.Key),
 		},
-		Wire:    wire,
-		Payload: payload,
-		Decoded: decoded,
-	}, getMS, decodeMS, nil
+		WireSHA256:    sha256Hex(wire),
+		PayloadSHA256: sha256Hex(payload),
+		PayloadLength: int64(len(payload)),
+		Decoded:       decoded,
+	}, decodeMS, nil
 }

@@ -75,6 +75,8 @@ export interface WranglerValidationOptions {
   expectedImageBuildContext?: string;
   expectedInstanceType?: string;
   expectedCompactorImage?: string;
+  /** Spec 034: the materializer/compactor container size (default standard-4). */
+  expectedCompactorInstanceType?: string;
   /**
    * Structural lint only: accept the repository's all-zero KV placeholder id.
    * A real deploy preflight must never set this (spec 024, R2).
@@ -242,6 +244,7 @@ export function validateWranglerConfig(
   const expectedContext = opts.expectedImageBuildContext ?? "..";
   const expectedInstanceType = opts.expectedInstanceType ?? "standard-1";
   const expectedCompactorImage = opts.expectedCompactorImage ?? "../Dockerfile.compactor";
+  const expectedCompactorInstanceType = opts.expectedCompactorInstanceType ?? "standard-4";
   const checks: Check[] = [];
   const add = (name: string, ok: boolean, required: boolean, detail: string): void => {
     checks.push({ name, ok, required, detail });
@@ -312,6 +315,12 @@ export function validateWranglerConfig(
     compactor
       ? `image=${compactor.image ?? "<unset>"} context=${compactor.image_build_context ?? "<unset>"}`
       : "no CompactorDO container",
+  );
+  add(
+    "container_compactor_instance_type",
+    compactor?.instance_type === expectedCompactorInstanceType,
+    true,
+    `CompactorDO instance_type=${compactor?.instance_type ?? "<unset>"} (want ${expectedCompactorInstanceType}; spec 034 materializer throughput)`,
   );
   add(
     "container_compactor_max_instances_bounded",
@@ -492,6 +501,49 @@ export function validateWranglerConfig(
     Number.isInteger(partsPerMember) && partsPerMember >= 1 && partsPerMember <= 8,
     true,
     `MATERIALIZE_PARTS_PER_MEMBER=${vars["MATERIALIZE_PARTS_PER_MEMBER"] ?? "<default 2>"} must be 1..8`,
+  );
+  // Spec 034: row-based part planning + projection-only part limits.
+  const targetSpans = Number.parseInt(String(vars["MATERIALIZE_PART_TARGET_SPANS"] ?? "500000"), 10);
+  add(
+    "materialize_part_target_spans_bounded",
+    Number.isInteger(targetSpans) && targetSpans >= 1_000 && targetSpans <= 10_000_000,
+    true,
+    `MATERIALIZE_PART_TARGET_SPANS=${vars["MATERIALIZE_PART_TARGET_SPANS"] ?? "<default 500000>"} must be 1000..10000000`,
+  );
+  const spansPerKiB = Number.parseInt(String(vars["MATERIALIZE_SPANS_PER_KIB"] ?? "40"), 10);
+  add(
+    "materialize_spans_per_kib_bounded",
+    Number.isInteger(spansPerKiB) && spansPerKiB >= 1 && spansPerKiB <= 10_000,
+    true,
+    `MATERIALIZE_SPANS_PER_KIB=${vars["MATERIALIZE_SPANS_PER_KIB"] ?? "<default 40>"} must be 1..10000`,
+  );
+  const maxPartBytes = Number.parseInt(String(vars["MATERIALIZE_MAX_PART_BYTES"] ?? String(1 << 30)), 10);
+  add(
+    "materialize_max_part_bytes_bounded",
+    Number.isFinite(maxPartBytes) && maxPartBytes >= 64 * 1024 * 1024 && maxPartBytes <= 2 * 1024 * 1024 * 1024,
+    true,
+    `MATERIALIZE_MAX_PART_BYTES=${vars["MATERIALIZE_MAX_PART_BYTES"] ?? "<default 1 GiB>"} must be 64 MiB..2 GiB`,
+  );
+  const partTimeout = Number.parseInt(String(vars["MATERIALIZE_PART_TIMEOUT_MS"] ?? "120000"), 10);
+  add(
+    "materialize_part_timeout_bounded",
+    Number.isFinite(partTimeout) && partTimeout >= 10_000 && partTimeout <= 900_000,
+    true,
+    `MATERIALIZE_PART_TIMEOUT_MS=${vars["MATERIALIZE_PART_TIMEOUT_MS"] ?? "<default 120000>"} must be 10000..900000`,
+  );
+  const maxPartTimeout = Number.parseInt(String(vars["MATERIALIZE_MAX_PART_TIMEOUT_MS"] ?? "600000"), 10);
+  add(
+    "materialize_max_part_timeout_bounded",
+    Number.isFinite(maxPartTimeout) && maxPartTimeout >= partTimeout && maxPartTimeout <= 900_000,
+    true,
+    `MATERIALIZE_MAX_PART_TIMEOUT_MS=${vars["MATERIALIZE_MAX_PART_TIMEOUT_MS"] ?? "<default 600000>"} must be >= MATERIALIZE_PART_TIMEOUT_MS and <= 900000`,
+  );
+  const materializeConcurrency = Number.parseInt(String(vars["MATERIALIZE_CONCURRENCY"] ?? "32"), 10);
+  add(
+    "materialize_concurrency_bounded",
+    Number.isInteger(materializeConcurrency) && materializeConcurrency >= 1 && materializeConcurrency <= 256,
+    true,
+    `MATERIALIZE_CONCURRENCY=${vars["MATERIALIZE_CONCURRENCY"] ?? "<default 32>"} must be 1..256`,
   );
   const insecure = vars["BURSTEL_DEV_INSECURE_AUTH"];
   add(

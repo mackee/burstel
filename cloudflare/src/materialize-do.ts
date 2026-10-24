@@ -33,6 +33,9 @@ export interface MaterializeEnv {
   MATERIALIZE_KEEPALIVE_MS?: string;
   MATERIALIZE_CAPACITY_BACKOFF_MS?: string;
   MATERIALIZE_PARTS_PER_MEMBER?: string;
+  /** Spec 034: row-based part planning. */
+  MATERIALIZE_PART_TARGET_SPANS?: string;
+  MATERIALIZE_SPANS_PER_KIB?: string;
   LATE_WRITE_LIMIT_MS?: string;
   COMPACTION_CONTAINER_TIMEOUT_MS?: string;
   [key: string]: unknown;
@@ -69,13 +72,15 @@ export class MaterializeDO extends DurableObject<MaterializeEnv> {
         parallelism: int(env.MATERIALIZE_PARALLELISM, 3),
         maxInstances: int(env.MATERIALIZE_MAX_INSTANCES, 4),
         maxAttempts: int(env.MATERIALIZE_MAX_ATTEMPTS, 3),
-        leaseTtlMs: int(env.MATERIALIZE_LEASE_TTL_MS, 120_000),
+        leaseTtlMs: int(env.MATERIALIZE_LEASE_TTL_MS, 300_000),
         retryDelayMs: int(env.MATERIALIZE_RETRY_MS, 5_000),
         heartbeatMs: int(env.MATERIALIZE_HEARTBEAT_MS, 30_000),
         lateWriteLimitMs: int(env.LATE_WRITE_LIMIT_MS, 10_000),
         keepAliveMs: int(env.MATERIALIZE_KEEPALIVE_MS, 10 * 60 * 1000),
         capacityBackoffMs: int(env.MATERIALIZE_CAPACITY_BACKOFF_MS, 10_000),
         partsPerMember: int(env.MATERIALIZE_PARTS_PER_MEMBER, 2),
+        partTargetSpans: int(env.MATERIALIZE_PART_TARGET_SPANS, 500_000),
+        partSpansPerKiB: int(env.MATERIALIZE_SPANS_PER_KIB, 40),
       },
       log: (message, fields) => console.log(message, fields ?? {}),
     });

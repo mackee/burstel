@@ -210,16 +210,20 @@ func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []Segm
 	baseFromNS := startNS - horizon.Nanoseconds()
 
 	attachStart := time.Now()
-	if len(refs) > 0 {
-		for i, ref := range refs {
-			if err := validateSegmentPath(ref.Path); err != nil {
-				return err
-			}
-			alias := fmt.Sprintf("seg%d", i)
-			if _, err := db.ExecContext(ctx, "ATTACH "+quoteLiteral(ref.Path)+" AS "+alias+" (READ_ONLY)"); err != nil {
-				return fmt.Errorf("analysis: attach segment %s: %w", ref.Key, err)
-			}
+	available := make([]map[string]bool, len(refs))
+	for i, ref := range refs {
+		if err := validateSegmentPath(ref.Path); err != nil {
+			return err
 		}
+		alias := fmt.Sprintf("seg%d", i)
+		if _, err := db.ExecContext(ctx, "ATTACH "+quoteLiteral(ref.Path)+" AS "+alias+" (READ_ONLY)"); err != nil {
+			return fmt.Errorf("analysis: attach segment %s: %w", ref.Key, err)
+		}
+		tables, err := attachedTableSet(ctx, db, alias)
+		if err != nil {
+			return fmt.Errorf("analysis: inspect segment %s: %w", ref.Key, err)
+		}
+		available[i] = tables
 	}
 	if timings != nil {
 		timings.AttachMS = time.Since(attachStart).Milliseconds()
@@ -232,43 +236,73 @@ func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []Segm
 	}()
 
 	tableSpecs := []struct {
-		table  string
-		where  func(alias string) string
-		source string
+		table string
+		where func(alias string) string
+		// selectSQL returns the source projection for one attached ref. Spec 034
+		// parts carry `part_meta` instead of `otlp_batches`; the batch projection
+		// is synthesized from it (without the raw payload blobs) so analysis and
+		// coverage keep working unchanged.
+		selectSQL func(alias string, tables map[string]bool) (string, bool)
 	}{
 		{"otlp_batches", func(a string) string {
 			return fmt.Sprintf("WHERE epoch_ms(%s.received_at) >= %d AND epoch_ms(%s.received_at) < %d", a, loMS, a, hiMS)
-		}, "otlp_batches"},
+		}, func(a string, tables map[string]bool) (string, bool) {
+			if tables["otlp_batches"] {
+				return "SELECT * FROM " + a + ".main.otlp_batches AS t ", true
+			}
+			if tables["part_meta"] {
+				return "SELECT instance_id, source_key, request_id, signal, received_at, content_encoding, " +
+					"wire_sha256, payload_sha256, record_count, payload_length, resource_summary, " +
+					"CAST('' AS BLOB) AS wire_payload, CAST('' AS BLOB) AS payload " +
+					"FROM " + a + ".main.part_meta AS t ", true
+			}
+			return "", false
+		}},
 		{"spans", func(a string) string {
 			return spanWindowWhere(a, startNS, endNS, policy)
-		}, "spans"},
+		}, func(a string, tables map[string]bool) (string, bool) {
+			if !tables["spans"] {
+				return "", false
+			}
+			return "SELECT * FROM " + a + ".main.spans AS t ", true
+		}},
 		{"log_records", func(a string) string {
 			return fmt.Sprintf("WHERE COALESCE(NULLIF(%[1]s.time_unix_nano, 0), %[1]s.observed_time_unix_nano) >= %[2]d AND COALESCE(NULLIF(%[1]s.time_unix_nano, 0), %[1]s.observed_time_unix_nano) < %[3]d", a, startNS, endNS)
-		}, "log_records"},
+		}, func(a string, tables map[string]bool) (string, bool) {
+			if !tables["log_records"] {
+				return "", false
+			}
+			return "SELECT * FROM " + a + ".main.log_records AS t ", true
+		}},
 		{"metric_points", func(a string) string {
 			return fmt.Sprintf("WHERE %s.time_unix_nano >= %d AND %s.time_unix_nano < %d", a, startNS, a, endNS)
-		}, "metric_points"},
+		}, func(a string, tables map[string]bool) (string, bool) {
+			if !tables["metric_points"] {
+				return "", false
+			}
+			return "SELECT * FROM " + a + ".main.metric_points AS t ", true
+		}},
 	}
 	for _, ts := range tableSpecs {
 		var b strings.Builder
 		b.WriteString("INSERT INTO ")
 		b.WriteString(ts.table)
 		b.WriteString(" SELECT * FROM (")
-		if len(refs) == 0 {
-			b.WriteString("SELECT * FROM " + ts.table + " WHERE 1=0")
-		} else {
-			for i := range refs {
-				if i > 0 {
-					b.WriteString(" UNION ALL ")
-				}
-				alias := fmt.Sprintf("seg%d", i)
-				b.WriteString("SELECT * FROM ")
-				b.WriteString(alias)
-				b.WriteString(".main.")
-				b.WriteString(ts.source)
-				b.WriteString(" AS t ")
-				b.WriteString(ts.where("t"))
+		sources := 0
+		for i := range refs {
+			selectSQL, ok := ts.selectSQL(fmt.Sprintf("seg%d", i), available[i])
+			if !ok {
+				continue
 			}
+			if sources > 0 {
+				b.WriteString(" UNION ALL ")
+			}
+			b.WriteString(selectSQL)
+			b.WriteString(ts.where("t"))
+			sources++
+		}
+		if sources == 0 {
+			b.WriteString("SELECT * FROM " + ts.table + " WHERE 1=0")
 		}
 		b.WriteString(")")
 		if _, err := db.ExecContext(ctx, b.String()); err != nil {
@@ -279,16 +313,20 @@ func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []Segm
 	// Pre-window cumulative baseline: kept private and never queryable.
 	var bb strings.Builder
 	bb.WriteString("INSERT INTO _burstel_baseline_metrics SELECT * FROM (")
-	if len(refs) == 0 {
-		bb.WriteString("SELECT * FROM metric_points WHERE 1=0")
-	} else {
-		for i := range refs {
-			if i > 0 {
-				bb.WriteString(" UNION ALL ")
-			}
-			alias := fmt.Sprintf("seg%d", i)
-			fmt.Fprintf(&bb, "SELECT * FROM %s.main.metric_points AS t WHERE t.aggregation_temporality = 2 AND t.time_unix_nano < %d AND t.time_unix_nano >= %d", alias, startNS, baseFromNS)
+	baselineSources := 0
+	for i := range refs {
+		if !available[i]["metric_points"] {
+			continue
 		}
+		if baselineSources > 0 {
+			bb.WriteString(" UNION ALL ")
+		}
+		alias := fmt.Sprintf("seg%d", i)
+		fmt.Fprintf(&bb, "SELECT * FROM %s.main.metric_points AS t WHERE t.aggregation_temporality = 2 AND t.time_unix_nano < %d AND t.time_unix_nano >= %d", alias, startNS, baseFromNS)
+		baselineSources++
+	}
+	if baselineSources == 0 {
+		bb.WriteString("SELECT * FROM metric_points WHERE 1=0")
 	}
 	bb.WriteString(")")
 	if _, err := db.ExecContext(ctx, bb.String()); err != nil {
@@ -358,6 +396,27 @@ func validateSegmentPath(path string) error {
 
 func quoteLiteral(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// attachedTableSet lists the tables a verified attached file exposes. A
+// compacted segment has the raw `otlp_batches` tables; a projection-only shot
+// part (spec 034) has `part_meta` plus the analysis projections instead.
+func attachedTableSet(ctx context.Context, db *sql.DB, alias string) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx,
+		`SELECT table_name FROM information_schema.tables WHERE table_catalog = ?`, alias)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	tables := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		tables[name] = true
+	}
+	return tables, rows.Err()
 }
 
 // scopedSchemaDDL mirrors the compacted segment schema. It is created empty and

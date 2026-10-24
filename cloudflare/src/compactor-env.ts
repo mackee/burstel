@@ -33,6 +33,29 @@ export interface CompactorR2Env {
 }
 
 /**
+ * Spec 034: materialization tuning that must reach the Go container. The names
+ * are the Worker variable names (no extra prefix), so an operator tunes one
+ * value in `wrangler.jsonc` and the preflight validates the same key.
+ */
+export interface CompactorMaterializeEnv {
+  /** Projection-only part size ceiling (bytes, default 1 GiB). */
+  MATERIALIZE_MAX_PART_BYTES?: string;
+  /** Parallel R2 GETs (default 32). */
+  MATERIALIZE_CONCURRENCY?: string;
+  /** Parallel gunzip+decode workers (default GOMAXPROCS). */
+  MATERIALIZE_DECODE_WORKERS?: string;
+  /** Concurrent DuckDB appenders per analysis table (default 2). */
+  MATERIALIZE_APPEND_SHARDS?: string;
+}
+
+const MATERIALIZE_CONTAINER_VARS = [
+  "MATERIALIZE_MAX_PART_BYTES",
+  "MATERIALIZE_CONCURRENCY",
+  "MATERIALIZE_DECODE_WORKERS",
+  "MATERIALIZE_APPEND_SHARDS",
+] as const;
+
+/**
  * Builds the compactor Container environment from the Worker/DO bindings.
  *
  * Secure mode: inject the distinct token so the Go service's auth gate matches
@@ -43,7 +66,7 @@ export interface CompactorR2Env {
  * ungated in that mode.
  */
 export function resolveCompactorContainerEnv(
-  env: InternalAuthEnv & CompactorR2Env,
+  env: InternalAuthEnv & CompactorR2Env & CompactorMaterializeEnv,
   port: number,
 ): CompactorContainerEnv {
   const internal = resolveInternalToken(env);
@@ -55,6 +78,14 @@ export function resolveCompactorContainerEnv(
     if (internal.token.length > 0) containerEnv["BURSTEL_INTERNAL_TOKEN"] = internal.token;
   } else if (internal.ok) {
     containerEnv["BURSTEL_DEV_INSECURE_AUTH"] = "1";
+  }
+  // Spec 034: part sizing and pipeline concurrency are owned by the Worker
+  // vars; only the values an operator explicitly set are forwarded.
+  for (const name of MATERIALIZE_CONTAINER_VARS) {
+    const value = env[name];
+    if (typeof value === "string" && value.trim() !== "") {
+      containerEnv[name] = value.trim();
+    }
   }
   // Spec 031 D1: a bucket-scoped R2 credential is injected into the
   // compactor/materializer container only. It is never exported to the

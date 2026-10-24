@@ -33,6 +33,15 @@ export interface CompactorEnv extends Cloudflare.Env {
   R2_BUCKET_NAME?: string;
   /** Spec 033: keep a materializer pool member warm after a part. */
   MATERIALIZE_KEEPALIVE_MS?: string;
+  /** Spec 034: base/par-MiB part request timeout (scales with part size). */
+  MATERIALIZE_PART_TIMEOUT_MS?: string;
+  MATERIALIZE_PART_TIMEOUT_PER_MIB_MS?: string;
+  MATERIALIZE_MAX_PART_TIMEOUT_MS?: string;
+  /** Spec 034: forwarded verbatim into the materializer container env. */
+  MATERIALIZE_MAX_PART_BYTES?: string;
+  MATERIALIZE_CONCURRENCY?: string;
+  MATERIALIZE_DECODE_WORKERS?: string;
+  MATERIALIZE_APPEND_SHARDS?: string;
 }
 
 export class CompactorDO extends DurableObject<CompactorEnv> {
@@ -76,7 +85,11 @@ export class CompactorDO extends DurableObject<CompactorEnv> {
       internalReady: internal.ok,
       holder: ctx.id.name ?? ctx.id.toString(),
       config: {
-        containerTimeoutMs: compactorConfigFromEnv(env).containerTimeoutMs,
+        // Spec 034: the part timeout is *not* the 60 s compaction timeout; it
+        // starts at 120 s and grows with the part's input bytes.
+        containerTimeoutMs: envNumber(env.MATERIALIZE_PART_TIMEOUT_MS, 120_000),
+        timeoutPerMiBMs: envNumber(env.MATERIALIZE_PART_TIMEOUT_PER_MIB_MS, 500),
+        maxTimeoutMs: envNumber(env.MATERIALIZE_MAX_PART_TIMEOUT_MS, 600_000),
         containerKeepAliveMs: envNumber(env.MATERIALIZE_KEEPALIVE_MS, 10 * 60 * 1000),
       },
       log: (message, fields) => console.log(message, fields ?? {}),

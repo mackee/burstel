@@ -27,6 +27,37 @@ type JournalRecord struct {
 	Wire    []byte // exactly the bytes stored in R2 (possibly gzip)
 	Payload []byte // decompressed OTLP protobuf request bytes
 	Decoded *otlp.Decoded
+	// Spec 034: a projection-only part never needs the raw bytes after decode.
+	// The materializer hashes them while they are in hand and drops both blobs
+	// so a large part does not hold hundreds of MiB of payload in memory.
+	WireSHA256    string
+	PayloadSHA256 string
+	PayloadLength int64
+}
+
+// wireSHA256 returns the stored-bytes checksum, falling back to hashing the
+// retained wire blob (continuous compaction keeps it for the raw tables).
+func (r JournalRecord) wireSHA256() string {
+	if r.WireSHA256 != "" {
+		return r.WireSHA256
+	}
+	return sha256Hex(r.Wire)
+}
+
+// payloadSHA256 returns the decompressed-payload checksum.
+func (r JournalRecord) payloadSHA256() string {
+	if r.PayloadSHA256 != "" {
+		return r.PayloadSHA256
+	}
+	return sha256Hex(r.Payload)
+}
+
+// payloadLength returns the decompressed payload length.
+func (r JournalRecord) payloadLength() int64 {
+	if r.PayloadLength > 0 || r.PayloadSHA256 != "" {
+		return r.PayloadLength
+	}
+	return int64(len(r.Payload))
 }
 
 // SegmentInfo describes a freshly built immutable segment.
@@ -204,19 +235,21 @@ type BuildProfile struct {
 	HashMS       int64
 }
 
-// BuildPart writes one shot-materialization part. Unlike a compacted segment it
-// may legitimately contain zero records (for example when every journal object
-// in a chunk was excluded); the schema, checksum and metadata contract are
-// identical so analysis can ATTACH a part exactly like a segment.
+// BuildPart writes one projection-only shot-materialization part (spec 034).
+// Unlike a compacted segment it has no raw wire/payload blobs and no secondary
+// indexes; it may legitimately contain zero records (for example when every
+// journal object in a chunk was excluded). The analysis tables and the
+// checksum/metadata contract are identical, so analysis can ATTACH a part
+// exactly like a segment.
 func BuildPart(ctx context.Context, path, key, instanceID, instanceName string, records []JournalRecord) (SegmentInfo, error) {
-	return buildSegment(ctx, path, key, instanceID, instanceName, records, true, nil)
+	return buildPart(ctx, path, key, instanceID, instanceName, records, nil)
 }
 
 // BuildPartProfile is BuildPart plus the per-phase timing breakdown used by the
 // materializer's structured logs (spec 033 requirement 5).
 func BuildPartProfile(ctx context.Context, path, key, instanceID, instanceName string, records []JournalRecord) (SegmentInfo, BuildProfile, error) {
 	var profile BuildProfile
-	info, err := buildSegment(ctx, path, key, instanceID, instanceName, records, true, &profile)
+	info, err := buildPart(ctx, path, key, instanceID, instanceName, records, &profile)
 	return info, profile, err
 }
 
@@ -324,8 +357,8 @@ func buildSegment(
 		if rowInstanceID == "" {
 			rowInstanceID = instanceID
 		}
-		wireSHA := sha256Hex(rec.Wire)
-		payloadSHA := sha256Hex(rec.Payload)
+		wireSHA := rec.wireSHA256()
+		payloadSHA := rec.payloadSHA256()
 		rq := rec.Decoded
 		recordCount := int64(0)
 		if rq != nil {
@@ -337,7 +370,7 @@ func buildSegment(
 		}
 		if err := batchAppender.AppendRow(
 			rowInstanceID, o.Key, o.RequestID, string(o.Signal), o.ReceivedAt.UTC(),
-			o.ContentEncoding, wireSHA, payloadSHA, recordCount, int64(len(rec.Payload)),
+			o.ContentEncoding, wireSHA, payloadSHA, recordCount, rec.payloadLength(),
 			resourceSummaryOf(rq), rec.Wire, rec.Payload,
 		); err != nil {
 			return SegmentInfo{}, fmt.Errorf("compaction: append batch: %w", err)
@@ -612,7 +645,9 @@ func (r *SegmentReader) Path() string { return r.path }
 // Close releases the read-only connection.
 func (r *SegmentReader) Close() error { return r.db.Close() }
 
-// Counts reads the per-signal row counts back from the restored segment.
+// Counts reads the per-signal row counts back from the restored segment or
+// part. A projection-only part (spec 034) has `part_meta` instead of
+// `otlp_batches`, so the batch count falls back to the provenance rows.
 func (r *SegmentReader) Counts(ctx context.Context) (spans, logs, metrics, batches int64, err error) {
 	for _, q := range []struct {
 		sql string
@@ -624,6 +659,12 @@ func (r *SegmentReader) Counts(ctx context.Context) (spans, logs, metrics, batch
 		{`SELECT COUNT(*) FROM otlp_batches`, &batches},
 	} {
 		if err := r.db.QueryRowContext(ctx, q.sql).Scan(q.dst); err != nil {
+			if q.dst == &batches && isMissingTableError(err) {
+				if fallbackErr := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM part_meta`).Scan(q.dst); fallbackErr != nil {
+					return 0, 0, 0, 0, fallbackErr
+				}
+				continue
+			}
 			return 0, 0, 0, 0, err
 		}
 	}
@@ -635,7 +676,13 @@ func (r *SegmentReader) Counts(ctx context.Context) (spans, logs, metrics, batch
 func (r *SegmentReader) WireHashes(ctx context.Context) (map[string]string, error) {
 	rows, err := r.db.QueryContext(ctx, `SELECT source_key, wire_sha256 FROM otlp_batches`)
 	if err != nil {
-		return nil, err
+		if !isMissingTableError(err) {
+			return nil, err
+		}
+		rows, err = r.db.QueryContext(ctx, `SELECT source_key, wire_sha256 FROM part_meta`)
+		if err != nil {
+			return nil, err
+		}
 	}
 	defer rows.Close()
 	out := map[string]string{}

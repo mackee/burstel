@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,6 +40,18 @@ type ServiceConfig struct {
 	MaxBatchBytes   int64
 	// MaxSegmentBytes bounds the built segment held for download.
 	MaxSegmentBytes int64
+	// MaxPartBytes bounds one shot materialization part (spec 034 R4, default
+	// 1 GiB). Parts are projection-only and row-planned, so the old 256 MiB
+	// segment ceiling must not cap them.
+	MaxPartBytes int64
+	// MaterializeConcurrency is the bounded number of parallel R2 GETs.
+	MaterializeConcurrency int
+	// DecodeWorkers is the parallel gunzip+protobuf worker count (0 =
+	// GOMAXPROCS).
+	DecodeWorkers int
+	// AppendShards is the number of concurrent DuckDB appenders per analysis
+	// table (0 = min(GOMAXPROCS, 4)).
+	AppendShards int
 	// SegmentTTL bounds how long a built segment is retained for download.
 	SegmentTTL time.Duration
 }
@@ -55,6 +68,7 @@ func DefaultServiceConfig() ServiceConfig {
 		MaxBatchObjects: 256,
 		MaxBatchBytes:   8 << 20,
 		MaxSegmentBytes: 256 << 20,
+		MaxPartBytes:    1 << 30,
 		SegmentTTL:      5 * time.Minute,
 	}
 }
@@ -128,6 +142,8 @@ type Service struct {
 	// The continuous compaction path still streams through the coordinator.
 	remote                 RemoteStore
 	materializeConcurrency int
+	decodeWorkers          int
+	appendShards           int
 }
 
 // NewService builds a compactor service.
@@ -148,11 +164,28 @@ func NewServiceWithRemote(cfg ServiceConfig, remote RemoteStore, concurrency int
 	if cfg.MaxSegmentBytes <= 0 {
 		cfg.MaxSegmentBytes = 256 << 20
 	}
+	if cfg.MaxPartBytes <= 0 {
+		cfg.MaxPartBytes = 1 << 30
+	}
 	if cfg.SegmentTTL <= 0 {
 		cfg.SegmentTTL = 5 * time.Minute
 	}
 	if concurrency <= 0 {
+		concurrency = cfg.MaterializeConcurrency
+	}
+	if concurrency <= 0 {
 		concurrency = 32
+	}
+	decodeWorkers := cfg.DecodeWorkers
+	if decodeWorkers <= 0 {
+		decodeWorkers = runtime.GOMAXPROCS(0)
+	}
+	if decodeWorkers <= 0 {
+		decodeWorkers = 1
+	}
+	appendShards := cfg.AppendShards
+	if appendShards <= 0 {
+		appendShards = defaultAppendShards()
 	}
 	return &Service{
 		cfg:                    cfg,
@@ -160,7 +193,17 @@ func NewServiceWithRemote(cfg ServiceConfig, remote RemoteStore, concurrency int
 		segs:                   map[string]*storedSegment{},
 		remote:                 remote,
 		materializeConcurrency: concurrency,
+		decodeWorkers:          decodeWorkers,
+		appendShards:           appendShards,
 	}
+}
+
+// maxPartBytes is the effective part size ceiling.
+func (s *Service) maxPartBytes() int64 {
+	if s.cfg.MaxPartBytes > 0 {
+		return s.cfg.MaxPartBytes
+	}
+	return 1 << 30
 }
 
 // Handler returns the HTTP handler for the service.
