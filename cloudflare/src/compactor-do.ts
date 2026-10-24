@@ -14,9 +14,9 @@
 import { DurableObject } from "cloudflare:workers";
 
 import type { R2BucketLike } from "./artifacts";
-import { resolveInternalToken } from "./auth";
 import { CompactorCore } from "./compactor-core";
 import type { CompactorConfig } from "./compactor-core";
+import { resolveCompactorContainerEnv } from "./compactor-env";
 import { createContainerControl } from "./container";
 import { containerPort, requireContainer } from "./shot-do";
 
@@ -35,14 +35,10 @@ export class CompactorDO extends DurableObject<CompactorEnv> {
 
     const port = containerPort(env);
     const container = createContainerControl(requireContainer(ctx), { port });
-    const internal = resolveInternalToken(env);
-    const containerEnv: Record<string, string> = {
-      BURSTEL_ADDR: `:${port}`,
-      BURSTEL_COMPACT_WORK_DIR: "/work",
-    };
-    if (internal.ok && internal.insecure) {
-      containerEnv["BURSTEL_DEV_INSECURE_AUTH"] = "1";
-    }
+    // Spec 028: the container env must carry the same distinct token that
+    // CompactorCore sends as `Authorization: Bearer ...`; otherwise the Go
+    // service fails closed and no segment is ever published in secure mode.
+    const { env: containerEnv, internal } = resolveCompactorContainerEnv(env, port);
 
     this.core = new CompactorCore({
       ingest: env.INGEST_DO,

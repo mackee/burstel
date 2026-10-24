@@ -274,8 +274,12 @@ describe("cross-file deployment invariants", () => {
     expect(dockerfile).toMatch(/^EXPOSE 8080$/m);
     expect(dockerfile).toMatch(/^ENV BURSTEL_ADDR=:8080/m);
     expect(dockerfile).toContain("USER burstel");
+    const compactorEnv = repoFile("../src/compactor-env.ts");
+    expect(compactorEnv).toContain("BURSTEL_ADDR: `:${port}`");
+    // Spec 028: the secure container env must carry the distinct token.
+    expect(compactorEnv).toContain('containerEnv["BURSTEL_INTERNAL_TOKEN"] = internal.token');
     const compactorDo = repoFile("../src/compactor-do.ts");
-    expect(compactorDo).toContain("BURSTEL_ADDR: `:${port}`");
+    expect(compactorDo).toContain("resolveCompactorContainerEnv(env, port)");
     expect(compactorDo).toContain("ctx.storage.setAlarm");
   });
 

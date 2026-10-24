@@ -12,6 +12,8 @@
 #   * POST /api/shots defaults to a logical window shot (no per-shot token)
 #   * real OTLP traces + metrics + logs through POST /ingest/v1/*
 #   * listing-based journal occupancy via GET /api/ingest/status
+#   * the compactor container token gate (POST /api/compaction/run must not
+#     report `compactor API disabled`, spec 028)
 #   * scope separation (instance token is not an admin token and vice versa)
 #   * KV backfill endpoint, freeze/stop of the window marker, MCP tools/list
 #
@@ -146,6 +148,23 @@ req POST /api/instance-tokens/backfill "" "$ADMIN"
 expect_code 200 "KV backfill"
 printf '%s' "$BODY" | grep -q '"backfilled"' || die "backfill response missing backfilled: $BODY"
 
+echo "== compactor container token gate (spec 028) ==" >&2
+# A secure deployment must never surface the Go compactor's fail-closed
+# `compactor API disabled: BURSTEL_INTERNAL_TOKEN is not configured` error.
+# `run` may be 200 or 503 (a tick can legitimately fail/skip for other
+# reasons), so inspect the report body instead of requiring success.
+req POST /api/compaction/run '{}' "$ADMIN"
+case "$HTTP_CODE" in
+  200|503) ;;
+  *) die "POST /api/compaction/run returned HTTP $HTTP_CODE: $BODY" ;;
+esac
+if printf '%s' "$BODY" | grep -q 'compactor API disabled'; then
+  die "compactor container is missing BURSTEL_INTERNAL_TOKEN (no segment can ever be published): $BODY"
+fi
+if printf '%s' "$BODY" | grep -q 'internal_token_unconfigured'; then
+  die "compactor coordinator has no distinct internal token configured: $BODY"
+fi
+
 echo "== stop the window marker ==" >&2
 req GET "/api/shots/$SHOT" "" "$ADMIN"
 expect_code 200 "status window shot"
@@ -175,6 +194,6 @@ req POST /api/ingest-token "" "$ADMIN"
 expect_code 410 "retired ingest-token endpoint"
 
 cat <<JSON
-{"base_url":"$BASE","healthz":"ok","instance":"$INSTANCE","shot":"$SHOT","kind":"window","shot_state":"$FINAL_STATE","instance_token_ttl_seconds":$TTL,"otlp_traces_metrics_logs":"sent","journal_objects":$OBJECTS,"kv_backfill":"ok","scope_separation":"ok","mcp_tools_list_and_call":"ok","installation_token_retired":true}
+{"base_url":"$BASE","healthz":"ok","instance":"$INSTANCE","shot":"$SHOT","kind":"window","shot_state":"$FINAL_STATE","instance_token_ttl_seconds":$TTL,"otlp_traces_metrics_logs":"sent","journal_objects":$OBJECTS,"kv_backfill":"ok","scope_separation":"ok","compactor_token_gate":"ok","mcp_tools_list_and_call":"ok","installation_token_retired":true}
 JSON
 echo "== cloudflare smoke passed (no secret was printed) ==" >&2

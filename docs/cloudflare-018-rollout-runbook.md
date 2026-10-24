@@ -107,6 +107,25 @@ published.
 
 ## 5. Post-deploy verification (bounded, no benchmark)
 
+First prove the compactor Container received its internal token (spec 028). A
+secure deployment previously returned `compactor API disabled:
+BURSTEL_INTERNAL_TOKEN is not configured` from the Go service, which means no
+segment can ever be published. A tick may legitimately return 503 or skip for
+other transient reasons, so inspect the body rather than the status code:
+
+```bash
+resp="$(curl -sS -X POST https://<host>/api/compaction/run \
+  -H "Authorization: Bearer $ADMIN" -d '{}')"
+case "$resp" in
+  *"compactor API disabled"*) echo "spec 028 regression: $resp" >&2; exit 1 ;;
+  *internal_token_unconfigured*) echo "coordinator token missing: $resp" >&2; exit 1 ;;
+esac
+printf '%s\n' "$resp"
+```
+
+`scripts/cloudflare-smoke.sh` performs the same check automatically and fails
+with `compactor_token_gate` evidence.
+
 ```bash
 BURSTEL_BASE_URL=https://<host> BURSTEL_API_TOKEN=... BURSTEL_INTERNAL_TOKEN=... \
   scripts/cloudflare-smoke.sh

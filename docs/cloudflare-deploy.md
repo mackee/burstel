@@ -199,8 +199,11 @@ scripts/cloudflare-smoke.sh
 health and auth boundaries, creates a named instance and issues its 24h token,
 creates a **default window shot** (`kind=window`, no per-shot token), sends real
 OTLP traces/metrics/logs through `/ingest` with `cmd/burstel-loadgen`, verifies
-the listing-based journal count, exercises the idempotent KV backfill, stops the
-window marker and lists MCP tools. `scripts/cloudflare-multishot-smoke.sh` now
+the listing-based journal count, forces one bounded `POST /api/compaction/run`
+and fails if the report contains `compactor API disabled` (spec 028: the
+Container must receive `BURSTEL_INTERNAL_TOKEN`), exercises the idempotent KV
+backfill, stops the window marker and lists MCP tools.
+`scripts/cloudflare-multishot-smoke.sh` now
 creates two named instances with distinct tokens, proves `/ingest` attributions
 (`x-burstel-instance`) do not cross instances, checks owner filtering, revokes
 one instance token immediately and stops both window markers.

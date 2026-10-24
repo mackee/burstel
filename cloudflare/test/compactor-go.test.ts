@@ -18,7 +18,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { CompactorCore } from "../src/compactor-core";
-import type { ContainerControl, ContainerStartOptions } from "../src/container";
+import { resolveCompactorContainerEnv } from "../src/compactor-env";
+import type { ContainerControl } from "../src/container";
 import { FakeBucket, FakeIngestNamespace, makeIngest, sha256Hex } from "./fakes";
 
 const GO_BIN = process.env.BURSTEL_GO_BIN ?? which("go");
@@ -40,16 +41,17 @@ function which(bin: string): string | null {
 
 class HttpContainer implements ContainerControl {
   runningFlag = false;
-  constructor(
-    private readonly base: string,
-    private readonly token: string,
-  ) {}
+  startEnv: Record<string, string> | undefined;
+  constructor(private readonly base: string) {}
 
   get running(): boolean {
     return this.runningFlag;
   }
 
-  start(_options?: ContainerStartOptions): void {
+  start(env: Record<string, string>): void {
+    // Mirror the real Container: the environment handed to `start` is what the
+    // Go process sees, including the spec-028 internal token.
+    this.startEnv = env;
     this.runningFlag = true;
   }
 
@@ -57,7 +59,7 @@ class HttpContainer implements ContainerControl {
     this.runningFlag = true;
   }
 
-  async keepAlive(): Promise<void> {
+  async keepAlive(_durationMs: number): Promise<void> {
     // no-op
   }
 
@@ -67,7 +69,11 @@ class HttpContainer implements ContainerControl {
 
   async request(path: string, init?: RequestInit): Promise<Response> {
     const headers = new Headers(init?.headers as Record<string, string> | undefined);
-    headers.set("authorization", `Bearer ${this.token}`);
+    // The real Worker sends the bearer header from its resolved token. Here it
+    // comes from the env the container was started with, so a missing spec-028
+    // injection would surface as a 401 instead of a false pass.
+    const token = this.startEnv?.BURSTEL_INTERNAL_TOKEN;
+    if (token) headers.set("authorization", `Bearer ${token}`);
     return fetch(`${this.base}${path}`, {
       ...init,
       headers,
@@ -122,11 +128,22 @@ describe.skipIf(!goAvailable)("compactor Go service bridge (spec 018)", () => {
     const bucket = new FakeBucket();
     const clock = { now: 1_700_000_000_000 };
     const { core: ingest } = makeIngest({ now: () => clock.now, bucket });
-    const container = new HttpContainer(`http://127.0.0.1:${port}`, token);
+    // Secure Worker configuration (spec 028): a distinct token is injected into
+    // the container env and used for the bearer header. The Go process is
+    // started in `beforeAll` with the same token, so this fails (401) unless
+    // the Worker actually sends it.
+    const { env: containerEnv } = resolveCompactorContainerEnv(
+      { BURSTEL_INTERNAL_TOKEN: token, BURSTEL_API_TOKEN: "go-e2e-admin-token" },
+      port,
+    );
+    const container = new HttpContainer(`http://127.0.0.1:${port}`);
     const compactor = new CompactorCore({
       ingest: new FakeIngestNamespace(ingest),
       bucket,
       container,
+      containerEnv,
+      internalToken: token,
+      internalReady: true,
       holder: "go-e2e",
       now: () => clock.now,
       config: { graceMs: 90_000 },
@@ -157,6 +174,7 @@ describe.skipIf(!goAvailable)("compactor Go service bridge (spec 018)", () => {
     const report = await compactor.tick();
     expect(report.ok).toBe(true);
     expect(report.segments_published).toBe(1);
+    expect(container.startEnv?.BURSTEL_INTERNAL_TOKEN).toBe(token);
 
     const segments = await ingest.listSegments({ limit: 10, offset: 0 });
     expect(segments.total).toBe(1);
@@ -169,4 +187,13 @@ describe.skipIf(!goAvailable)("compactor Go service bridge (spec 018)", () => {
     // A real DuckDB segment is not empty.
     expect(seg.size_bytes).toBeGreaterThan(0);
   }, 60_000);
+
+  test("the secure Go service rejects an unauthenticated request", async () => {
+    const resp = await fetch(`http://127.0.0.1:${port}/v1/segments`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    expect(resp.status).toBe(401);
+  });
 });
