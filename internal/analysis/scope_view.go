@@ -111,6 +111,12 @@ func buildScopedView(ctx context.Context, window TimeWindow, refs []SegmentRef, 
 	}
 	timings.AttachMS = time.Since(attachStart).Milliseconds()
 
+	parts, err := countParts(ctx, db, refs, available)
+	if err != nil {
+		cleanup()
+		return nil, err
+	}
+
 	if err := createScopedViews(ctx, db, window, refs, available, horizon, policy); err != nil {
 		cleanup()
 		return nil, err
@@ -157,6 +163,7 @@ func buildScopedView(ctx context.Context, window TimeWindow, refs []SegmentRef, 
 		Window:   window,
 		Coverage: cov,
 		Timings:  timings,
+		Parts:    parts,
 		dir:      dir,
 	}, nil
 }

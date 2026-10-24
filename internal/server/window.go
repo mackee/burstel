@@ -25,7 +25,7 @@ func (s *Server) handleWindowOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	started := time.Now()
-	selection, cached, err := s.window.OpenWindowWithCache(r.Context(), req.SessionID, req.Window, req.Catalog, req.Download)
+	selection, cached, err := s.window.OpenWindowWithManifest(r.Context(), req.SessionID, req.Window, req.Catalog, req.Download, req.Manifest())
 	if err != nil {
 		writeAnalysisError(w, err)
 		return
@@ -48,17 +48,25 @@ func (s *Server) handleWindowPreload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	selection, cached, cov, timings, err := s.window.Prefetch(r.Context(), req.SessionID, req.Window, req.Catalog)
+	selection, cached, commit, err := s.window.Prefetch(r.Context(), req.SessionID, req.Window, req.Catalog, req.Manifest())
 	if err != nil {
 		writeAnalysisError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, analysis.WindowPreloadResponse{
-		SessionID:  req.SessionID,
-		Selection:  selection,
-		CachedKeys: cached,
-		Coverage:   cov,
-		Timings:    timings,
+		SessionID:           req.SessionID,
+		Selection:           selection,
+		CachedKeys:          cached,
+		Coverage:            commit.ScopedCoverage,
+		Timings:             commit.Timings,
+		AttachedParts:       commit.AttachedParts,
+		PartRows:            commit.PartRows,
+		AttachedSpans:       commit.AttachedSpans,
+		ViewSpans:           commit.ViewSpans,
+		ExpectedParts:       commit.ExpectedParts,
+		ExpectedSpans:       commit.ExpectedSpans,
+		ViewMatchesManifest: commit.ViewMatchesManifest,
+		Verified:            commit.Verified,
 	})
 }
 
@@ -91,19 +99,17 @@ func (s *Server) handleWindowSegment(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWindowCommit(w http.ResponseWriter, r *http.Request) {
-	var req struct {
-		SessionID string `json:"session_id"`
-	}
+	var req analysis.WindowCommitRequest
 	if err := decodeJSONBody(w, r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	cov, timings, err := s.window.CommitWithTimings(r.Context(), req.SessionID)
+	commit, err := s.window.CommitWithManifest(r.Context(), req.SessionID, req.Manifest())
 	if err != nil {
 		writeAnalysisError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, analysis.WindowCommitResponse{ScopedCoverage: cov, Timings: timings})
+	writeJSON(w, http.StatusOK, commit)
 }
 
 func (s *Server) handleWindowQuery(w http.ResponseWriter, r *http.Request) {

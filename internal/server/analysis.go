@@ -138,15 +138,41 @@ func (s *Server) handleAnalysisSchema(w http.ResponseWriter, _ *http.Request) {
 func writeAnalysisError(w http.ResponseWriter, err error) {
 	var policyErr *analysis.PolicyError
 	var windowErr *analysis.WindowValidationError
+	var incomplete *analysis.IncompleteError
 	switch {
 	case errors.As(err, &policyErr):
+		status := http.StatusBadRequest
+		body := map[string]any{"error": policyErr.Message, "code": policyErr.Code}
+		if policyErr.Code == "window_not_committed" {
+			// A concurrent caller raced the session lifecycle: retryable 409 so
+			// the Worker can answer `202 preparing` instead of a hard 400
+			// (spec 036 requirement 3).
+			status = http.StatusConflict
+			body["retryable"] = true
+		}
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]string{"error": policyErr.Message, "code": policyErr.Code})
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(body)
+	case errors.As(err, &incomplete):
+		// Spec 036: an incomplete attachment set is never a partial result.
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusConflict)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":          incomplete.Message,
+			"code":           incomplete.Code(),
+			"retryable":      false,
+			"missing_parts":  incomplete.MissingParts,
+			"attached_parts": incomplete.AttachedParts,
+			"expected_parts": incomplete.ExpectedParts,
+			"attached_spans": incomplete.AttachedSpans,
+			"expected_spans": incomplete.ExpectedSpans,
+		})
 	case errors.As(err, &windowErr):
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.WriteHeader(http.StatusBadRequest)
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": windowErr.Message, "code": windowErr.Code})
+	case errors.Is(err, analysis.ErrWindowSessionNotFound):
+		writeError(w, http.StatusNotFound, errors.New("window session not found; open the session again"))
 	case errors.Is(err, analysis.ErrRestoreNotFound):
 		writeError(w, http.StatusNotFound, errors.New("frozen shot has not been restored"))
 	case errors.Is(err, analysis.ErrPartFetchUnavailable):

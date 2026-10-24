@@ -288,7 +288,7 @@ func TestWindowStoreDirectDownloadVerifiesChecksum(t *testing.T) {
 	if _, err := store.OpenWindow("s1", window, []SegmentMeta{part.meta}); err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	if _, _, _, _, err := store.Prefetch(ctx, "s1", window, []SegmentMeta{part.meta}); err == nil {
+	if _, _, _, err := store.Prefetch(ctx, "s1", window, []SegmentMeta{part.meta}, WindowManifest{}); err == nil {
 		t.Fatal("expected a checksum/size failure for corrupt part bytes")
 	}
 	if _, _, ok := store.cachedSegment(part.meta.Key, part.meta.Size, part.meta.SHA256); ok {
@@ -299,15 +299,15 @@ func TestWindowStoreDirectDownloadVerifiesChecksum(t *testing.T) {
 	good := &fakeFetcher{data: map[string][]byte{part.meta.Key: raw}}
 	store = NewWindowStore(filepath.Join(dir, "windows"), WindowStoreOptions{Fetcher: good})
 	defer store.Close()
-	_, keys, cov, timings, err := store.Prefetch(ctx, "s1", window, []SegmentMeta{part.meta})
+	_, keys, commit, err := store.Prefetch(ctx, "s1", window, []SegmentMeta{part.meta}, WindowManifest{})
 	if err != nil {
 		t.Fatalf("prefetch: %v", err)
 	}
 	if len(keys) != 1 || keys[0] != part.meta.Key {
 		t.Fatalf("cached keys = %v", keys)
 	}
-	if !cov.Complete || timings.AttachMS < 0 {
-		t.Fatalf("coverage/timings = %+v / %+v", cov, timings)
+	if !commit.Complete || commit.Timings.AttachMS < 0 {
+		t.Fatalf("coverage/timings = %+v / %+v", commit.ScopedCoverage, commit.Timings)
 	}
 	if _, _, ok := store.cachedSegment(part.meta.Key, part.meta.Size, part.meta.SHA256); !ok {
 		t.Fatal("verified part must be cached")

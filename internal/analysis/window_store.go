@@ -33,6 +33,12 @@ const DefaultFetchParallelism = 16
 // credential configured, so the caller must stream the part bytes instead.
 var ErrPartFetchUnavailable = errors.New("analysis: direct part download is not configured")
 
+// ErrWindowSessionNotFound means the window session was never opened, was
+// replaced by a different window/part set, or was discarded after an incomplete
+// commit. It is deliberately distinct from the frozen-shot restore error so a
+// window preload can never be reported as a missing frozen artifact (spec 036).
+var ErrWindowSessionNotFound = errors.New("analysis: window session not found")
+
 // ObjectFetcher streams one object into w and returns the bytes written. It is
 // satisfied by *r2s3.Client; tests use an in-memory fake.
 type ObjectFetcher interface {
@@ -136,6 +142,14 @@ type WindowSession struct {
 	ready     bool
 	sig       string
 	scopedSig string
+	// byKey resolves a selected key back to its declared size/checksum so
+	// commit can verify every selected part locally (spec 036).
+	byKey map[string]SegmentMeta
+	// manifest is the caller's latest declared part/span totals.
+	manifest WindowManifest
+	// commit is the last successful, verified commit result.
+	commit         *WindowCommit
+	commitManifest WindowManifest
 }
 
 // OpenWindow validates a window and starts a session. catalog is the full set of
@@ -155,6 +169,20 @@ func (s *WindowStore) OpenWindow(id string, window TimeWindow, catalog []Segment
 // parts reuses the attached session and returns every selected key, so no
 // re-ATTACH and no re-download happen.
 func (s *WindowStore) OpenWindowWithCache(ctx context.Context, id string, window TimeWindow, catalog []SegmentMeta, download bool) (SegmentSelection, []string, error) {
+	return s.OpenWindowWithManifest(ctx, id, window, catalog, download, WindowManifest{})
+}
+
+// OpenWindowWithManifest is OpenWindowWithCache plus the materialization
+// manifest (spec 036): commit later refuses the session unless every selected
+// part is attached and the attached span total equals manifest.Spans.
+//
+// download asks the store to fetch every selected part itself with the
+// bucket-scoped R2 credential. It is *synchronous*: when it returns successfully
+// every selected part is on local disk with a verified SHA-256, or the call
+// fails and the session is discarded. A repeated open of the same shot with the
+// same parts reuses the attached session and returns every selected key, so no
+// re-ATTACH and no re-download happen.
+func (s *WindowStore) OpenWindowWithManifest(ctx context.Context, id string, window TimeWindow, catalog []SegmentMeta, download bool, manifest WindowManifest) (SegmentSelection, []string, error) {
 	if !sessionIDPattern.MatchString(id) {
 		return SegmentSelection{}, nil, policyErr("invalid_session_id", "session id must match [A-Za-z0-9._-]{1,128}")
 	}
@@ -182,6 +210,7 @@ func (s *WindowStore) OpenWindowWithCache(ctx context.Context, id string, window
 		// whose verified bytes are present so the caller skips every download.
 		keys, complete := s.cachedKeysLocked(selection, byKey, prev)
 		if complete {
+			prev.manifest = mergeManifest(prev.manifest, manifest)
 			prevSelection := prev.Selection
 			s.mu.Unlock()
 			return prevSelection, keys, nil
@@ -191,7 +220,16 @@ func (s *WindowStore) OpenWindowWithCache(ctx context.Context, id string, window
 		_ = prev.scoped.Close()
 		_ = os.RemoveAll(prev.dir)
 	}
-	sess := &WindowSession{ID: id, Window: window, Catalog: catalog, Selection: selection, dir: dir, sig: sig}
+	sess := &WindowSession{
+		ID:        id,
+		Window:    window,
+		Catalog:   catalog,
+		Selection: selection,
+		dir:       dir,
+		sig:       sig,
+		byKey:     byKey,
+		manifest:  manifest,
+	}
 	s.sessions[id] = sess
 	s.mu.Unlock()
 
@@ -206,10 +244,24 @@ func (s *WindowStore) OpenWindowWithCache(ctx context.Context, id string, window
 	cur, ok := s.sessions[id]
 	if !ok || cur != sess {
 		s.mu.Unlock()
-		return SegmentSelection{}, nil, ErrRestoreNotFound
+		return SegmentSelection{}, nil, ErrWindowSessionNotFound
 	}
 	keys := s.attachCachedLocked(sess, selection, byKey)
 	s.mu.Unlock()
+
+	// Spec 036: a direct-download open is only successful when the whole
+	// selected set is attached with a verified digest. No caller may commit a
+	// partially downloaded session behind a 200.
+	if download {
+		if missing := missingSelectedKeys(selection, keys); len(missing) > 0 {
+			s.Release(id)
+			inc := incompleteError(fmt.Sprintf("analysis: direct download did not attach %d of %d selected parts", len(missing), len(selection.Selected)))
+			inc.MissingParts = missing
+			inc.ExpectedParts = len(selection.Selected)
+			inc.AttachedParts = len(selection.Selected) - len(missing)
+			return SegmentSelection{}, nil, inc
+		}
+	}
 	return selection, keys, nil
 }
 
@@ -304,13 +356,63 @@ func (s *WindowStore) cachedSegment(key string, size int64, sha string) (string,
 		return "", 0, false
 	}
 	norm := normalizeSHA(sha)
-	if norm != "" {
-		sidecar, err := os.ReadFile(path + ".sha256")
-		if err != nil || strings.TrimSpace(string(sidecar)) != norm {
-			return "", 0, false
-		}
+	sidecar, err := os.ReadFile(path + ".sha256")
+	if err != nil {
+		return "", 0, false
+	}
+	got := strings.TrimSpace(string(sidecar))
+	if !isSHA256Hex(got) {
+		return "", 0, false
+	}
+	if norm != "" && got != norm {
+		return "", 0, false
 	}
 	return path, info.Size(), true
+}
+
+// isSHA256Hex reports whether value is a lowercase 64-character hex digest.
+func isSHA256Hex(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// mergeManifest keeps the most specific declared totals: a non-zero value in
+// the newer manifest wins, so a commit can add the span total to an open that
+// only knew the part count.
+func mergeManifest(base, next WindowManifest) WindowManifest {
+	out := base
+	if next.Parts > 0 {
+		out.Parts = next.Parts
+	}
+	if next.Spans > 0 {
+		out.Spans = next.Spans
+	}
+	return out
+}
+
+func manifestsEqual(a, b WindowManifest) bool { return a.Parts == b.Parts && a.Spans == b.Spans }
+
+// missingSelectedKeys returns the selected keys absent from an attached-key set.
+func missingSelectedKeys(selection SegmentSelection, attached []string) []string {
+	have := make(map[string]struct{}, len(attached))
+	for _, key := range attached {
+		have[key] = struct{}{}
+	}
+	var missing []string
+	for _, sel := range selection.Selected {
+		if _, ok := have[sel.Key]; !ok {
+			missing = append(missing, sel.Key)
+		}
+	}
+	return missing
 }
 
 // AddSegment writes one verified segment object into the session.
@@ -319,7 +421,7 @@ func (s *WindowStore) AddSegment(ctx context.Context, id string, ref SegmentRef,
 	sess, ok := s.sessions[id]
 	s.mu.Unlock()
 	if !ok {
-		return ErrRestoreNotFound
+		return ErrWindowSessionNotFound
 	}
 	if err := validateSegmentPath(ref.Key); err != nil {
 		return err
@@ -370,7 +472,7 @@ func (s *WindowStore) appendCachedSegment(id string, sess *WindowSession, ref Se
 	defer s.mu.Unlock()
 	cur, ok := s.sessions[id]
 	if !ok || cur != sess {
-		return ErrRestoreNotFound
+		return ErrWindowSessionNotFound
 	}
 	for _, existing := range cur.segments {
 		if existing.Key == ref.Key {
@@ -504,18 +606,19 @@ func (s *WindowStore) downloadOne(ctx context.Context, meta SegmentMeta) error {
 	return nil
 }
 
-// Prefetch opens a session, downloads every selected part directly from R2 and
-// commits it, so a later `shot analyze` only runs queries (spec 035).
-func (s *WindowStore) Prefetch(ctx context.Context, id string, window TimeWindow, catalog []SegmentMeta) (SegmentSelection, []string, ScopedCoverage, ScopedTimings, error) {
-	selection, keys, err := s.OpenWindowWithCache(ctx, id, window, catalog, true)
+// Prefetch opens a session, downloads every selected part directly from R2,
+// verifies the full attached set and commits it, so a later `shot analyze` only
+// runs queries (spec 035/036).
+func (s *WindowStore) Prefetch(ctx context.Context, id string, window TimeWindow, catalog []SegmentMeta, manifest WindowManifest) (SegmentSelection, []string, *WindowCommit, error) {
+	selection, keys, err := s.OpenWindowWithManifest(ctx, id, window, catalog, true, manifest)
 	if err != nil {
-		return SegmentSelection{}, nil, ScopedCoverage{}, ScopedTimings{}, err
+		return SegmentSelection{}, nil, nil, err
 	}
-	cov, timings, err := s.CommitWithTimings(ctx, id)
+	commit, err := s.CommitWithManifest(ctx, id, manifest)
 	if err != nil {
-		return selection, keys, ScopedCoverage{}, ScopedTimings{}, err
+		return selection, keys, nil, err
 	}
-	return selection, keys, cov, timings, nil
+	return selection, keys, commit, nil
 }
 
 // Commit builds the scoped read-only snapshot for the session.
@@ -526,24 +629,76 @@ func (s *WindowStore) Commit(ctx context.Context, id string) (ScopedCoverage, er
 
 // CommitWithTimings also returns the attach/materialize/checkpoint phases.
 func (s *WindowStore) CommitWithTimings(ctx context.Context, id string) (ScopedCoverage, ScopedTimings, error) {
+	commit, err := s.CommitWithManifest(ctx, id, WindowManifest{})
+	if err != nil {
+		return ScopedCoverage{}, ScopedTimings{}, err
+	}
+	return commit.ScopedCoverage, commit.Timings, nil
+}
+
+// CommitWithManifest commits a window session with the spec-036 invariant:
+//
+//   - every *selected* part must be present locally with a verified SHA-256;
+//   - the commit result reports the attached part count and per-part row
+//     counts, plus `SELECT count(*) FROM spans` over the committed views;
+//   - when the manifest declares a part/span total, the attached set must match
+//     it exactly, otherwise the session is discarded and an
+//     *IncompleteError (`409 analysis_incomplete`) is returned. No rows are ever
+//     served from a partially attached session.
+func (s *WindowStore) CommitWithManifest(ctx context.Context, id string, manifest WindowManifest) (*WindowCommit, error) {
 	s.mu.Lock()
 	sess, ok := s.sessions[id]
 	if !ok {
 		s.mu.Unlock()
-		return ScopedCoverage{}, ScopedTimings{}, ErrRestoreNotFound
+		return nil, ErrWindowSessionNotFound
 	}
+	expected := mergeManifest(sess.manifest, manifest)
 	// Spec 035: a repeated commit of an unchanged session reuses the attached
-	// views instead of ATTACHing (let alone copying) every part again.
-	if sess.ready && sess.scopedSig == sess.sig && sess.scoped != nil {
-		cov, timings := sess.coverage, sess.timings
+	// views instead of ATTACHing every part again. A different manifest must be
+	// re-verified rather than reusing a stale answer.
+	if sess.ready && sess.scopedSig == sess.sig && sess.scoped != nil && sess.commit != nil && manifestsEqual(sess.commitManifest, expected) {
+		commit := *sess.commit
+		commit.Timings = sess.timings
+		commit.Timings.Reused = true
 		s.mu.Unlock()
-		timings.Reused = true
-		return cov, timings, nil
+		return &commit, nil
 	}
-	segments := append([]SegmentRef(nil), sess.segments...)
+	selection := sess.Selection
 	window := sess.Window
 	sig := sess.sig
+
+	// Spec 036: only selected parts that are present locally with a verified
+	// digest may enter the snapshot. Anything else refuses the commit.
+	segments := make([]SegmentRef, 0, len(selection.Selected))
+	var missing []string
+	for _, sel := range selection.Selected {
+		meta, ok := sess.byKey[sel.Key]
+		if !ok {
+			missing = append(missing, sel.Key)
+			continue
+		}
+		path, _, ok := s.cachedSegment(meta.Key, meta.Size, meta.SHA256)
+		if !ok {
+			missing = append(missing, meta.Key)
+			continue
+		}
+		segments = append(segments, SegmentRef{
+			Key:      meta.Key,
+			Instance: firstNonEmpty(meta.Instance, meta.InstanceID),
+			Path:     path,
+		})
+	}
 	s.mu.Unlock()
+
+	if len(missing) > 0 {
+		s.Release(id)
+		inc := incompleteError(fmt.Sprintf("analysis: %d of %d selected parts are not present locally with a verified sha256", len(missing), len(selection.Selected)))
+		inc.MissingParts = missing
+		inc.AttachedParts = len(segments)
+		inc.ExpectedParts = len(selection.Selected)
+		inc.ExpectedSpans = expected.Spans
+		return nil, inc
+	}
 
 	scoped, err := BuildScopedEngine(ctx, window, segments, ScopedOptions{
 		WorkDir:         sess.dir,
@@ -552,33 +707,57 @@ func (s *WindowStore) CommitWithTimings(ctx context.Context, id string) (ScopedC
 		Mode:            s.mode,
 	})
 	if err != nil {
-		return ScopedCoverage{}, ScopedTimings{}, err
+		return nil, err
 	}
-	provided := map[string]struct{}{}
-	for _, ref := range segments {
-		provided[ref.Key] = struct{}{}
-	}
-	var missing []string
-	for _, m := range sess.Selection.Missing {
-		missing = append(missing, m)
-	}
-	for _, sel := range sess.Selection.Selected {
-		if _, ok := provided[sel.Key]; !ok {
-			missing = append(missing, sel.Key)
-		}
-	}
+	missing = append(missing, selection.Missing...)
 	scoped.Coverage.MissingSegments = missing
-	scoped.Coverage.ExpectedSegments = sess.Selection.Expected
+	scoped.Coverage.ExpectedSegments = selection.Expected
 	scoped.Coverage.AvailableSegments = len(segments)
 	scoped.Coverage.Complete = len(missing) == 0
-	scoped.Coverage.SelectionJustification = sess.Selection.Justification
+	scoped.Coverage.SelectionJustification = selection.Justification
+
+	// Spec 036 self-check: the per-part counts prove what was attached; the
+	// view count proves the committed query surface sees the same rows.
+	attachedSpans := int64(0)
+	for _, part := range scoped.Parts {
+		attachedSpans += part.Spans
+	}
+	viewSpans, err := scoped.Engine.countScopedSpans(ctx)
+	if err != nil {
+		_ = scoped.Close()
+		s.Release(id)
+		return nil, fmt.Errorf("analysis: span-count self-check: %w", err)
+	}
+
+	commit := &WindowCommit{
+		ScopedCoverage: scoped.Coverage,
+		Timings:        scoped.Timings,
+		AttachedParts:  len(scoped.Parts),
+		PartRows:       scoped.Parts,
+		AttachedSpans:  attachedSpans,
+		ViewSpans:      viewSpans,
+		ExpectedParts:  expected.Parts,
+		ExpectedSpans:  expected.Spans,
+	}
+	commit.ViewMatchesManifest = expected.Spans <= 0 || viewSpans == expected.Spans
+	commit.Verified = commitVerified(commit, expected)
+	if !commit.Verified {
+		_ = scoped.Close()
+		s.Release(id)
+		inc := incompleteError(incompleteMessage(commit, expected))
+		inc.AttachedParts = commit.AttachedParts
+		inc.ExpectedParts = expected.Parts
+		inc.AttachedSpans = commit.AttachedSpans
+		inc.ExpectedSpans = expected.Spans
+		return nil, inc
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, ok := s.sessions[id]
 	if !ok || cur != sess {
 		_ = scoped.Close()
-		return ScopedCoverage{}, ScopedTimings{}, ErrRestoreNotFound
+		return nil, ErrWindowSessionNotFound
 	}
 	if cur.scoped != nil {
 		_ = cur.scoped.Close()
@@ -588,7 +767,30 @@ func (s *WindowStore) CommitWithTimings(ctx context.Context, id string) (ScopedC
 	cur.timings = scoped.Timings
 	cur.scopedSig = sig
 	cur.ready = true
-	return scoped.Coverage, scoped.Timings, nil
+	cur.manifest = expected
+	cur.commit = commit
+	cur.commitManifest = expected
+	return commit, nil
+}
+
+// commitVerified applies the manifest comparison. Without a declared manifest
+// the invariant is just "every selected part is attached", which the caller has
+// already enforced; the self-check counts are still reported.
+func commitVerified(commit *WindowCommit, expected WindowManifest) bool {
+	if commit.ExpectedParts > 0 && commit.AttachedParts != commit.ExpectedParts {
+		return false
+	}
+	if commit.ExpectedSpans > 0 && commit.AttachedSpans != commit.ExpectedSpans {
+		return false
+	}
+	return true
+}
+
+func incompleteMessage(commit *WindowCommit, expected WindowManifest) string {
+	return fmt.Sprintf(
+		"analysis incomplete: attached %d parts / %d spans, expected %d parts / %d spans",
+		commit.AttachedParts, commit.AttachedSpans, expected.Parts, expected.Spans,
+	)
 }
 
 // Scoped returns the committed engine for a session.
@@ -597,7 +799,7 @@ func (s *WindowStore) Scoped(id string) (*ScopedEngine, error) {
 	defer s.mu.Unlock()
 	sess, ok := s.sessions[id]
 	if !ok {
-		return nil, ErrRestoreNotFound
+		return nil, ErrWindowSessionNotFound
 	}
 	if sess.scoped == nil {
 		return nil, policyErr("window_not_committed", "window session has not been committed")

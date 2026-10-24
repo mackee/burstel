@@ -178,6 +178,10 @@ export class MaterializeDO extends DurableObject<MaterializeEnv> {
             name: window.name,
           },
           parts: record.materialization.parts,
+          // Spec 036: the manifest totals the ShotDO preload passes to the
+          // container commit, so a partially attached session is refused.
+          spans: record.materialization.spans,
+          parts_total: record.materialization.parts_total,
         }),
       }),
     );

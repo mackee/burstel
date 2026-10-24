@@ -312,6 +312,30 @@ analysis.window.commit        reused=true when the shot/parts did not change
   leaves one container slot for continuous compaction; preflight enforces
   `P <= max_instances - 1`.
 
+## Analysis session correctness (spec 036)
+
+* **Commit invariant.** `/internal/window/commit` refuses a session unless
+  every *selected* part is present locally with a verified SHA-256, and returns
+  `attached_parts`, per-part `part_rows`, `attached_spans` and `view_spans`
+  (`SELECT count(*) FROM spans` over the committed views). The Worker compares
+  the attached span total with `materialization.spans`; any mismatch fails the
+  analysis with `409 {"code":"analysis_incomplete"}`, never rows. Coverage is
+  persisted as `complete=false` and the session is discarded.
+* **Synchronous download.** `/internal/window/open` with `download: true`
+  blocks until every missing part is downloaded and verified; a partial open
+  fails and discards the session instead of committing behind a 200.
+* **Single-flight per shot session.** The ShotDO serializes open / download /
+  commit / analyze per session id. An analyze that races an in-flight preload
+  waits (bounded to 20 s) and then either runs on the committed session or
+  answers `202 {"state":"preparing","retry_after_ms":5000}` — never
+  `400 window_not_committed`.
+* **Preload path.** The ShotDO preload uses the window-session path only
+  (`/internal/window/preload`); it never restores a frozen artifact, so a
+  window shot without one preloads correctly.
+* **Self-check log.** After commit the Worker logs `analysis.session.verified`
+  with `verified`, `attached_parts`/`expected_parts`,
+  `attached_spans`/`expected_spans` and `view_spans`.
+
 ## Shared multi-user access (spec 013, Part B)
 
 A deployment can be shared by several people, each with their **own revocable

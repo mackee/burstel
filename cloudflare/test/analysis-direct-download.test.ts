@@ -61,7 +61,8 @@ class CaptureStub implements DoStubLike {
     }
     if (path === "/internal/window/commit") {
       return new Response(
-        JSON.stringify({ expected_segments: 1, available_segments: 1, missing_segments: [], complete: true }),
+        JSON.stringify({ expected_segments: 1, available_segments: 1, missing_segments: [], complete: true,
+          verified: true, attached_parts: 1, attached_spans: 10, expected_parts: 1, expected_spans: 10, view_spans: 10 }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
     }

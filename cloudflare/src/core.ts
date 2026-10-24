@@ -97,7 +97,20 @@ export interface AnalysisPreload {
     name?: string;
   };
   parts: PreloadPart[];
+  /**
+   * Spec 036: the materialization manifest totals. The preload passes them to
+   * the container so commit refuses a partially attached session, and the
+   * ShotDO logs `analysis.session.verified` with the self-check counts.
+   */
+  spans?: number;
+  parts_total?: number;
   at?: number;
+}
+
+/** Session operations serialized per shot (spec 036). */
+export interface WindowManifest {
+  parts: number;
+  spans: number;
 }
 
 export interface ShotCoreDeps {
@@ -137,6 +150,8 @@ export interface ShotCoreDeps {
   heartbeatIntervalMs?: number;
   /** After this long in `recording`, the heartbeat stops re-arming. */
   maxRecordingMs?: number;
+  /** Spec 036: bounded wait for an in-flight preload before `202 preparing`. */
+  preloadWaitMs?: number;
 }
 
 const DEFAULT_DRAIN_TIMEOUT_MS = 60_000;
@@ -147,6 +162,18 @@ export const ANALYSIS_KEEPALIVE_MS = 10 * 60 * 1000;
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 60_000;
 /** Matches the ingest token lifetime; a forgotten shot cannot pin a container. */
 export const DEFAULT_MAX_RECORDING_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Spec 036: how long a session operation (open/commit/analyze) waits for an
+ * in-flight preload of the same session before answering `202 preparing`.
+ * Bounded so the request stays well inside the Worker's 60 s limit.
+ */
+export const DEFAULT_PRELOAD_WAIT_MS = 20_000;
+
+/** A `202 preparing` body returned while the session preload is in flight. */
+export function isPreparingResult(value: unknown): boolean {
+  return typeof value === "object" && value !== null && (value as { state?: unknown }).state === "preparing";
+}
 
 export class ShotCore {
   readonly shotId: string;
@@ -177,6 +204,17 @@ export class ShotCore {
   private readonly analysisRestored = new Map<string, string>();
   /** Serialises lifecycle transitions (create/stop). */
   private transition: Promise<unknown> = Promise.resolve();
+  /**
+   * Spec 036: per-session single-flight. Open/download/commit/preload/analyze
+   * for the same shot session never interleave, so an analyze can never observe
+   * a half-downloaded session (which used to be committed as "complete").
+   */
+  private readonly sessionFlights = new Map<string, Promise<unknown>>();
+  /** Session ids whose durable preload is currently in flight. */
+  private readonly sessionPreloads = new Set<string>();
+  /** Single-flight boot of the analysis container. */
+  private analysisBoot?: Promise<void>;
+  private readonly preloadWaitMs: number;
 
   constructor(deps: ShotCoreDeps) {
     this.shotId = deps.shotId;
@@ -197,6 +235,7 @@ export class ShotCore {
     this.scheduler = deps.scheduler;
     this.heartbeatIntervalMs = deps.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS;
     this.maxRecordingMs = deps.maxRecordingMs ?? DEFAULT_MAX_RECORDING_MS;
+    this.preloadWaitMs = deps.preloadWaitMs ?? DEFAULT_PRELOAD_WAIT_MS;
   }
 
   /** Creates the schema and restores persisted state. */
@@ -632,22 +671,33 @@ export class ShotCore {
   /**
    * Boots (or reuses) the read-only analysis container for logical windows.
    * Unlike {@link ensureAnalysis} there is no frozen artifact to restore: the
-   * Worker streams verified segment bytes into a window session instead.
+   * Worker streams verified segment bytes into a window session instead, or the
+   * container downloads the materialization parts directly (spec 035).
+   *
+   * Spec 036: the boot itself is single-flight, so two concurrent opens cannot
+   * start (and race) two container bootstraps.
    */
   private async ensureAnalysisOnly(): Promise<void> {
     this.requireInternalAuth();
-    if (!this.container.running) {
-      const started = Date.now();
-      this.container.start(this.analysisEnvironment(), { internet: this.analysisEgress });
-      await this.container.ensureReady();
-      await this.container.keepAlive(ANALYSIS_KEEPALIVE_MS).catch(() => undefined);
-      this.analysisRestored.clear();
-      console.log("analysis.container.start", {
-        shot_id: this.shotId,
-        kind: "window",
-        duration_ms: Date.now() - started,
-      });
-    }
+    if (this.container.running) return;
+    this.analysisBoot ??= (async () => {
+      try {
+        if (this.container.running) return;
+        const started = Date.now();
+        this.container.start(this.analysisEnvironment(), { internet: this.analysisEgress });
+        await this.container.ensureReady();
+        await this.container.keepAlive(ANALYSIS_KEEPALIVE_MS).catch(() => undefined);
+        this.analysisRestored.clear();
+        console.log("analysis.container.start", {
+          shot_id: this.shotId,
+          kind: "window",
+          duration_ms: Date.now() - started,
+        });
+      } finally {
+        this.analysisBoot = undefined;
+      }
+    })();
+    await this.analysisBoot;
   }
 
   /**
@@ -660,16 +710,25 @@ export class ShotCore {
   }
 
   /**
-   * Spec 035: open the shot's window session, download every part directly from
-   * R2 and commit the zero-copy views. Runs from the ShotDO alarm after the
-   * MaterializeDO reports a complete run, so `shot analyze` only runs queries.
-   * A no-op when direct part download is not configured (the Worker then keeps
-   * streaming part bytes into the session).
+   * Spec 035/036: open the shot's window session, download every part directly
+   * from R2 and commit the zero-copy views. Runs from the ShotDO alarm after
+   * the MaterializeDO reports a complete run, so `shot analyze` only runs
+   * queries.
+   *
+   * The preload uses the window-session path exclusively: it never consults the
+   * shot's frozen artifact or the legacy `/internal/restore` endpoint, so a
+   * window shot without any frozen artifact preloads correctly. The whole
+   * open+download+commit sequence is one per-session flight, so a concurrent
+   * analyze waits for it instead of observing a partial session.
    */
   async preloadAnalysis(preload: AnalysisPreload): Promise<void> {
     await this.ensureLoaded();
     if (!this.analysisEgress) return;
-    await this.ensureAnalysisOnly();
+    const sessionId = `w-${this.shotId}`;
+    const manifest: WindowManifest = {
+      parts: preload.parts.length,
+      spans: typeof preload.spans === "number" && Number.isFinite(preload.spans) ? preload.spans : 0,
+    };
     const startMs = Date.parse(preload.window.start);
     const endMs = Date.parse(preload.window.end);
     const catalog = preload.parts.map((part) => ({
@@ -684,20 +743,93 @@ export class ShotCore {
       event_min_ns: null,
       event_max_ns: null,
     }));
-    const started = Date.now();
-    const out = await this.analysisJson("/internal/window/preload", {
-      session_id: `w-${this.shotId}`,
-      window: preload.window,
-      catalog,
-      download: true,
+    this.sessionPreloads.add(sessionId);
+    try {
+      await this.sessionFlight(sessionId, async () => {
+        await this.ensureAnalysisOnly();
+        const started = Date.now();
+        const out = await this.analysisJson("/internal/window/preload", {
+          session_id: sessionId,
+          window: preload.window,
+          catalog,
+          download: true,
+          expected_parts: manifest.parts,
+          expected_spans: manifest.spans,
+        });
+        console.log("analysis.session.preload", {
+          shot_id: this.shotId,
+          parts: catalog.length,
+          duration_ms: Date.now() - started,
+          cached_parts: Array.isArray(out.cached_keys) ? out.cached_keys.length : undefined,
+          timings: out.timings ?? undefined,
+        });
+        // Spec 036 requirement 5: the commit self-check is logged with counts.
+        console.log("analysis.session.verified", {
+          shot_id: this.shotId,
+          session_id: sessionId,
+          verified: out.verified === true,
+          attached_parts: out.attached_parts,
+          expected_parts: out.expected_parts ?? manifest.parts,
+          attached_spans: out.attached_spans,
+          expected_spans: out.expected_spans ?? manifest.spans,
+          view_spans: out.view_spans,
+          view_matches_manifest: out.view_matches_manifest === true,
+        });
+      });
+    } finally {
+      this.sessionPreloads.delete(sessionId);
+    }
+  }
+
+  /**
+   * Serializes one session operation behind any earlier operation for the same
+   * session id (spec 036). The returned promise settles with `fn`'s outcome;
+   * the chain itself never rejects, so one failure cannot poison the session.
+   */
+  private sessionFlight<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
+    const previous = this.sessionFlights.get(sessionId) ?? Promise.resolve();
+    const run = previous.then(fn, fn);
+    const tail = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.sessionFlights.set(sessionId, tail);
+    void tail.then(() => {
+      if (this.sessionFlights.get(sessionId) === tail) this.sessionFlights.delete(sessionId);
     });
-    console.log("analysis.session.preload", {
+    return run;
+  }
+
+  /**
+   * Waits (bounded) for an in-flight preload of this session. Returns false
+   * when the caller should answer `202 preparing` instead of racing the
+   * download (spec 036 requirement 3).
+   */
+  private async waitForPreload(sessionId: string): Promise<boolean> {
+    const flight = this.sessionFlights.get(sessionId);
+    if (!flight || !this.sessionPreloads.has(sessionId)) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), this.preloadWaitMs);
+      // `unref` keeps a test process from hanging on the timer.
+      const maybe = timer as unknown as { unref?: () => void };
+      maybe.unref?.();
+    });
+    try {
+      return await Promise.race([flight.then(() => true), timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  private preparingBody(sessionId: string): Record<string, unknown> {
+    return {
       shot_id: this.shotId,
-      parts: catalog.length,
-      duration_ms: Date.now() - started,
-      cached_parts: Array.isArray(out.cached_keys) ? out.cached_keys.length : undefined,
-      timings: out.timings ?? undefined,
-    });
+      session_id: sessionId,
+      state: "preparing",
+      retry_after_ms: 5_000,
+      message: "the analysis session preload is still in flight; retry in about 5 s",
+    };
   }
 
   /** Opens a logical-window session and returns the justified segment selection. */
@@ -705,10 +837,22 @@ export class ShotCore {
     sessionId: string,
     window: Record<string, unknown>,
     catalog: Array<Record<string, unknown>>,
+    download = false,
+    manifest: WindowManifest = { parts: 0, spans: 0 },
   ): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
     await this.ensureAnalysisOnly();
-    return this.analysisJson("/internal/window/open", { session_id: sessionId, window, catalog });
+    if (!(await this.waitForPreload(sessionId))) return this.preparingBody(sessionId);
+    return this.sessionFlight(sessionId, () =>
+      this.analysisJson("/internal/window/open", {
+        session_id: sessionId,
+        window,
+        catalog,
+        download,
+        expected_parts: manifest.parts,
+        expected_spans: manifest.spans,
+      }),
+    );
   }
 
   /** Streams one verified segment object into a window session. */
@@ -719,36 +863,55 @@ export class ShotCore {
   ): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
     await this.ensureAnalysisOnly();
-    const resp = await this.container.request("/internal/window/segment", {
-      method: "POST",
-      headers: this.internalHeaders({
-        "content-type": "application/octet-stream",
-        "x-burstel-session-id": sessionId,
-        "x-burstel-segment-key": ref.key,
-        "x-burstel-segment-instance": ref.instance,
-        "x-burstel-size": String(ref.size),
-        "x-burstel-sha256": ref.sha256,
-      }),
-      body,
-      duplex: "half",
-    } as RequestInit);
-    return this.parseAnalysisJson(resp, "/internal/window/segment");
+    return this.sessionFlight(sessionId, async () => {
+      const resp = await this.container.request("/internal/window/segment", {
+        method: "POST",
+        headers: this.internalHeaders({
+          "content-type": "application/octet-stream",
+          "x-burstel-session-id": sessionId,
+          "x-burstel-segment-key": ref.key,
+          "x-burstel-segment-instance": ref.instance,
+          "x-burstel-size": String(ref.size),
+          "x-burstel-sha256": ref.sha256,
+        }),
+        body,
+        duplex: "half",
+      } as RequestInit);
+      return this.parseAnalysisJson(resp, "/internal/window/segment");
+    });
   }
 
-  /** Commits a window session and returns its coverage diagnostics. */
-  async windowCommit(sessionId: string): Promise<Record<string, unknown>> {
+  /**
+   * Commits a window session and returns its coverage diagnostics plus the
+   * spec-036 attachment/self-check counts. Refuses (never returns rows for) a
+   * session whose attached parts do not match the manifest.
+   */
+  async windowCommit(
+    sessionId: string,
+    manifest: WindowManifest = { parts: 0, spans: 0 },
+  ): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
-    return this.analysisJson("/internal/window/commit", { session_id: sessionId });
+    if (!(await this.waitForPreload(sessionId))) return this.preparingBody(sessionId);
+    return this.sessionFlight(sessionId, () =>
+      this.analysisJson("/internal/window/commit", {
+        session_id: sessionId,
+        expected_parts: manifest.parts,
+        expected_spans: manifest.spans,
+      }),
+    );
   }
 
   /** Runs a bounded, shot-scoped query against a committed window session. */
   async windowQuery(sessionId: string, sql: string, maxRows?: number): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
-    return this.analysisJson("/internal/window/query", {
-      session_id: sessionId,
-      sql,
-      max_rows: maxRows ?? this.analysisMaxRows,
-    });
+    if (!(await this.waitForPreload(sessionId))) return this.preparingBody(sessionId);
+    return this.sessionFlight(sessionId, () =>
+      this.analysisJson("/internal/window/query", {
+        session_id: sessionId,
+        sql,
+        max_rows: maxRows ?? this.analysisMaxRows,
+      }),
+    );
   }
 
   /** Runs the analysis sections against a committed window session. */
@@ -758,28 +921,44 @@ export class ShotCore {
     req: { sections?: string[]; topN?: number } = {},
   ): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
-    return this.analysisJson("/internal/window/analyze", {
-      session_id: sessionId,
-      shot_id: shotId,
-      sections: req.sections,
-      top_n: req.topN ?? this.analysisTopN,
-    });
+    if (!(await this.waitForPreload(sessionId))) return this.preparingBody(sessionId);
+    return this.sessionFlight(sessionId, () =>
+      this.analysisJson("/internal/window/analyze", {
+        session_id: sessionId,
+        shot_id: shotId,
+        sections: req.sections,
+        top_n: req.topN ?? this.analysisTopN,
+      }),
+    );
   }
 
   /** Compares two committed window sessions hosted by this container. */
   async windowCompare(leftSessionId: string, rightSessionId: string, topN?: number): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
-    return this.analysisJson("/internal/window/compare", {
-      left_session_id: leftSessionId,
-      right_session_id: rightSessionId,
-      top_n: topN ?? this.analysisTopN,
-    });
+    if (!(await this.waitForPreload(leftSessionId)) || !(await this.waitForPreload(rightSessionId))) {
+      return this.preparingBody(leftSessionId);
+    }
+    const run = () =>
+      this.analysisJson("/internal/window/compare", {
+        left_session_id: leftSessionId,
+        right_session_id: rightSessionId,
+        top_n: topN ?? this.analysisTopN,
+      });
+    // Both sessions live in one Go store; wait out any in-flight work on the
+    // right session before taking the left session's flight.
+    if (rightSessionId !== leftSessionId) {
+      const right = this.sessionFlights.get(rightSessionId);
+      if (right) await right.catch(() => undefined);
+    }
+    return this.sessionFlight(leftSessionId, run);
   }
 
   /** Releases a window session. */
   async windowRelease(sessionId: string): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
-    return this.analysisJson("/internal/window/release", { session_id: sessionId });
+    return this.sessionFlight(sessionId, () =>
+      this.analysisJson("/internal/window/release", { session_id: sessionId }),
+    );
   }
 
   /** Returns the documented queryable schema for window analysis. */
@@ -857,15 +1036,17 @@ export class ShotCore {
     if (resp.status < 200 || resp.status >= 300) {
       let message = `analysis ${path} failed with status ${resp.status}`;
       let code = "analysis_error";
+      let retryable = resp.status >= 500;
       try {
-        const parsed = JSON.parse(text) as { error?: string; code?: string };
+        const parsed = JSON.parse(text) as { error?: string; code?: string; retryable?: boolean };
         if (parsed.error) message = parsed.error;
         if (parsed.code) code = parsed.code;
+        if (parsed.retryable === true) retryable = true;
       } catch {
         // keep defaults
       }
-      const status = resp.status === 400 || resp.status === 404 ? resp.status : 503;
-      throw new HttpError(status, message, resp.status >= 500, code);
+      const status = resp.status === 400 || resp.status === 404 || resp.status === 409 ? resp.status : 503;
+      throw new HttpError(status, message, retryable, code);
     }
     try {
       return JSON.parse(text) as Record<string, unknown>;
@@ -938,11 +1119,18 @@ export class ShotCore {
           session_id?: string;
           window?: Record<string, unknown>;
           catalog?: Array<Record<string, unknown>>;
+          download?: boolean;
+          expected_parts?: number;
+          expected_spans?: number;
         }>(request);
         if (!body.session_id || !body.window) {
           return json(400, { error: "session_id and window are required", code: "bad_request" });
         }
-        return json(200, await this.windowOpen(body.session_id, body.window, body.catalog ?? []));
+        const out = await this.windowOpen(body.session_id, body.window, body.catalog ?? [], body.download === true, {
+          parts: manifestInt(body.expected_parts),
+          spans: manifestInt(body.expected_spans),
+        });
+        return json(isPreparingResult(out) ? 202 : 200, out);
       }
       if (path === "/internal/window/segment") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
@@ -966,9 +1154,13 @@ export class ShotCore {
       }
       if (path === "/internal/window/commit") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
-        const body = await readJson<{ session_id?: string }>(request);
+        const body = await readJson<{ session_id?: string; expected_parts?: number; expected_spans?: number }>(request);
         if (!body.session_id) return json(400, { error: "session_id is required", code: "bad_request" });
-        return json(200, await this.windowCommit(body.session_id));
+        const out = await this.windowCommit(body.session_id, {
+          parts: manifestInt(body.expected_parts),
+          spans: manifestInt(body.expected_spans),
+        });
+        return json(isPreparingResult(out) ? 202 : 200, out);
       }
       if (path === "/internal/window/query") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
@@ -976,19 +1168,18 @@ export class ShotCore {
         if (!body.session_id || typeof body.sql !== "string" || body.sql.trim() === "") {
           return json(400, { error: "session_id and sql are required", code: "bad_request" });
         }
-        return json(200, await this.windowQuery(body.session_id, body.sql, body.max_rows));
+        const out = await this.windowQuery(body.session_id, body.sql, body.max_rows);
+        return json(isPreparingResult(out) ? 202 : 200, out);
       }
       if (path === "/internal/window/analyze") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
         const body = await readJson<{ session_id?: string; shot_id?: string; sections?: string[]; top_n?: number }>(request);
         if (!body.session_id) return json(400, { error: "session_id is required", code: "bad_request" });
-        return json(
-          200,
-          await this.windowAnalyze(body.session_id, body.shot_id ?? body.session_id, {
-            sections: body.sections,
-            topN: body.top_n,
-          }),
-        );
+        const out = await this.windowAnalyze(body.session_id, body.shot_id ?? body.session_id, {
+          sections: body.sections,
+          topN: body.top_n,
+        });
+        return json(isPreparingResult(out) ? 202 : 200, out);
       }
       if (path === "/internal/window/compare") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
@@ -1137,8 +1328,13 @@ export class ShotCore {
   }
 }
 
-function parseJSON(value: string): Record<string, unknown> {
-  try {
+/** Non-negative integer from an untrusted request field; 0 means "not given". */
+function manifestInt(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return 0;
+  return Math.trunc(value);
+}
+
+function parseJSON(value: string): Record<string, unknown> {  try {
     const parsed = JSON.parse(value);
     return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
   } catch {

@@ -93,6 +93,64 @@ describe("REST logical windows", () => {
   });
 
 
+  test("analyze returns 202 preparing while a session preload is in flight", async () => {
+    const ingest = makeIngest({ now: () => 1_700_000_100_000 });
+    const env = makeEnv(ingest);
+    await handleRequest(post("/api/instances", { name: "web-1" }), env);
+    const started = await handleRequest(post("/api/shots", { mode: "window", instances: ["web-1"] }), env);
+    const shotId = String(((await started.json()) as Record<string, unknown>)["shot_id"]);
+    await handleRequest(post(`/api/shots/${shotId}/stop`, {}), env);
+    await ingest.core.setMaterialization(shotId, {
+      state: "complete",
+      parts_done: 1,
+      parts_total: 1,
+      spans: 10,
+      started_at: 1_700_000_000_000,
+      finished_at: 1_700_000_070_000,
+      parts: [
+        {
+          index: 0,
+          object_key: `${shotId}/part-0.duckdb`,
+          size_bytes: 1,
+          sha256: "c".repeat(64),
+          object_count: 1,
+          request_count: 1,
+          record_count: 10,
+          span_count: 10,
+          log_count: 0,
+          metric_count: 0,
+          first_received_at: 1_700_000_000_000,
+          last_received_at: 1_700_000_060_000,
+        },
+      ],
+    });
+
+    // The ShotDO answers 202 while the durable preload still owns the session.
+    const slowNamespace: ShotNamespaceLike = {
+      getByName: () => ({
+        fetch: async (request: Request) => {
+          const path = new URL(request.url).pathname;
+          if (path === "/internal/window/open") {
+            return new Response(
+              JSON.stringify({ shot_id: shotId, state: "preparing", retry_after_ms: 5000, message: "preload in flight" }),
+              { status: 202, headers: { "content-type": "application/json" } },
+            );
+          }
+          return new Response(JSON.stringify({ released: true }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        },
+      }),
+    };
+    const env2 = { ...env, SHOT_DO: slowNamespace, BUCKET: {} as never } as AppEnv;
+    const resp = await handleRequest(post(`/api/shots/${shotId}/analyze`, {}), env2);
+    expect(resp.status).toBe(202);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body["state"]).toBe("preparing");
+    expect(body["retry_after_ms"]).toBe(5000);
+  });
+
   test("POST /api/shots/window creates a backdated external window", async () => {
     const env = makeEnv();
     await handleRequest(post("/api/instances", { name: "web-1" }), env);

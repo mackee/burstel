@@ -315,6 +315,8 @@ export class FakeContainer implements ContainerControl {
       const keys = Array.isArray(body.catalog)
         ? (body.catalog as Array<{ key?: string }>).map((entry) => String(entry.key ?? ""))
         : [];
+      const expectedParts = Number(body.expected_parts ?? keys.length);
+      const expectedSpans = Number(body.expected_spans ?? 0);
       return new Response(
         JSON.stringify({
           session_id: body.session_id,
@@ -322,6 +324,13 @@ export class FakeContainer implements ContainerControl {
           cached_keys: keys,
           coverage: { complete: true, expected_segments: keys.length, available_segments: keys.length },
           timings: { attach_ms: 0, materialize_ms: 0, total_ms: 0 },
+          attached_parts: expectedParts,
+          part_rows: keys.map((key) => ({ key, spans: 0, log_records: 0, metric_points: 0, batches: 0 })),
+          attached_spans: expectedSpans,
+          view_spans: expectedSpans,
+          expected_parts: expectedParts,
+          expected_spans: expectedSpans,
+          verified: true,
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
@@ -347,6 +356,10 @@ export class FakeContainer implements ContainerControl {
           missing_segments: [],
           instances: [],
           complete: true,
+          verified: true,
+          attached_parts: this.windowSegments.length,
+          attached_spans: 0,
+          view_spans: 0,
         }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
@@ -853,6 +866,8 @@ export function makeCore(
     /** Spec 035: analysis container R2 env and egress. */
     analysisEnv?: Record<string, string>;
     analysisEgress?: boolean;
+    /** Spec 036: bounded wait for an in-flight preload. */
+    preloadWaitMs?: number;
   } = {},
 ): TestHarness {
   const sql = options.sql ?? new BunSql();
@@ -878,6 +893,7 @@ export function makeCore(
     scheduler,
     heartbeatIntervalMs: 60_000,
     maxRecordingMs: options.maxRecordingMs,
+    preloadWaitMs: options.preloadWaitMs,
   };
   const core = new ShotCore(deps);
   return { core, sql, container, artifacts, scheduler };

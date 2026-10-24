@@ -104,7 +104,10 @@ type ScopedEngine struct {
 	Window   TimeWindow
 	Coverage ScopedCoverage
 	Timings  ScopedTimings
-	dir      string
+	// Parts is the verified per-part row count of every attached part
+	// (spec 036). It is empty when the build could not inspect a part catalog.
+	Parts []PartRowCounts
+	dir   string
 }
 
 // Close releases the engine and removes the ephemeral scratch database.
@@ -191,7 +194,8 @@ func buildScopedCopy(ctx context.Context, window TimeWindow, refs []SegmentRef, 
 		_ = os.RemoveAll(dir)
 	}
 
-	if err := materialize(ctx, db, window, refs, horizon, policy, &timings); err != nil {
+	parts, err := materialize(ctx, db, window, refs, horizon, policy, &timings)
+	if err != nil {
 		cleanup()
 		return nil, err
 	}
@@ -226,12 +230,12 @@ func buildScopedCopy(ctx context.Context, window TimeWindow, refs []SegmentRef, 
 	}
 	timings.CoverageMS = time.Since(coverageStart).Milliseconds()
 	timings.TotalMS = time.Since(startedAt).Milliseconds()
-	return &ScopedEngine{Engine: engine, Window: window, Coverage: cov, Timings: timings, dir: dir}, nil
+	return &ScopedEngine{Engine: engine, Window: window, Coverage: cov, Timings: timings, Parts: parts, dir: dir}, nil
 }
 
-func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []SegmentRef, horizon time.Duration, policy SpanBoundaryPolicy, timings *ScopedTimings) error {
+func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []SegmentRef, horizon time.Duration, policy SpanBoundaryPolicy, timings *ScopedTimings) ([]PartRowCounts, error) {
 	if _, err := db.ExecContext(ctx, scopedSchemaDDL); err != nil {
-		return fmt.Errorf("analysis: window schema: %w", err)
+		return nil, fmt.Errorf("analysis: window schema: %w", err)
 	}
 	startNS, endNS := window.StartNS(), window.EndNS()
 	baseFromNS := startNS - horizon.Nanoseconds()
@@ -240,20 +244,24 @@ func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []Segm
 	available := make([]map[string]bool, len(refs))
 	for i, ref := range refs {
 		if err := validateSegmentPath(ref.Path); err != nil {
-			return err
+			return nil, err
 		}
 		alias := fmt.Sprintf("seg%d", i)
 		if _, err := db.ExecContext(ctx, "ATTACH "+quoteLiteral(ref.Path)+" AS "+alias+" (READ_ONLY)"); err != nil {
-			return fmt.Errorf("analysis: attach segment %s: %w", ref.Key, err)
+			return nil, fmt.Errorf("analysis: attach segment %s: %w", ref.Key, err)
 		}
 		tables, err := attachedTableSet(ctx, db, alias)
 		if err != nil {
-			return fmt.Errorf("analysis: inspect segment %s: %w", ref.Key, err)
+			return nil, fmt.Errorf("analysis: inspect segment %s: %w", ref.Key, err)
 		}
 		available[i] = tables
 	}
 	if timings != nil {
 		timings.AttachMS = time.Since(attachStart).Milliseconds()
+	}
+	parts, err := countParts(ctx, db, refs, available)
+	if err != nil {
+		return nil, err
 	}
 	materializeStart := time.Now()
 	defer func() {
@@ -286,7 +294,7 @@ func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []Segm
 		}
 		b.WriteString(")")
 		if _, err := db.ExecContext(ctx, b.String()); err != nil {
-			return fmt.Errorf("analysis: materialize %s: %w", ts.table, err)
+			return nil, fmt.Errorf("analysis: materialize %s: %w", ts.table, err)
 		}
 	}
 
@@ -310,7 +318,7 @@ func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []Segm
 	}
 	bb.WriteString(")")
 	if _, err := db.ExecContext(ctx, bb.String()); err != nil {
-		return fmt.Errorf("analysis: materialize baseline: %w", err)
+		return nil, fmt.Errorf("analysis: materialize baseline: %w", err)
 	}
 
 	if _, err := db.ExecContext(ctx, `INSERT INTO schema_meta (key, value) VALUES
@@ -321,9 +329,9 @@ func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []Segm
 		ON CONFLICT (key) DO UPDATE SET value = excluded.value`,
 		fmt.Sprint(startNS), fmt.Sprint(endNS), string(window.Provenance),
 	); err != nil {
-		return fmt.Errorf("analysis: window meta: %w", err)
+		return nil, fmt.Errorf("analysis: window meta: %w", err)
 	}
-	return nil
+	return parts, nil
 }
 
 func spanWindowWhere(alias string, startNS, endNS int64, _ SpanBoundaryPolicy) string {
@@ -430,6 +438,48 @@ func computeScopedCoverage(ctx context.Context, e *Engine, window TimeWindow, re
 	}
 	_ = policy
 	return cov, nil
+}
+
+// countParts returns the verified row counts of every attached part (spec 036).
+// Parts are the physical projection-only tables, so these counts are independent
+// of the window predicate and can be compared with the materialization manifest.
+func countParts(ctx context.Context, db *sql.DB, refs []SegmentRef, available []map[string]bool) ([]PartRowCounts, error) {
+	parts := make([]PartRowCounts, 0, len(refs))
+	for i, ref := range refs {
+		alias := fmt.Sprintf("seg%d", i)
+		counts := PartRowCounts{Key: ref.Key}
+		var err error
+		if counts.Spans, err = countAttachedTable(ctx, db, alias, available[i], "spans"); err != nil {
+			return nil, err
+		}
+		if counts.LogRecords, err = countAttachedTable(ctx, db, alias, available[i], "log_records"); err != nil {
+			return nil, err
+		}
+		if counts.MetricPoints, err = countAttachedTable(ctx, db, alias, available[i], "metric_points"); err != nil {
+			return nil, err
+		}
+		if counts.Batches, err = countAttachedTable(ctx, db, alias, available[i], "otlp_batches"); err != nil {
+			return nil, err
+		}
+		if counts.Batches == 0 && available[i]["part_meta"] {
+			if counts.Batches, err = countAttachedTable(ctx, db, alias, available[i], "part_meta"); err != nil {
+				return nil, err
+			}
+		}
+		parts = append(parts, counts)
+	}
+	return parts, nil
+}
+
+func countAttachedTable(ctx context.Context, db *sql.DB, alias string, tables map[string]bool, table string) (int64, error) {
+	if !tables[table] {
+		return 0, nil
+	}
+	var n int64
+	if err := db.QueryRowContext(ctx, "SELECT count(*) FROM "+alias+".main."+table).Scan(&n); err != nil {
+		return 0, fmt.Errorf("analysis: count %s.main.%s: %w", alias, table, err)
+	}
+	return n, nil
 }
 
 func validateSegmentPath(path string) error {

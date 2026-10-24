@@ -132,6 +132,9 @@ export class ShotDO extends DurableObject<Env> {
       const preload: AnalysisPreload = {
         window: body.window,
         parts: body.parts,
+        // Spec 036: carry the manifest totals to the container commit.
+        spans: body.spans,
+        parts_total: body.parts_total,
         at: Date.now(),
       };
       await this.ctx.storage.put("analysis_preload", preload);

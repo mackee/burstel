@@ -296,6 +296,165 @@ func TestWindowPreloadDownloadsPartsDirectly(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestWindowSessionCommitRefusedWithMissingPart(t *testing.T) {
+	h := newHarness(t)
+	start := time.Now().UTC().Add(-3 * time.Minute).Truncate(time.Second)
+	window := analysis.NewServerWindow(start, start.Add(time.Minute), []string{"web-1"}, "refused")
+
+	presentKey := "journal/inst-web/traces/present.bin"
+	absKey := "journal/inst-web/traces/absent.bin"
+	presentMeta, presentRaw := buildWindowSegment(t, h.dir, presentKey, "inst-web", "web-1", start, []otlp.Span{
+		{Name: "GET /", ServiceName: "web-1", StartTimeUnixNano: uint64(window.StartNS() + 1), EndTimeUnixNano: uint64(window.StartNS() + 2)},
+	})
+	absentMeta, _ := buildWindowSegment(t, h.dir, absKey, "inst-web", "web-1", start, []otlp.Span{
+		{Name: "SELECT", ServiceName: "web-1", StartTimeUnixNano: uint64(window.StartNS() + 3), EndTimeUnixNano: uint64(window.StartNS() + 4)},
+	})
+
+	resp := h.postJSON("/internal/window/open", testToken, analysis.WindowOpenRequest{
+		SessionID:     "sess-refused",
+		Window:        window,
+		Catalog:       []analysis.SegmentMeta{presentMeta, absentMeta},
+		ExpectedParts: 2,
+		ExpectedSpans: 2,
+	})
+	resp.Body.Close()
+
+	resp = postRaw(t, h, "/internal/window/segment", map[string]string{
+		"X-Burstel-Session-Id":       "sess-refused",
+		"X-Burstel-Segment-Key":      presentKey,
+		"X-Burstel-Segment-Instance": "web-1",
+		"X-Burstel-Size":             strconv.FormatInt(int64(len(presentRaw)), 10),
+		"X-Burstel-Sha256":           presentMeta.SHA256,
+	}, presentRaw)
+	resp.Body.Close()
+
+	resp = h.postJSON("/internal/window/commit", testToken, analysis.WindowCommitRequest{
+		SessionID:     "sess-refused",
+		ExpectedParts: 2,
+		ExpectedSpans: 2,
+	})
+	if resp.StatusCode != http.StatusConflict {
+		buf := new(bytes.Buffer)
+		_, _ = buf.ReadFrom(resp.Body)
+		t.Fatalf("commit status %d, want 409: %s", resp.StatusCode, buf.String())
+	}
+	var body struct {
+		Code          string   `json:"code"`
+		Error         string   `json:"error"`
+		MissingParts  []string `json:"missing_parts"`
+		AttachedParts int      `json:"attached_parts"`
+		ExpectedParts int      `json:"expected_parts"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if body.Code != "analysis_incomplete" {
+		t.Fatalf("code = %q", body.Code)
+	}
+	if len(body.MissingParts) != 1 || body.MissingParts[0] != absKey {
+		t.Fatalf("missing_parts = %v", body.MissingParts)
+	}
+	if body.AttachedParts != 1 || body.ExpectedParts != 2 {
+		t.Fatalf("attached/expected = %d/%d", body.AttachedParts, body.ExpectedParts)
+	}
+
+	// The session is discarded: a query never returns partial rows.
+	resp = h.postJSON("/internal/window/query", testToken, map[string]any{"session_id": "sess-refused", "sql": "SELECT count(*) FROM spans"})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("query after refused commit = %d, want 404", resp.StatusCode)
+	}
+	buf := new(bytes.Buffer)
+	_, _ = buf.ReadFrom(resp.Body)
+	resp.Body.Close()
+	if !strings.Contains(buf.String(), "window session not found") {
+		t.Fatalf("query error should be a window-session error, got %s", buf.String())
+	}
+	if strings.Contains(buf.String(), "frozen shot") {
+		t.Fatalf("window path must never report a frozen-shot error: %s", buf.String())
+	}
+}
+
+// Spec 036: commit compares the attached span total with the materialization
+// manifest and refuses on mismatch.
+func TestWindowSessionSelfCheckMismatch(t *testing.T) {
+	start := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
+	window := analysis.NewServerWindow(start, start.Add(2*time.Minute), []string{"web-1"}, "selfcheck")
+	key := "journal/inst-web/traces/selfcheck.bin"
+	tmp := newHarness(t)
+	meta, raw := buildWindowSegment(t, tmp.dir, key, "inst-web", "web-1", start.Add(time.Minute), []otlp.Span{
+		{Name: "GET /", ServiceName: "web-1", StartTimeUnixNano: uint64(window.StartNS() + 10), EndTimeUnixNano: uint64(window.StartNS() + 20)},
+	})
+
+	objects := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, key) {
+			_, _ = w.Write(raw)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer objects.Close()
+
+	h := newHarnessWith(t, config.Config{
+		DataDir:                  t.TempDir(),
+		R2AccessKeyID:            "test-key",
+		R2SecretAccessKey:        "test-secret",
+		R2Bucket:                 "burstel-test",
+		R2Endpoint:               objects.URL,
+		AnalysisFetchParallelism: 2,
+	})
+
+	// The manifest claims two spans; the part carries one.
+	resp := h.postJSON("/internal/window/preload", testToken, analysis.WindowOpenRequest{
+		SessionID:     "selfcheck-1",
+		Window:        window,
+		Catalog:       []analysis.SegmentMeta{meta},
+		Download:      true,
+		ExpectedParts: 1,
+		ExpectedSpans: 2,
+	})
+	if resp.StatusCode != http.StatusConflict {
+		buf := new(bytes.Buffer)
+		_, _ = buf.ReadFrom(resp.Body)
+		t.Fatalf("preload status %d, want 409: %s", resp.StatusCode, buf.String())
+	}
+	resp.Body.Close()
+	resp = h.postJSON("/internal/window/query", testToken, map[string]any{"session_id": "selfcheck-1", "sql": "SELECT count(*) FROM spans"})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("query after failed self-check = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
+
+	// The correct manifest verifies and reports the per-part counts.
+	resp = h.postJSON("/internal/window/preload", testToken, analysis.WindowOpenRequest{
+		SessionID:     "selfcheck-2",
+		Window:        window,
+		Catalog:       []analysis.SegmentMeta{meta},
+		Download:      true,
+		ExpectedParts: 1,
+		ExpectedSpans: 1,
+	})
+	if resp.StatusCode != http.StatusOK {
+		buf := new(bytes.Buffer)
+		_, _ = buf.ReadFrom(resp.Body)
+		t.Fatalf("preload status %d: %s", resp.StatusCode, buf.String())
+	}
+	var preloaded analysis.WindowPreloadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&preloaded); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !preloaded.Verified || !preloaded.Coverage.Complete {
+		t.Fatalf("preload not verified: %+v", preloaded)
+	}
+	if preloaded.AttachedParts != 1 || preloaded.AttachedSpans != 1 || preloaded.ViewSpans != 1 {
+		t.Fatalf("self-check counts = parts %d, attached %d, view %d", preloaded.AttachedParts, preloaded.AttachedSpans, preloaded.ViewSpans)
+	}
+	if len(preloaded.PartRows) != 1 || preloaded.PartRows[0].Key != key || preloaded.PartRows[0].Spans != 1 {
+		t.Fatalf("part rows = %+v", preloaded.PartRows)
+	}
+}
+
 func TestWindowEndpointsRequireInternalAuth(t *testing.T) {
 	h := newHarness(t)
 	req, _ := http.NewRequest(http.MethodPost, h.ts.URL+"/internal/window/query", bytes.NewReader([]byte(`{}`)))

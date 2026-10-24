@@ -337,7 +337,9 @@ export async function handleRequest(
       if (request.method !== "POST") throw badRequest("method not allowed");
       const body = await readJson<{ sql?: string; max_rows?: number }>(request);
       if (typeof body.sql !== "string") throw badRequest("sql is required");
-      return json(200, await queryShot(ctx, requireShotId(queryMatch[1]!), body.sql, body.max_rows));
+      const result = await queryShot(ctx, requireShotId(queryMatch[1]!), body.sql, body.max_rows);
+      // Spec 036: a session preload still in flight answers 202 preparing.
+      return json(result["state"] === "preparing" ? 202 : 200, result);
     }
 
     const analyzeMatch = /^\/api\/shots\/([^/]+)\/analyze$/.exec(path);
@@ -349,7 +351,9 @@ export async function handleRequest(
       // hanging past the 60 s Worker limit.
       const preparing = await analyzeReadiness(ctx, shotId);
       if (preparing) return json(202, preparing);
-      return json(200, await analyzeShot(ctx, shotId, body.sections, body.top_n));
+      const result = await analyzeShot(ctx, shotId, body.sections, body.top_n);
+      // Spec 036: the same 202 contract while the preload session is in flight.
+      return json(result["state"] === "preparing" ? 202 : 200, result);
     }
 
     const schemaMatch = /^\/api\/shots\/([^/]+)\/schema$/.exec(path);
@@ -363,10 +367,8 @@ export async function handleRequest(
       if (request.method !== "POST") throw badRequest("method not allowed");
       const body = await readJson<{ other?: string; top_n?: number }>(request);
       if (typeof body.other !== "string") throw badRequest("other shot id is required");
-      return json(
-        200,
-        await compareShots(ctx, requireShotId(compareMatch[1]!), requireShotId(body.other), body.top_n),
-      );
+      const result = await compareShots(ctx, requireShotId(compareMatch[1]!), requireShotId(body.other), body.top_n);
+      return json(result["state"] === "preparing" ? 202 : 200, result);
     }
 
     // Legacy per-shot path, kept for backwards compatibility. Admin token only.

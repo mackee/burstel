@@ -35,6 +35,19 @@ type Engine struct {
 // Scoped reports whether the engine backs a logical window snapshot.
 func (e *Engine) Scoped() bool { return e.scoped }
 
+// countScopedSpans is the spec-036 self-check: the exact span count the
+// committed query surface sees, compared with the materialization manifest.
+func (e *Engine) countScopedSpans(ctx context.Context) (int64, error) {
+	if e == nil || e.db == nil {
+		return 0, fmt.Errorf("analysis: window engine is closed")
+	}
+	var n int64
+	if err := e.db.QueryRowContext(ctx, "SELECT count(*) FROM spans").Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // WindowBoundsNS returns the half-open window bounds for a scoped engine.
 func (e *Engine) WindowBoundsNS() (startNS, endNS int64, ok bool) {
 	return e.windowStartNS, e.windowEndNS, e.scoped

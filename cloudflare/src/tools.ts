@@ -905,15 +905,8 @@ async function listAllSegments(ctx: ToolContext): Promise<SegmentManifestRow[]> 
   return out;
 }
 
-/** Streams the selected segments of one window into a session on `stub`. */
-async function openWindowSession(
-  ctx: ToolContext,
-  stub: { fetch(request: Request): Promise<Response> },
-  sessionId: string,
-  window: ShotWindow,
-  catalog: SegmentManifestRow[],
-  parts: MaterializationPart[] | null = null,
-): Promise<{
+/** Summary of a committed window session (or a `preparing` retry signal). */
+interface WindowOpenSummary {
   selected: number;
   expected: number;
   available: number;
@@ -922,7 +915,25 @@ async function openWindowSession(
   lookback_truncated: boolean;
   lookback_in_range: boolean;
   lookback_floor_ms: number | null;
-}> {
+}
+
+type WindowSessionOpen = { preparing: true; body: Record<string, unknown> } | { preparing: false; summary: WindowOpenSummary };
+
+/** True when the container/ShotDO answered `202 preparing` (spec 036). */
+function isPreparingOpen(opened: Record<string, unknown>): boolean {
+  return opened["state"] === "preparing";
+}
+
+/** Streams the selected segments of one window into a session on `stub`. */
+async function openWindowSession(
+  ctx: ToolContext,
+  stub: { fetch(request: Request): Promise<Response> },
+  sessionId: string,
+  window: ShotWindow,
+  catalog: SegmentManifestRow[],
+  parts: MaterializationPart[] | null = null,
+  expectedSpans = 0,
+): Promise<WindowSessionOpen> {
   if (!ctx.bucket && ctx.partDownload !== true) {
     throw new HttpError(503, "window analysis requires the object bucket binding", true, "bucket_unavailable");
   }
@@ -934,6 +945,7 @@ async function openWindowSession(
   if (parts !== null) {
     // Spec 031: a materialized shot is ATTACHed directly from its part files.
     // No continuous-compaction segment, no pending-journal disclaimer.
+    const manifest = { parts: parts.length, spans: expectedSpans > 0 ? expectedSpans : 0 };
     const catalogWire = parts.map((part) => ({
       key: part.object_key,
       instance_id: "all",
@@ -952,7 +964,10 @@ async function openWindowSession(
       window: windowWire(window),
       catalog: catalogWire,
       download: ctx.partDownload === true,
+      expected_parts: manifest.parts,
+      expected_spans: manifest.spans,
     });
+    if (isPreparingOpen(opened)) return { preparing: true, body: opened };
     const cached = cachedKeysFromOpen(opened);
     console.log("analysis.window.open", {
       session_id: sessionId,
@@ -967,6 +982,8 @@ async function openWindowSession(
     let streamed = 0;
     // Spec 035: with a bucket-scoped credential the container already fetched
     // (and verified) every selected part during open; the Worker sends no bytes.
+    // Spec 036: that download is synchronous, so a successful open means the
+    // whole part set is local and verified.
     if (ctx.partDownload !== true) {
       for (const part of parts) {
         if (cached.has(part.object_key)) continue;
@@ -991,7 +1008,22 @@ async function openWindowSession(
       }
     }
     const commitStarted = Date.now();
-    const committed = await doJson(stub, "/internal/window/commit", "POST", { session_id: sessionId });
+    const committed = await doJson(stub, "/internal/window/commit", "POST", {
+      session_id: sessionId,
+      expected_parts: manifest.parts,
+      expected_spans: manifest.spans,
+    });
+    if (isPreparingOpen(committed)) {
+      await releaseWindowSession(stub, sessionId);
+      return { preparing: true, body: committed };
+    }
+    const attachedParts = Number(committed["attached_parts"] ?? NaN);
+    const attachedSpans = Number(committed["attached_spans"] ?? NaN);
+    const viewSpans = Number(committed["view_spans"] ?? NaN);
+    const attachedOk = Number.isFinite(attachedParts) && attachedParts === manifest.parts;
+    const spansOk = manifest.spans <= 0 || (Number.isFinite(attachedSpans) && attachedSpans === manifest.spans);
+    const verified =
+      committed["verified"] === true && committed["complete"] === true && attachedOk && spansOk;
     console.log("analysis.part.download", {
       session_id: sessionId,
       shot_id: sessionId,
@@ -1003,6 +1035,28 @@ async function openWindowSession(
       attach_ms: (committed.timings as Record<string, unknown> | undefined)?.attach_ms ?? undefined,
       timings: committed.timings ?? undefined,
     });
+    // Spec 036 requirement 5: the post-commit self-check counts are logged.
+    console.log("analysis.session.verified", {
+      session_id: sessionId,
+      shot_id: sessionId,
+      verified,
+      attached_parts: committed["attached_parts"],
+      expected_parts: manifest.parts,
+      attached_spans: committed["attached_spans"],
+      expected_spans: manifest.spans,
+      view_spans: Number.isFinite(viewSpans) ? viewSpans : undefined,
+      view_matches_manifest: committed["view_matches_manifest"] === true,
+    });
+    if (!verified) {
+      await releaseWindowSession(stub, sessionId);
+      throw new HttpError(
+        409,
+        `analysis incomplete: attached ${committed["attached_parts"] ?? "?"} of ${manifest.parts} parts and ` +
+          `${committed["attached_spans"] ?? "?"} of ${manifest.spans} manifest spans`,
+        false,
+        "analysis_incomplete",
+      );
+    }
     // Materialization consumes the journal in the range, so `pending_journal`
     // is zero; the compaction lookback warning is still disclosed because it
     // says objects may be missing from *any* view, including a part.
@@ -1021,14 +1075,17 @@ async function openWindowSession(
       to_ms: window.end_ms,
     }).catch(() => ({ lookback_truncated: false, lookback_in_range: false, lookback_floor_ms: null }));
     return {
-      selected: parts.length,
-      expected: parts.length,
-      available: parts.length,
-      missing: [],
-      pending_journal: 0,
-      lookback_truncated: pending.lookback_truncated === true,
-      lookback_in_range: pending.lookback_in_range === true,
-      lookback_floor_ms: typeof pending.lookback_floor_ms === "number" ? pending.lookback_floor_ms : null,
+      preparing: false,
+      summary: {
+        selected: parts.length,
+        expected: parts.length,
+        available: parts.length,
+        missing: [],
+        pending_journal: 0,
+        lookback_truncated: pending.lookback_truncated === true,
+        lookback_in_range: pending.lookback_in_range === true,
+        lookback_floor_ms: typeof pending.lookback_floor_ms === "number" ? pending.lookback_floor_ms : null,
+      },
     };
   }
 
@@ -1055,6 +1112,7 @@ async function openWindowSession(
     window: windowWire(window),
     catalog: catalog.map((s) => segmentMetaWire(s, nameById.get(s.instance_id) ?? "")),
   });
+  if (isPreparingOpen(opened)) return { preparing: true, body: opened };
   const cached = cachedKeysFromOpen(opened);
   console.log("analysis.window.open", {
     session_id: sessionId,
@@ -1098,6 +1156,10 @@ async function openWindowSession(
   }
   const commitStarted = Date.now();
   const committed = await doJson(stub, "/internal/window/commit", "POST", { session_id: sessionId });
+  if (isPreparingOpen(committed)) {
+    await releaseWindowSession(stub, sessionId);
+    return { preparing: true, body: committed };
+  }
   console.log("analysis.part.download", {
     session_id: sessionId,
     shot_id: sessionId,
@@ -1131,15 +1193,26 @@ async function openWindowSession(
     lookback_floor_ms: null,
   }));
   return {
-    selected: selection.selected.length,
-    expected: selection.expected,
-    available,
-    missing,
-    pending_journal: pending.pending_journal,
-    lookback_truncated: pending.lookback_truncated === true,
-    lookback_in_range: pending.lookback_in_range === true,
-    lookback_floor_ms: typeof pending.lookback_floor_ms === "number" ? pending.lookback_floor_ms : null,
+    preparing: false,
+    summary: {
+      selected: selection.selected.length,
+      expected: selection.expected,
+      available,
+      missing,
+      pending_journal: pending.pending_journal,
+      lookback_truncated: pending.lookback_truncated === true,
+      lookback_in_range: pending.lookback_in_range === true,
+      lookback_floor_ms: typeof pending.lookback_floor_ms === "number" ? pending.lookback_floor_ms : null,
+    },
   };
+}
+
+/** Best-effort release of a discarded window session. */
+async function releaseWindowSession(
+  stub: { fetch(request: Request): Promise<Response> },
+  sessionId: string,
+): Promise<void> {
+  await doJson(stub, "/internal/window/release", "POST", { session_id: sessionId }).catch(() => undefined);
 }
 
 /** Lazily materializes a window before analysis (spec 031 D3.1/D4). */
@@ -1175,15 +1248,44 @@ async function withWindowSession<T>(
   ctx: ToolContext,
   record: WindowShotRecord,
   run: (sessionId: string) => Promise<T>,
-): Promise<T> {
+): Promise<T | Record<string, unknown>> {
   if (!record.window) throw badRequest("shot is not a window shot");
   const stub = ctx.namespace.getByName(record.shot_id);
   const sessionId = `w-${record.shot_id}`;
   const current = await ensureWindowMaterialized(ctx, record);
   const catalog = await listAllSegments(ctx);
-  const parts = current.materialization?.state === "complete" ? current.materialization.parts : null;
-  const result = await openWindowSession(ctx, stub, sessionId, current.window!, catalog, parts);
-  await syncCoverage(ctx, current, catalog, result);
+  const materialization = current.materialization?.state === "complete" ? current.materialization : null;
+  let opened: WindowSessionOpen;
+  try {
+    opened = await openWindowSession(
+      ctx,
+      stub,
+      sessionId,
+      current.window!,
+      catalog,
+      materialization?.parts ?? null,
+      materialization?.spans ?? 0,
+    );
+  } catch (error) {
+    // Spec 036: an incomplete attachment set never yields rows. Mark the
+    // coverage incomplete so a later shot_get cannot claim `complete: true`.
+    if (error instanceof HttpError && error.code === "analysis_incomplete") {
+      await syncCoverage(ctx, current, catalog, {
+        missing: [],
+        expected: materialization?.parts.length ?? catalog.length,
+        incomplete: true,
+      });
+    }
+    const preparing = preparingFromSessionError(error, record, sessionId);
+    if (preparing) {
+      // A raced session is discarded so the retry starts from a clean state.
+      await releaseWindowSession(stub, sessionId);
+      return preparing;
+    }
+    throw error;
+  }
+  if (opened.preparing) return opened.body;
+  await syncCoverage(ctx, current, catalog, opened.summary);
   try {
     const runStarted = Date.now();
     const out = await run(sessionId);
@@ -1194,11 +1296,33 @@ async function withWindowSession<T>(
       timings: (out as { timings?: unknown } | null)?.timings ?? undefined,
     });
     return out;
+  } catch (error) {
+    // A concurrent session reset is a retry signal, never a hard failure
+    // (spec 036 requirement 3: correct result or 202, never 400/partial).
+    const preparing = preparingFromSessionError(error, record, sessionId);
+    if (preparing) return preparing;
+    throw error;
   } finally {
     // Spec 033: the shot's downloaded parts stay cached in the analysis
     // container even after this session is released.
-    await doJson(stub, "/internal/window/release", "POST", { session_id: sessionId }).catch(() => undefined);
+    await releaseWindowSession(stub, sessionId);
   }
+}
+
+/** Maps a raced session lifecycle into the documented `202 preparing` body. */
+function preparingFromSessionError(
+  error: unknown,
+  record: WindowShotRecord,
+  sessionId: string,
+): Record<string, unknown> | null {
+  if (!(error instanceof HttpError) || error.code !== "window_not_committed") return null;
+  return {
+    shot_id: record.shot_id,
+    session_id: sessionId,
+    state: "preparing",
+    retry_after_ms: 5_000,
+    message: "the analysis session is being prepared; retry in about 5 s",
+  };
 }
 
 async function withWindowSessions<T>(
@@ -1207,7 +1331,7 @@ async function withWindowSessions<T>(
   sessions: Array<{ record: WindowShotRecord; sessionId: string }>,
   run: () => Promise<T>,
   releaseIds: string[],
-): Promise<T> {
+): Promise<T | Record<string, unknown>> {
   if (!ctx.bucket && ctx.partDownload !== true) {
     throw new HttpError(503, "window analysis requires the object bucket binding", true, "bucket_unavailable");
   }
@@ -1215,15 +1339,24 @@ async function withWindowSessions<T>(
   for (const session of sessions) {
     if (!session.record.window) throw badRequest("shot is not a window shot");
     const current = await ensureWindowMaterialized(ctx, session.record);
-    const parts = current.materialization?.state === "complete" ? current.materialization.parts : null;
-    const result = await openWindowSession(ctx, stub, session.sessionId, current.window!, catalog, parts);
-    await syncCoverage(ctx, current, catalog, result);
+    const materialization = current.materialization?.state === "complete" ? current.materialization : null;
+    const opened = await openWindowSession(
+      ctx,
+      stub,
+      session.sessionId,
+      current.window!,
+      catalog,
+      materialization?.parts ?? null,
+      materialization?.spans ?? 0,
+    );
+    if (opened.preparing) return opened.body;
+    await syncCoverage(ctx, current, catalog, opened.summary);
   }
   try {
     return await run();
   } finally {
     for (const id of releaseIds) {
-      await doJson(stub, "/internal/window/release", "POST", { session_id: id }).catch(() => undefined);
+      await releaseWindowSession(stub, id);
     }
   }
 }
@@ -1240,6 +1373,8 @@ async function syncCoverage(
     lookback_truncated?: boolean;
     lookback_in_range?: boolean;
     lookback_floor_ms?: number | null;
+    /** Spec 036: force `complete=false` after a refused/incomplete commit. */
+    incomplete?: boolean;
   },
 ): Promise<void> {
   const missing = result.missing ?? [];
@@ -1247,6 +1382,7 @@ async function syncCoverage(
   // Spec 025 R3: a truncated lookback that overlaps this window means objects
   // may still be undiscovered even when nothing is pending yet.
   const lookbackTruncated = result.lookback_in_range === true;
+  const incomplete = result.incomplete === true;
   try {
     await ingestCall(ctx, "/internal/shot/window/coverage", "POST", {
       shot_id: record.shot_id,
@@ -1258,7 +1394,7 @@ async function syncCoverage(
         pending_journal: pending,
         lookback_truncated: lookbackTruncated,
         lookback_floor_ms: result.lookback_floor_ms ?? null,
-        complete: missing.length === 0 && pending === 0 && !lookbackTruncated,
+        complete: !incomplete && missing.length === 0 && pending === 0 && !lookbackTruncated,
       },
     });
   } catch {
