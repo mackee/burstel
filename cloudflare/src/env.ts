@@ -99,6 +99,16 @@ export interface AppEnv {
   INGEST_ANALYTICS?: AnalyticsEngineLike;
   BURSTEL_API_TOKEN?: string;
   /**
+   * Spec 035: bucket-scoped R2 S3 credential for direct part download in the
+   * analysis container. All four values must be present to enable egress.
+   */
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  R2_ACCOUNT_ID?: string;
+  R2_BUCKET_NAME?: string;
+  /** Spec 035: concurrent part downloads in the analysis container. */
+  ANALYSIS_FETCH_PARALLELISM?: string;
+  /**
    * Trusted local-development escape hatch. When set to `1`/`true`, admin
    * endpoints accept requests even if `BURSTEL_API_TOKEN` is unset. Never set
    * this in production.

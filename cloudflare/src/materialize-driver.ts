@@ -63,6 +63,10 @@ export interface MaterializeRunState {
   heartbeat_at: number | null;
   /** False while a terminal mirror has not yet reached the ControlDO. */
   mirrored: boolean;
+  /** Spec 035: the ShotDO accepted the analysis preload request. */
+  analysis_preloaded?: boolean;
+  /** Spec 035: bounded attempts to reach the ShotDO preload alarm. */
+  analysis_preload_attempts?: number;
 }
 
 export interface MaterializeStore {
@@ -121,12 +125,18 @@ export interface MaterializeDriverDeps {
   keepAlive?: (poolMember: number) => Promise<void>;
   /** Test seam: start one pool member's container during prewarm. */
   prewarm?: (poolMember: number) => Promise<void>;
+  /**
+   * Spec 035: notify the ShotDO analysis alarm that the run is complete. The
+   * default production implementation loads the shot and posts the window plus
+   * parts to the ShotDO; the alarm then downloads them.
+   */
+  preloadAnalysis?: (shotId: string) => Promise<void>;
 }
 
 const DEFAULT_CONFIG: MaterializeDriverConfig = {
-  // Spec 033: fixed pool sized one below CompactorDO max_instances (4).
-  parallelism: 3,
-  maxInstances: 4,
+  // Spec 035: fixed pool sized one below CompactorDO max_instances (6).
+  parallelism: 5,
+  maxInstances: 6,
   maxAttempts: 3,
   // Spec 034: must exceed the largest part timeout (120 s base + scaling)
   // with room for container start, otherwise an expired lease retries a part
@@ -173,6 +183,7 @@ export class MaterializeDriver {
     | undefined;
   private readonly keepAlive: (poolMember: number) => Promise<void>;
   private readonly prewarm: (poolMember: number) => Promise<void>;
+  private readonly preloadAnalysis?: (shotId: string) => Promise<void>;
 
   constructor(deps: MaterializeDriverDeps) {
     this.shotId = deps.shotId;
@@ -186,6 +197,7 @@ export class MaterializeDriver {
     this.execute = deps.execute;
     this.keepAlive = deps.keepAlive ?? ((member) => this.poolCall(member, "/internal/keepalive", "POST"));
     this.prewarm = deps.prewarm ?? ((member) => this.poolCall(member, "/internal/prewarm", "POST"));
+    this.preloadAnalysis = deps.preloadAnalysis;
     const config = { ...DEFAULT_CONFIG, ...deps.config };
     this.config = {
       parallelism: clampInt(config.parallelism, 1, 8, DEFAULT_CONFIG.parallelism),
@@ -351,12 +363,22 @@ export class MaterializeDriver {
     const now = this.now();
 
     if (run.state === "complete" || run.state === "failed") {
-      // A terminal mirror may have failed; a small retry alarm makes delivery
-      // eventual without ever resurrecting the run itself.
-      if (!run.mirrored) {
+      if (run.state === "complete") {
+        const before = `${run.analysis_preloaded}:${run.analysis_preload_attempts ?? 0}`;
+        await this.deliverPreload(run);
+        if (`${run.analysis_preloaded}:${run.analysis_preload_attempts ?? 0}` !== before) {
+          await this.persist(run);
+        }
+      }
+      // A terminal mirror or the spec-035 preload may have failed; a small
+      // retry alarm makes both eventual without resurrecting the run.
+      if (!run.mirrored || this.needsPreload(run)) {
         await this.persist(run);
-        if (!run.mirrored) await this.scheduler.set(now + Math.max(1_000, this.config.retryDelayMs));
-        else await this.endYield();
+        if (!run.mirrored || this.needsPreload(run)) {
+          await this.scheduler.set(now + Math.max(1_000, this.config.retryDelayMs));
+        } else {
+          await this.endYield();
+        }
       }
       return;
     }
@@ -580,13 +602,61 @@ export class MaterializeDriver {
       });
     }
 
+    // Mirror the terminal state before notifying the analysis DO: the ShotDO
+    // preload path reads the same control-plane record.
     await this.persist(run);
+    if (run.state === "complete") {
+      const before = `${run.analysis_preloaded}:${run.analysis_preload_attempts ?? 0}`;
+      await this.deliverPreload(run);
+      if (`${run.analysis_preloaded}:${run.analysis_preload_attempts ?? 0}` !== before) {
+        await this.persist(run);
+      }
+    }
     if (run.state === "complete" || run.state === "failed") {
       await this.endYield();
-      if (!run.mirrored) await this.scheduler.set(finishedAt + Math.max(1_000, this.config.retryDelayMs));
+      if (!run.mirrored || this.needsPreload(run)) {
+        await this.scheduler.set(finishedAt + Math.max(1_000, this.config.retryDelayMs));
+      }
     } else {
       await this.scheduler.set(run.scheduled_at);
     }
+  }
+
+  /**
+   * Spec 035: after a complete run, ask the ShotDO alarm to open the shot
+   * session and download its parts. Bounded attempts; a failure never changes
+   * the run result (analysis falls back to opening with download on demand).
+   */
+  private async deliverPreload(run: MaterializeRunState): Promise<void> {
+    if (!this.preloadAnalysis || run.analysis_preloaded === true) return;
+    const attempts = run.analysis_preload_attempts ?? 0;
+    if (attempts >= 5) return;
+    try {
+      await this.preloadAnalysis(run.shot_id);
+      run.analysis_preloaded = true;
+      this.log("materialize.preload.notified", {
+        shot_id: run.shot_id,
+        run_id: run.run_id,
+        attempts,
+      });
+    } catch (error) {
+      run.analysis_preload_attempts = attempts + 1;
+      this.log("materialize.preload.retry", {
+        shot_id: run.shot_id,
+        run_id: run.run_id,
+        attempt: run.analysis_preload_attempts,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  private needsPreload(run: MaterializeRunState): boolean {
+    return (
+      run.state === "complete" &&
+      this.preloadAnalysis !== undefined &&
+      run.analysis_preloaded !== true &&
+      (run.analysis_preload_attempts ?? 0) < 5
+    );
   }
 
   private stale(run: MaterializeRunState, now: number): boolean {
@@ -821,6 +891,8 @@ function newRun(shotId: string, scheduledAt: number, force: boolean): Materializ
     lease_expires_at: null,
     heartbeat_at: null,
     mirrored: false,
+    analysis_preloaded: false,
+    analysis_preload_attempts: 0,
   };
 }
 

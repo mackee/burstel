@@ -35,6 +35,7 @@
 // *person* tokens. Neither the admin credential nor an instance token may
 // cross the other boundary.
 
+import { analysisDirectDownload } from "./analysis-env";
 import { resolvePrincipal, isRegistryAdmin } from "./authz";
 import { DO_ORIGIN, pagination } from "./env";
 import type { AppEnv, DoStubLike, ShotNamespaceLike } from "./env";
@@ -45,6 +46,7 @@ import { isShotId, newShotId } from "./ids";
 import { handleMcp } from "./mcp";
 import type { Signal } from "./store";
 import {
+  analyzeReadiness,
   analyzeShot,
   backfillInstanceTokens,
   compareShots,
@@ -342,7 +344,12 @@ export async function handleRequest(
     if (analyzeMatch) {
       if (request.method !== "POST") throw badRequest("method not allowed");
       const body = await readJson<{ sections?: string[]; top_n?: number }>(request);
-      return json(200, await analyzeShot(ctx, requireShotId(analyzeMatch[1]!), body.sections, body.top_n));
+      const shotId = requireShotId(analyzeMatch[1]!);
+      // Spec 035: answer 202 while the shot is still materializing instead of
+      // hanging past the 60 s Worker limit.
+      const preparing = await analyzeReadiness(ctx, shotId);
+      if (preparing) return json(202, preparing);
+      return json(200, await analyzeShot(ctx, shotId, body.sections, body.top_n));
     }
 
     const schemaMatch = /^\/api\/shots\/([^/]+)\/schema$/.exec(path);
@@ -393,6 +400,7 @@ function toolContext(env: AppEnv, url: URL, _execution?: { waitUntil(promise: Pr
     bucket: env.BUCKET,
     tokens: env.INSTANCE_TOKENS,
     materialize: materializeOptions(env),
+    partDownload: analysisDirectDownload(env),
   };
 }
 
@@ -411,9 +419,10 @@ export function materializeOptions(env: AppEnv): {
     MATERIALIZE_MAX_INSTANCES?: string;
     MATERIALIZE_WAIT_MS?: string;
   };
-  const maxInstances = Math.min(8, num(vars.MATERIALIZE_MAX_INSTANCES, 4));
-  // Spec 033: leave one CompactorDO container slot for continuous compaction.
-  const parallelism = Math.min(maxInstances - 1, Math.min(8, num(vars.MATERIALIZE_PARALLELISM, 3)));
+  const maxInstances = Math.min(8, num(vars.MATERIALIZE_MAX_INSTANCES, 6));
+  // Spec 033/035: leave one CompactorDO container slot for continuous
+  // compaction (six instances -> five parallel materializers).
+  const parallelism = Math.min(maxInstances - 1, Math.min(8, num(vars.MATERIALIZE_PARALLELISM, 5)));
   return {
     parallelism: Math.max(1, parallelism),
     maxInstances,

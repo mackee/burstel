@@ -112,3 +112,69 @@ describe("frozen shot analysis", () => {
     expect(other!.sha).toBe(rightFrozen.sha256!);
   });
 });
+
+describe("spec 035 analysis preload", () => {
+  test("opens the shot session, downloads parts directly and enables egress", async () => {
+    const container = new FakeContainer();
+    const h = makeCore("shot-preload", {
+      container,
+      analysisEnv: {
+        R2_ACCESS_KEY_ID: "key",
+        R2_SECRET_ACCESS_KEY: "secret",
+        R2_ACCOUNT_ID: "account",
+        R2_BUCKET: "burstel-shots",
+      },
+      analysisEgress: true,
+    });
+    await h.core.prewarmAnalysis();
+    expect(container.startInternet).toEqual([true]);
+    expect(container.startEnv?.["R2_ACCESS_KEY_ID"]).toBe("key");
+    expect(container.startEnv?.["BURSTEL_ANALYSIS"]).toBe("1");
+    // The recorder environment is never handed the analysis credential.
+    expect(container.startEnv?.["BURSTEL_DATA_DIR"]).toBe("/data");
+
+    const start = 1_700_000_000_000;
+    await h.core.preloadAnalysis({
+      window: {
+        start: new Date(start).toISOString(),
+        end: new Date(start + 60_000).toISOString(),
+        provenance: "server",
+        clock_trust: "server",
+        instances: ["web-1"],
+      },
+      parts: [
+        {
+          object_key: "shots/shot-preload/part-0.duckdb",
+          size_bytes: 1024,
+          sha256: "a".repeat(64),
+          first_received_at: start,
+          last_received_at: start + 60_000,
+        },
+      ],
+    });
+    expect(container.preloads.length).toBe(1);
+    const body = container.preloads[0]!;
+    expect(body["session_id"]).toBe("w-shot-preload");
+    expect(body["download"]).toBe(true);
+    const catalog = body["catalog"] as Array<Record<string, unknown>>;
+    expect(catalog.length).toBe(1);
+    expect(catalog[0]!["key"]).toBe("shots/shot-preload/part-0.duckdb");
+    expect(catalog[0]!["sha256"]).toBe("a".repeat(64));
+    // No part bytes crossed the Worker boundary.
+    expect(container.windowSegments.length).toBe(0);
+  });
+
+  test("preload is a no-op without the bucket-scoped credential", async () => {
+    const container = new FakeContainer();
+    const h = makeCore("shot-preload-off", { container });
+    await h.core.preloadAnalysis({
+      window: {
+        start: new Date(1_700_000_000_000).toISOString(),
+        end: new Date(1_700_000_060_000).toISOString(),
+      },
+      parts: [{ object_key: "shots/x/part-0.duckdb", size_bytes: 1, sha256: "b".repeat(64) }],
+    });
+    expect(container.started).toBe(false);
+    expect(container.preloads.length).toBe(0);
+  });
+});

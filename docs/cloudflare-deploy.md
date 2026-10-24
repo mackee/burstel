@@ -156,8 +156,8 @@ The full preflight checks, without mutating anything:
   are never read or printed), including the spec-031 bucket-scoped
   `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_ACCOUNT_ID`;
 * `docker`/`buildx`/`linux/amd64` compatibility;
-* the `wrangler.jsonc` invariants: `ShotDO` container on `standard-1`, the
-  `CompactorDO`/materializer container on `standard-4` (spec 034), bounded
+* the `wrangler.jsonc` invariants: both the `ShotDO` (recorder/analysis) and the
+  `CompactorDO`/materializer container on `standard-4` (spec 034/035), bounded
   `max_instances`, SQLite `ShotDO`/`IngestDO`/`AuthDO` exports, the deploy-safe
   `INGEST_DO -> IngestDO` binding (no `ControlDO` rename),
   `BUCKET -> burstel-shots`, a concrete (not all-zero) `INSTANCE_TOKENS` KV id,
@@ -296,16 +296,26 @@ Containers are ephemeral and are destroyed on freeze/idle.
 
 * `containers[].max_instances` is capped at 10 and validated by preflight; an
   account-level limit overrun surfaces to clients as a retryable `503`.
-* `ShotDO` (`instance_type: standard-1`) is the recorder/analysis container.
-* `CompactorDO` (`instance_type: standard-4`, spec 034) also hosts the fixed
-  materializer pool (`MATERIALIZE_PARALLELISM=3`). It bills at 4 vCPU / 12 GiB
-  while any pool member is alive, and finished members are kept warm for
+* `ShotDO` (`instance_type: standard-4`, spec 035) hosts both the legacy
+  recorder and the analysis container. Zero-copy window analysis ATTACHes parts
+  instead of copying them, and the analysis container downloads parts directly
+  from R2 (bounded by `ANALYSIS_FETCH_PARALLELISM`, default 16), which is why the
+  analysis path now needs 4 vCPU and container egress. Egress and the
+  bucket-scoped R2 credential are only injected when `R2_ACCESS_KEY_ID`,
+  `R2_SECRET_ACCESS_KEY`, `R2_ACCOUNT_ID` and `R2_BUCKET_NAME` are all set;
+  without them the Worker streams parts and the container stays isolated.
+* `CompactorDO` (`instance_type: standard-4`, spec 034/035) also hosts the fixed
+  materializer pool (`MATERIALIZE_PARALLELISM=5` of `max_instances=6`, leaving
+  one slot for continuous compaction). It bills at 4 vCPU / 12 GiB while any
+  pool member is alive, and finished members are kept warm for
   `MATERIALIZE_KEEPALIVE_MS` (10 min) to serve the next shot. That warm window
   dominates cost for intermittent shots: lower `MATERIALIZE_KEEPALIVE_MS` (and,
   if needed, `MATERIALIZE_PARALLELISM`) to trade materialization latency for
   spend. `standard-4` is ~4x the compute of `standard-1` per second; the
-  projection-only part layout (spec 034) is what keeps the parts small enough
-  that a 3-container, ~30 s build replaces the previous ~90 s + failures.
+  projection-only part layout (spec 034) plus five parallel builders is what
+  keeps a ~8M-span shot inside the 60 s materialization budget. Never set
+  `MATERIALIZE_PARALLELISM` above `max_instances - 1`; preflight enforces it so
+  compaction cannot be starved.
 * Stop shots promptly; a recording Container holds an ephemeral disk.
 * The durable raw journal writes one R2 object per accepted export under
   `journal/*`; add an R2 lifecycle rule for old `shots/*` **and** `journal/*`

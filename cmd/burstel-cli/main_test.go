@@ -85,6 +85,31 @@ func TestShotStartRejectsUnknownMode(t *testing.T) {
 	}
 }
 
+func TestAnalyzeDefaultTimeoutAndFlag(t *testing.T) {
+	c, err := newClient("https://example.invalid", "test-token", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.http.Timeout != 180*time.Second {
+		t.Fatalf("default analyze HTTP timeout = %s, want 180s", c.http.Timeout)
+	}
+
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("content-type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"shot_id": "AAAAAAAAAAAAAAAA"})
+	}))
+	defer slow.Close()
+	err = runCLI(t, slow.URL, "shot", "analyze", "AAAAAAAAAAAAAAAA", "--timeout", "20ms")
+	if err == nil || !strings.Contains(err.Error(), "Client.Timeout") {
+		t.Fatalf("err = %v, want a client timeout from --timeout 20ms", err)
+	}
+	if err := runCLI(t, slow.URL, "shot", "analyze", "AAAAAAAAAAAAAAAA", "--timeout", "soon"); err == nil ||
+		!strings.Contains(err.Error(), "--timeout must be a positive duration") {
+		t.Fatalf("err = %v, want --timeout validation", err)
+	}
+}
+
 func TestShotMaterializeDefaultsAndFlags(t *testing.T) {
 	ts, seen := fakeWorker(t, map[string]any{"shot_id": "AAAAAAAAAAAAAAAA", "kind": "window"})
 	if err := runCLI(t, ts.URL, "shot", "materialize", "AAAAAAAAAAAAAAAA"); err != nil {

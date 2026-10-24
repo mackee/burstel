@@ -25,6 +25,9 @@ const (
 	// R4). A background guard checkpoints once the WAL reaches this size, off
 	// the ingest hot path.
 	DefaultWALCheckpointBytes int64 = 256 << 20 // 256 MiB
+	// DefaultAnalysisFetchParallelism bounds concurrent direct R2 part
+	// downloads in the analysis container (spec 035).
+	DefaultAnalysisFetchParallelism = 16
 )
 
 // Config describes a running burstel recorder.
@@ -61,6 +64,16 @@ type Config struct {
 	// WALCheckpointBytes bounds the standalone DuckDB WAL. The background guard
 	// checkpoints once it reaches this size (spec 024, R4).
 	WALCheckpointBytes int64
+	// Spec 035: bucket-scoped R2 credential the analysis container uses to
+	// download materialization parts directly. Empty fields leave the legacy
+	// Worker-streamed segment path in place.
+	R2AccountID       string
+	R2AccessKeyID     string
+	R2SecretAccessKey string
+	R2Bucket          string
+	R2Endpoint        string
+	// AnalysisFetchParallelism bounds concurrent direct part downloads.
+	AnalysisFetchParallelism int
 }
 
 // Load returns configuration from the environment, falling back to defaults.
@@ -79,6 +92,12 @@ func Load() Config {
 			"BURSTEL_WAL_CHECKPOINT_BYTES",
 			DefaultWALCheckpointBytes,
 		),
+		R2AccountID:              os.Getenv("R2_ACCOUNT_ID"),
+		R2AccessKeyID:            os.Getenv("R2_ACCESS_KEY_ID"),
+		R2SecretAccessKey:        os.Getenv("R2_SECRET_ACCESS_KEY"),
+		R2Bucket:                 envString("R2_BUCKET", os.Getenv("R2_BUCKET_NAME")),
+		R2Endpoint:               os.Getenv("R2_ENDPOINT"),
+		AnalysisFetchParallelism: envInt("BURSTEL_ANALYSIS_FETCH_PARALLELISM", DefaultAnalysisFetchParallelism),
 	}
 	return cfg
 }

@@ -42,10 +42,10 @@ class FakeMaterializerNamespace implements MaterializerNamespaceLike {
   }
 }
 
-function makeEnv(): AppEnv {
+function makeEnv(ingest = makeIngest()): AppEnv {
   return {
     SHOT_DO: new FakeNamespace(),
-    INGEST_DO: new FakeIngestNamespace(makeIngest().core),
+    INGEST_DO: new FakeIngestNamespace(ingest.core),
     MATERIALIZE_DO: new FakeMaterializerNamespace(),
     BURSTEL_API_TOKEN: TOKEN,
     PUBLIC_BASE_URL: "https://burstel.example",
@@ -65,6 +65,34 @@ function get(path: string, token: string | null = TOKEN): Request {
 }
 
 describe("REST logical windows", () => {
+  test("analyze returns 202 preparing while materialization is still running", async () => {
+    const ingest = makeIngest();
+    const env = makeEnv(ingest);
+    await handleRequest(post("/api/instances", { name: "web-1" }), env);
+    const started = await handleRequest(post("/api/shots", { mode: "window", instances: ["web-1"] }), env);
+    const shot = (await started.json()) as Record<string, unknown>;
+    const shotId = String(shot["shot_id"]);
+    await handleRequest(post(`/api/shots/${shotId}/stop`, {}), env);
+    await ingest.core.setMaterialization(shotId, {
+      state: "running",
+      parts_done: 1,
+      parts_total: 4,
+      spans: 100,
+      started_at: null,
+      finished_at: null,
+      parts: [],
+    });
+
+    const resp = await handleRequest(post(`/api/shots/${shotId}/analyze`, {}), env);
+    expect(resp.status).toBe(202);
+    const body = (await resp.json()) as Record<string, unknown>;
+    expect(body["state"]).toBe("preparing");
+    expect(body["materialization_state"]).toBe("running");
+    expect(body["retry_after_ms"]).toBe(5000);
+    expect(String(body["message"])).toContain("retry");
+  });
+
+
   test("POST /api/shots/window creates a backdated external window", async () => {
     const env = makeEnv();
     await handleRequest(post("/api/instances", { name: "web-1" }), env);

@@ -140,7 +140,12 @@ interface Harness {
 }
 
 async function harness(
-  options: { maxAttempts?: number; parallelism?: number; capacityBackoffMs?: number } = {},
+  options: {
+    maxAttempts?: number;
+    parallelism?: number;
+    capacityBackoffMs?: number;
+    preloadAnalysis?: (shotId: string) => Promise<void>;
+  } = {},
 ): Promise<Harness> {
   const clock = { now: 1_700_000_100_000 };
   const bucket = new FakeBucket();
@@ -174,6 +179,7 @@ async function harness(
       capacityBackoffMs: options.capacityBackoffMs ?? 2_000,
     },
     log: () => undefined,
+    preloadAnalysis: options.preloadAnalysis,
   });
   return { clock, core, ingest, store, prewarmStore, scheduler, compactor, driver, stopped };
 }
@@ -203,6 +209,51 @@ describe("alarm-driven materialization", () => {
     const record = h.core.getShotRecord("shot_alarm_materialize")!;
     expect(record.materialization?.state).toBe("complete");
     expect(record.coverage?.complete).toBe(true);
+  });
+
+  test("a complete run notifies the ShotDO preload alarm exactly once", async () => {
+    const calls: string[] = [];
+    const h = await harness({
+      preloadAnalysis: async (shotId) => {
+        calls.push(shotId);
+      },
+    });
+    await h.driver.schedule(h.stopped);
+    h.clock.now = h.scheduler.armed.at(-1)!;
+    await h.driver.alarm();
+    expect(calls).toEqual(["shot_alarm_materialize"]);
+    const run = await h.store.load();
+    expect(run?.state).toBe("complete");
+    expect(run?.analysis_preloaded).toBe(true);
+
+    // A watchdog alarm must not notify again.
+    h.clock.now += 10_000;
+    await h.driver.alarm();
+    expect(calls).toEqual(["shot_alarm_materialize"]);
+  });
+
+  test("a failed preload notification retries on the next alarm", async () => {
+    let attempts = 0;
+    const h = await harness({
+      preloadAnalysis: async () => {
+        attempts += 1;
+        if (attempts < 2) throw new Error("shot do unavailable");
+      },
+    });
+    await h.driver.schedule(h.stopped);
+    h.clock.now = h.scheduler.armed.at(-1)!;
+    await h.driver.alarm();
+    let run = await h.store.load();
+    expect(run?.state).toBe("complete");
+    expect(run?.analysis_preloaded).not.toBe(true);
+    expect(run?.analysis_preload_attempts).toBe(1);
+    expect(h.scheduler.armed.at(-1)).toBeGreaterThan(h.clock.now);
+
+    h.clock.now = h.scheduler.armed.at(-1)!;
+    await h.driver.alarm();
+    run = await h.store.load();
+    expect(run?.analysis_preloaded).toBe(true);
+    expect(attempts).toBe(2);
   });
 
   test("shot_stop only schedules the DO; the alarm completes after the request is gone", async () => {

@@ -25,7 +25,7 @@ func (s *Server) handleWindowOpen(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	started := time.Now()
-	selection, cached, err := s.window.OpenWindowWithCache(req.SessionID, req.Window, req.Catalog)
+	selection, cached, err := s.window.OpenWindowWithCache(r.Context(), req.SessionID, req.Window, req.Catalog, req.Download)
 	if err != nil {
 		writeAnalysisError(w, err)
 		return
@@ -36,6 +36,29 @@ func (s *Server) handleWindowOpen(w http.ResponseWriter, r *http.Request) {
 		Selection:  selection,
 		CachedKeys: cached,
 		Timings:    analysis.ScopedTimings{OpenMS: time.Since(started).Milliseconds()},
+	})
+}
+
+// handleWindowPreload is spec 035's materialization-complete hook: it opens the
+// shot session, downloads every part directly from R2 with bounded parallelism
+// and commits the zero-copy views, so a later analyze only runs queries.
+func (s *Server) handleWindowPreload(w http.ResponseWriter, r *http.Request) {
+	var req analysis.WindowOpenRequest
+	if err := decodeJSONBody(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	selection, cached, cov, timings, err := s.window.Prefetch(r.Context(), req.SessionID, req.Window, req.Catalog)
+	if err != nil {
+		writeAnalysisError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, analysis.WindowPreloadResponse{
+		SessionID:  req.SessionID,
+		Selection:  selection,
+		CachedKeys: cached,
+		Coverage:   cov,
+		Timings:    timings,
 	})
 }
 

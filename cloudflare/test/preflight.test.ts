@@ -328,15 +328,34 @@ describe("cross-file deployment invariants", () => {
   });
 });
 
-describe("spec 034 materializer throughput configuration", () => {
-  test("the CompactorDO/materializer container uses standard-4 while ShotDO stays standard-1", () => {
+describe("spec 034/035 materializer throughput configuration", () => {
+  test("both containers use standard-4 and the pool leaves a compaction slot", () => {
     const cfg = loadWranglerConfig(REAL_CONFIG);
     const shot = cfg.containers?.find((c) => c.class_name === "ShotDO");
     const compactor = cfg.containers?.find((c) => c.class_name === "CompactorDO");
-    expect(shot?.instance_type).toBe("standard-1");
+    expect(shot?.instance_type).toBe("standard-4");
     expect(compactor?.instance_type).toBe("standard-4");
+    expect(compactor?.max_instances).toBe(6);
+    expect(cfg.vars?.["MATERIALIZE_PARALLELISM"]).toBe("5");
     const report = finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true }));
     expect(report.failed_required).not.toContain("container_compactor_instance_type");
+    expect(report.failed_required).not.toContain("container_compactor_max_instances_bounded");
+    expect(report.failed_required).not.toContain("materialize_parallelism_bounded");
+  });
+
+  test("preflight rejects parallelism above max_instances - 1", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    cfg.containers!.find((c) => c.class_name === "CompactorDO")!.max_instances = 6;
+    cfg.vars!["MATERIALIZE_PARALLELISM"] = "6";
+    const report = finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true }));
+    expect(report.failed_required).toContain("materialize_parallelism_bounded");
+  });
+
+  test("preflight bounds direct part download parallelism", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    cfg.vars!["ANALYSIS_FETCH_PARALLELISM"] = "0";
+    const report = finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true }));
+    expect(report.failed_required).toContain("analysis_fetch_parallelism_bounded");
   });
 
   test("rejects a standard-1 materializer instance and out-of-range part limits", () => {

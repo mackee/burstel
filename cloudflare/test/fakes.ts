@@ -96,6 +96,10 @@ export class FakeContainer implements ContainerControl {
   started = false;
   destroyed = false;
   startEnv: Record<string, string> | undefined;
+  /** Spec 035: egress requested for each start. */
+  readonly startInternet: boolean[] = [];
+  /** Spec 035: parsed /internal/window/preload bodies. */
+  readonly preloads: Array<Record<string, unknown>> = [];
 
   startStatus = 200;
   goStartStatus: number;
@@ -182,10 +186,11 @@ export class FakeContainer implements ContainerControl {
     return this.runningFlag;
   }
 
-  start(env: Record<string, string>): void {
+  start(env: Record<string, string>, options?: { internet?: boolean }): void {
     this.started = true;
     this.startEnv = env;
     this.runningFlag = true;
+    this.startInternet.push(options?.internet === true);
   }
 
   async ensureReady(): Promise<void> {
@@ -299,6 +304,25 @@ export class FakeContainer implements ContainerControl {
       this.windowSessions.add(String(body.session_id));
       return new Response(
         JSON.stringify({ session_id: body.session_id, window: body.window, selection: { selected: [], missing: [], expected: 0, justification: "fake" } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+
+    if (path === "/internal/window/preload") {
+      const body = init?.body ? JSON.parse(await textBody(init.body)) : {};
+      this.preloads.push(body as Record<string, unknown>);
+      this.windowSessions.add(String(body.session_id));
+      const keys = Array.isArray(body.catalog)
+        ? (body.catalog as Array<{ key?: string }>).map((entry) => String(entry.key ?? ""))
+        : [];
+      return new Response(
+        JSON.stringify({
+          session_id: body.session_id,
+          selection: { selected: [], missing: [], expected: keys.length, justification: "fake" },
+          cached_keys: keys,
+          coverage: { complete: true, expected_segments: keys.length, available_segments: keys.length },
+          timings: { attach_ms: 0, materialize_ms: 0, total_ms: 0 },
+        }),
         { status: 200, headers: { "content-type": "application/json" } },
       );
     }
@@ -826,6 +850,9 @@ export function makeCore(
     maxRecordingMs?: number;
     /** Override the resolved internal-token state (defaults to a valid one). */
     internals?: { token?: string; ready?: boolean; error?: "missing" | "not_distinct" };
+    /** Spec 035: analysis container R2 env and egress. */
+    analysisEnv?: Record<string, string>;
+    analysisEgress?: boolean;
   } = {},
 ): TestHarness {
   const sql = options.sql ?? new BunSql();
@@ -845,6 +872,8 @@ export function makeCore(
     internalTokenReady: internals?.ready ?? true,
     internalTokenError: internals?.error,
     containerEnv: { BURSTEL_ADDR: ":8080", BURSTEL_DATA_DIR: "/data" },
+    analysisEnv: options.analysisEnv,
+    analysisEgress: options.analysisEgress,
     drainTimeoutMs: options.drainTimeoutMs ?? 2000,
     scheduler,
     heartbeatIntervalMs: 60_000,

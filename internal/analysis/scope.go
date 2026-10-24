@@ -35,6 +35,20 @@ type SegmentRef struct {
 	Path     string
 }
 
+// ScopedMode selects how a window snapshot is built (spec 035).
+type ScopedMode string
+
+const (
+	// ScopedModeView is the default zero-copy mode: every part is ATTACHed
+	// read-only and `spans`/`log_records`/`metric_points` are UNION ALL views
+	// with the window predicates. Nothing is copied into a combined database.
+	ScopedModeView ScopedMode = "view"
+	// ScopedModeCopy is the pre-035 behaviour that copies the in-window rows
+	// into one scratch DuckDB. It is kept for diagnostics and as the reference
+	// implementation the view path is tested against.
+	ScopedModeCopy ScopedMode = "copy"
+)
+
 // ScopedOptions configures the scoped snapshot build.
 type ScopedOptions struct {
 	// WorkDir is the parent directory for the ephemeral scratch database.
@@ -46,6 +60,8 @@ type ScopedOptions struct {
 	SpanPolicy SpanBoundaryPolicy
 	// Open configures the read-only engine.
 	Open OpenOptions
+	// Mode selects zero-copy views (default) or the legacy copy path.
+	Mode ScopedMode
 }
 
 // DefaultBaselineHorizon is how far before a window a cumulative baseline may
@@ -77,6 +93,9 @@ type ScopedTimings struct {
 	OpenMS        int64 `json:"open_ms"`
 	CoverageMS    int64 `json:"coverage_ms"`
 	TotalMS       int64 `json:"total_ms"`
+	// Reused is true when an unchanged session returned its existing attached
+	// views instead of re-ATTACHing every part (spec 035).
+	Reused bool `json:"reused,omitempty"`
 }
 
 // ScopedEngine is a read-only window snapshot plus its coverage diagnostics.
@@ -122,9 +141,19 @@ func ScopedPolicy(base Policy) Policy {
 	return p
 }
 
-// BuildScopedEngine materializes a window's rows into an immutable read-only
-// DuckDB snapshot and returns it with coverage diagnostics.
+// BuildScopedEngine builds a window snapshot using the configured mode. The
+// default (ScopedModeView) ATTACHes the parts and exposes UNION ALL views; the
+// copy mode materializes one scratch database and is retained as a reference.
 func BuildScopedEngine(ctx context.Context, window TimeWindow, refs []SegmentRef, opts ScopedOptions) (*ScopedEngine, error) {
+	if opts.Mode == ScopedModeCopy {
+		return buildScopedCopy(ctx, window, refs, opts)
+	}
+	return buildScopedView(ctx, window, refs, opts)
+}
+
+// buildScopedCopy materializes a window's rows into an immutable read-only
+// DuckDB snapshot and returns it with coverage diagnostics.
+func buildScopedCopy(ctx context.Context, window TimeWindow, refs []SegmentRef, opts ScopedOptions) (*ScopedEngine, error) {
 	startedAt := time.Now()
 	var timings ScopedTimings
 	workDir := opts.WorkDir
@@ -205,8 +234,6 @@ func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []Segm
 		return fmt.Errorf("analysis: window schema: %w", err)
 	}
 	startNS, endNS := window.StartNS(), window.EndNS()
-	lag := DefaultIngestLag.Milliseconds()
-	loMS, hiMS := window.Start.UnixMilli()-lag, window.End.UnixMilli()+lag
 	baseFromNS := startNS - horizon.Nanoseconds()
 
 	attachStart := time.Now()
@@ -235,54 +262,7 @@ func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []Segm
 		}
 	}()
 
-	tableSpecs := []struct {
-		table string
-		where func(alias string) string
-		// selectSQL returns the source projection for one attached ref. Spec 034
-		// parts carry `part_meta` instead of `otlp_batches`; the batch projection
-		// is synthesized from it (without the raw payload blobs) so analysis and
-		// coverage keep working unchanged.
-		selectSQL func(alias string, tables map[string]bool) (string, bool)
-	}{
-		{"otlp_batches", func(a string) string {
-			return fmt.Sprintf("WHERE epoch_ms(%s.received_at) >= %d AND epoch_ms(%s.received_at) < %d", a, loMS, a, hiMS)
-		}, func(a string, tables map[string]bool) (string, bool) {
-			if tables["otlp_batches"] {
-				return "SELECT * FROM " + a + ".main.otlp_batches AS t ", true
-			}
-			if tables["part_meta"] {
-				return "SELECT instance_id, source_key, request_id, signal, received_at, content_encoding, " +
-					"wire_sha256, payload_sha256, record_count, payload_length, resource_summary, " +
-					"CAST('' AS BLOB) AS wire_payload, CAST('' AS BLOB) AS payload " +
-					"FROM " + a + ".main.part_meta AS t ", true
-			}
-			return "", false
-		}},
-		{"spans", func(a string) string {
-			return spanWindowWhere(a, startNS, endNS, policy)
-		}, func(a string, tables map[string]bool) (string, bool) {
-			if !tables["spans"] {
-				return "", false
-			}
-			return "SELECT * FROM " + a + ".main.spans AS t ", true
-		}},
-		{"log_records", func(a string) string {
-			return fmt.Sprintf("WHERE COALESCE(NULLIF(%[1]s.time_unix_nano, 0), %[1]s.observed_time_unix_nano) >= %[2]d AND COALESCE(NULLIF(%[1]s.time_unix_nano, 0), %[1]s.observed_time_unix_nano) < %[3]d", a, startNS, endNS)
-		}, func(a string, tables map[string]bool) (string, bool) {
-			if !tables["log_records"] {
-				return "", false
-			}
-			return "SELECT * FROM " + a + ".main.log_records AS t ", true
-		}},
-		{"metric_points", func(a string) string {
-			return fmt.Sprintf("WHERE %s.time_unix_nano >= %d AND %s.time_unix_nano < %d", a, startNS, a, endNS)
-		}, func(a string, tables map[string]bool) (string, bool) {
-			if !tables["metric_points"] {
-				return "", false
-			}
-			return "SELECT * FROM " + a + ".main.metric_points AS t ", true
-		}},
-	}
+	tableSpecs := scopedTableSpecs(window, policy)
 	for _, ts := range tableSpecs {
 		var b strings.Builder
 		b.WriteString("INSERT INTO ")
@@ -353,6 +333,74 @@ func spanWindowWhere(alias string, startNS, endNS int64, _ SpanBoundaryPolicy) s
 	return fmt.Sprintf("WHERE %s.start_time_unix_nano >= %d AND %s.start_time_unix_nano < %d", alias, startNS, alias, endNS)
 }
 
+// scopedTableSpec is one logical projection and how to read it from an
+// attached part/segment. Both the copy builder and the zero-copy view builder
+// use the same predicates so their results are identical.
+type scopedTableSpec struct {
+	table string
+	where func(alias string) string
+	// selectSQL returns the source projection for one attached ref. Spec 034
+	// parts carry `part_meta` instead of `otlp_batches`; the batch projection
+	// is synthesized from it (without the raw payload blobs) so analysis and
+	// coverage keep working unchanged.
+	selectSQL func(alias string, tables map[string]bool) (string, bool)
+}
+
+func scopedTableSpecs(window TimeWindow, policy SpanBoundaryPolicy) []scopedTableSpec {
+	startNS, endNS := window.StartNS(), window.EndNS()
+	lag := DefaultIngestLag.Milliseconds()
+	loMS, hiMS := window.Start.UnixMilli()-lag, window.End.UnixMilli()+lag
+	return []scopedTableSpec{
+		{"otlp_batches", func(a string) string {
+			return fmt.Sprintf("WHERE epoch_ms(%s.received_at) >= %d AND epoch_ms(%s.received_at) < %d", a, loMS, a, hiMS)
+		}, func(a string, tables map[string]bool) (string, bool) {
+			if tables["otlp_batches"] {
+				return "SELECT * FROM " + a + ".main.otlp_batches AS t ", true
+			}
+			if tables["part_meta"] {
+				return "SELECT instance_id, source_key, request_id, signal, received_at, content_encoding, " +
+					"wire_sha256, payload_sha256, record_count, payload_length, resource_summary, " +
+					"CAST('' AS BLOB) AS wire_payload, CAST('' AS BLOB) AS payload " +
+					"FROM " + a + ".main.part_meta AS t ", true
+			}
+			return "", false
+		}},
+		{"spans", func(a string) string {
+			return spanWindowWhere(a, startNS, endNS, policy)
+		}, func(a string, tables map[string]bool) (string, bool) {
+			if !tables["spans"] {
+				return "", false
+			}
+			return "SELECT * FROM " + a + ".main.spans AS t ", true
+		}},
+		{"log_records", func(a string) string {
+			return fmt.Sprintf("WHERE COALESCE(NULLIF(%[1]s.time_unix_nano, 0), %[1]s.observed_time_unix_nano) >= %[2]d AND COALESCE(NULLIF(%[1]s.time_unix_nano, 0), %[1]s.observed_time_unix_nano) < %[3]d", a, startNS, endNS)
+		}, func(a string, tables map[string]bool) (string, bool) {
+			if !tables["log_records"] {
+				return "", false
+			}
+			return "SELECT * FROM " + a + ".main.log_records AS t ", true
+		}},
+		{"metric_points", func(a string) string {
+			return fmt.Sprintf("WHERE %s.time_unix_nano >= %d AND %s.time_unix_nano < %d", a, startNS, a, endNS)
+		}, func(a string, tables map[string]bool) (string, bool) {
+			if !tables["metric_points"] {
+				return "", false
+			}
+			return "SELECT * FROM " + a + ".main.metric_points AS t ", true
+		}},
+	}
+}
+
+// baselineSourceSQL returns the pre-window cumulative metric projection of one
+// attached ref (or false when it has no metric_points table).
+func baselineSourceSQL(alias string, startNS, baseFromNS int64, tables map[string]bool) (string, bool) {
+	if !tables["metric_points"] {
+		return "", false
+	}
+	return fmt.Sprintf("SELECT * FROM %s.main.metric_points AS t WHERE t.aggregation_temporality = 2 AND t.time_unix_nano < %d AND t.time_unix_nano >= %d", alias, startNS, baseFromNS), true
+}
+
 func computeScopedCoverage(ctx context.Context, e *Engine, window TimeWindow, refs []SegmentRef, policy SpanBoundaryPolicy) (ScopedCoverage, error) {
 	cov := ScopedCoverage{SegmentsRestored: len(refs)}
 	instances := map[string]struct{}{}
@@ -419,13 +467,16 @@ func attachedTableSet(ctx context.Context, db *sql.DB, alias string) (map[string
 	return tables, rows.Err()
 }
 
-// scopedSchemaDDL mirrors the compacted segment schema. It is created empty and
-// then filled only with in-window rows.
-const scopedSchemaDDL = `
+// Each scoped projection is declared separately so the zero-copy builder can
+// create an empty table only for a projection that no attached part provides,
+// while the copy builder composes them all into one scratch database.
+const schemaMetaDDL = `
 CREATE TABLE IF NOT EXISTS schema_meta (
   key   VARCHAR PRIMARY KEY,
   value VARCHAR NOT NULL
-);
+);`
+
+const otlpBatchesDDL = `
 CREATE TABLE IF NOT EXISTS otlp_batches (
   instance_id      VARCHAR NOT NULL,
   source_key       VARCHAR NOT NULL,
@@ -440,7 +491,9 @@ CREATE TABLE IF NOT EXISTS otlp_batches (
   resource_summary VARCHAR,
   wire_payload     BLOB    NOT NULL,
   payload          BLOB    NOT NULL
-);
+);`
+
+const spansDDL = `
 CREATE TABLE IF NOT EXISTS spans (
   instance_id              VARCHAR NOT NULL,
   source_key               VARCHAR NOT NULL,
@@ -467,7 +520,9 @@ CREATE TABLE IF NOT EXISTS spans (
   dropped_links_count      BIGINT,
   events_count             BIGINT,
   links_count              BIGINT
-);
+);`
+
+const logRecordsDDL = `
 CREATE TABLE IF NOT EXISTS log_records (
   instance_id              VARCHAR NOT NULL,
   source_key               VARCHAR NOT NULL,
@@ -488,7 +543,9 @@ CREATE TABLE IF NOT EXISTS log_records (
   event_name               VARCHAR,
   flags                    BIGINT,
   dropped_attributes_count BIGINT
-);
+);`
+
+const metricPointsDDL = `
 CREATE TABLE IF NOT EXISTS metric_points (
   instance_id             VARCHAR NOT NULL,
   source_key              VARCHAR NOT NULL,
@@ -517,7 +574,9 @@ CREATE TABLE IF NOT EXISTS metric_points (
   bucket_counts           VARCHAR,
   explicit_bounds         VARCHAR,
   detail                  VARCHAR
-);
+);`
+
+const baselineMetricsDDL = `
 CREATE TABLE IF NOT EXISTS _burstel_baseline_metrics (
   instance_id             VARCHAR NOT NULL,
   source_key              VARCHAR NOT NULL,
@@ -546,5 +605,8 @@ CREATE TABLE IF NOT EXISTS _burstel_baseline_metrics (
   bucket_counts           VARCHAR,
   explicit_bounds         VARCHAR,
   detail                  VARCHAR
-);
-`
+);`
+
+// scopedSchemaDDL mirrors the compacted segment schema. It is created empty and
+// then filled only with in-window rows.
+const scopedSchemaDDL = schemaMetaDDL + otlpBatchesDDL + spansDDL + logRecordsDDL + metricPointsDDL + baselineMetricsDDL

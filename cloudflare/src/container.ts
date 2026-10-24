@@ -24,8 +24,12 @@ export interface ContainerLike {
 /** Per-shot controller used by {@link ShotCore}. */
 export interface ContainerControl {
   readonly running: boolean;
-  /** Boots the container if needed and forwards its runtime environment. */
-  start(env: Record<string, string>): void;
+  /**
+   * Boots the container if needed and forwards its runtime environment.
+   * Spec 035: `options.internet` enables container egress for this start only
+   * (the analysis path when a bucket-scoped R2 credential is configured).
+   */
+  start(env: Record<string, string>, options?: { internet?: boolean }): void;
   /** Resolves once the recorder answers `GET /readyz` with 200. */
   ensureReady(): Promise<void>;
   /** Proxies an HTTP request into the container via its TCP port. */
@@ -44,10 +48,11 @@ export interface ContainerControl {
 export type ContainerClass = "ShotDO" | "CompactorDO";
 
 /**
- * Spec 033 egress policy: only the CompactorDO (continuous compaction plus the
+ * Spec 033/035 egress policy: the CompactorDO (continuous compaction plus the
  * fixed materializer pool, which performs direct bucket-scoped R2 S3 GET/PUT)
- * gets container internet access. The ShotDO recorder/analysis container never
- * does.
+ * always gets container internet access. The ShotDO recorder never does; its
+ * analysis path opts in per start when a bucket-scoped R2 credential is
+ * configured (direct part download, spec 035).
  */
 export function containerEgressFor(containerClass: ContainerClass): boolean {
   return containerClass === "CompactorDO";
@@ -80,9 +85,10 @@ export function createContainerControl(
       return container.running;
     },
 
-    start(env) {
+    start(env, startOptions) {
       if (container.running) return;
-      container.start({ enableInternet: options.enableInternet === true, env });
+      const internet = startOptions?.internet ?? options.enableInternet === true;
+      container.start({ enableInternet: internet, env });
     },
 
     async keepAlive(durationMs) {

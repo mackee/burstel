@@ -273,6 +273,45 @@ GOMAXPROCS workers, and appends with a single-writer goroutine per table (two
 per analysis table by default) into a part with **no secondary indexes**. The
 container class is `standard-4` (see the deploy doc's cost bounds).
 
+## Zero-copy window analysis (spec 035)
+
+`shot analyze` no longer copies every part into one DuckDB. The analysis
+container ATTACHes each verified part read-only and exposes the five logical
+tables as `UNION ALL` views with the same window predicates; `materialize_ms`
+drops to zero and opening a shot is only an ATTACH. The analysis container is
+`standard-4`.
+
+```text
+analysis.container.start      cached parts -> attach only
+analysis.session.preload     MaterializeDO alarm -> ShotDO alarm -> open/download/commit
+analysis.window.open          download=true; cached_keys returns every selected part
+analysis.part.download        streamed=0 (direct R2 download in the container)
+analysis.window.commit        reused=true when the shot/parts did not change
+```
+
+* **Direct part download.** When `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
+  `R2_ACCOUNT_ID` and `R2_BUCKET_NAME` are all configured, the analysis
+  container gets that bucket-scoped credential and container egress; it fetches
+  selected parts from R2 with `ANALYSIS_FETCH_PARALLELISM` concurrent GETs
+  (default 16) and verifies size + SHA-256 before caching. The Worker
+  (`analysis.part.download streamed=0`) then sends no part bytes. Without a
+  complete credential the Worker keeps the legacy streaming path and the
+  container stays isolated.
+* **Preload.** When a materialization run reaches `complete`, the
+  `MaterializeDO` alarm posts the window and parts to the ShotDO's durable
+  preload flag; the ShotDO alarm opens the session, downloads the parts and
+  commits the views. `shot analyze` therefore only runs queries on a warm shot.
+* **Session reuse.** A repeated open of the same shot with the same
+  window/catalog reuses the attached session and its cached parts; commit
+  returns `timings.reused=true` instead of re-ATTACHing.
+* **Timeout UX.** `burstel-cli shot analyze` defaults to a 180 s HTTP timeout
+  (`--timeout` overrides it). The Worker answers `202 {"state":"preparing",
+  "retry_after_ms":5000}` while the shot's materialization is still
+  pending/running instead of blocking past 60 s.
+* **Capacity.** `MATERIALIZE_PARALLELISM=5` with `CompactorDO max_instances=6`
+  leaves one container slot for continuous compaction; preflight enforces
+  `P <= max_instances - 1`.
+
 ## Shared multi-user access (spec 013, Part B)
 
 A deployment can be shared by several people, each with their **own revocable
@@ -688,7 +727,8 @@ scripts/cloudflare-preflight.sh                 # full read-only preflight (auth
 ```
 
 `cloudflare/src/preflight.ts` + `cloudflare/scripts/preflight.mjs` validate the
-`wrangler.jsonc` invariants (ShotDO container, `standard-1`, bounded
+`wrangler.jsonc` invariants (ShotDO and CompactorDO containers on
+`standard-4`, bounded
 `max_instances`, SQLite `ShotDO`/`IngestDO`/`AuthDO` exports,
 `BUCKET -> burstel-shots`, no anonymous admin) and parse read-only
 `wrangler whoami --json`, `wrangler secret list` (names only) and R2 bucket

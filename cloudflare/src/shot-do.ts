@@ -9,11 +9,12 @@ import { DurableObject } from "cloudflare:workers";
 
 import { createR2Sink } from "./artifacts";
 import type { R2BucketLike } from "./artifacts";
-import { resolveInternalToken } from "./auth";
+import { resolveAnalysisContainerEnv } from "./analysis-env";import { resolveInternalToken } from "./auth";
 import { containerEgressFor, createContainerControl } from "./container";
 import type { ContainerLike } from "./container";
 import { ShotCore } from "./core";
-import { json } from "./http";
+import type { AnalysisPreload } from "./core";
+import { json, readJson } from "./http";
 import type { SqlCursor, SqlValue, SyncSql } from "./store";
 
 export interface Env extends Cloudflare.Env {
@@ -27,6 +28,15 @@ export interface Env extends Cloudflare.Env {
   CONTAINER_PORT?: string;
   /** R2 key prefix; defaults to `shots`. */
   ARTIFACT_PREFIX?: string;
+  /**
+   * Spec 035: bucket-scoped R2 S3 credential for direct part download in the
+   * analysis container. Egress is enabled only when all four are present.
+   */
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  R2_ACCOUNT_ID?: string;
+  R2_BUCKET_NAME?: string;
+  ANALYSIS_FETCH_PARALLELISM?: string;
   /**
    * Trusted local-development escape hatch. When set to `1`/`true`, admin
    * endpoints accept requests even when `BURSTEL_API_TOKEN` is unset. Never set
@@ -51,6 +61,10 @@ export class ShotDO extends DurableObject<Env> {
       enableInternet: containerEgressFor("ShotDO"),
     });
     const artifacts = createR2Sink(env.BUCKET as unknown as R2BucketLike);
+    // Spec 035: direct R2 part download for the analysis container. The
+    // credential and egress are only enabled when a bucket-scoped R2 S3
+    // credential is configured; otherwise the Worker streams parts.
+    const analysis = resolveAnalysisContainerEnv(env);
 
     // The container's internal bearer token must be distinct from the admin
     // token and is never derived from it. In production a missing/equal token
@@ -75,6 +89,8 @@ export class ShotDO extends DurableObject<Env> {
       internalTokenReady: internal.ok,
       internalTokenError: internal.ok ? undefined : internal.reason,
       containerEnv,
+      analysisEnv: analysis.env,
+      analysisEgress: analysis.directDownload,
       artifactPrefix: env.ARTIFACT_PREFIX,
       // The recording heartbeat runs on this DO's alarm.
       scheduler: { set: (atMs) => ctx.storage.setAlarm(atMs) },
@@ -99,6 +115,29 @@ export class ShotDO extends DurableObject<Env> {
       await this.ctx.storage.setAlarm(Date.now());
       return json(202, { shot_id: this.ctx.id.name ?? this.ctx.id.toString(), prewarm: "scheduled" });
     }
+    if (path === "/internal/analysis/preload") {
+      if (request.method !== "POST") return json(405, { error: "method not allowed" });
+      // Spec 035: the MaterializeDO alarm asks this ShotDO to open the shot
+      // session and download its parts. Only a durable flag plus an alarm are
+      // written here; the alarm owns the container work.
+      let body: Partial<AnalysisPreload>;
+      try {
+        body = await readJson<Partial<AnalysisPreload>>(request);
+      } catch (error) {
+        return json(400, { error: error instanceof Error ? error.message : String(error), code: "bad_request" });
+      }
+      if (!body.window || !Array.isArray(body.parts)) {
+        return json(400, { error: "window and parts are required", code: "bad_request" });
+      }
+      const preload: AnalysisPreload = {
+        window: body.window,
+        parts: body.parts,
+        at: Date.now(),
+      };
+      await this.ctx.storage.put("analysis_preload", preload);
+      await this.ctx.storage.setAlarm(Date.now());
+      return json(202, { shot_id: this.ctx.id.name ?? this.ctx.id.toString(), preload: "scheduled" });
+    }
     return this.core.handleInternal(request);
   }
 
@@ -108,6 +147,16 @@ export class ShotDO extends DurableObject<Env> {
       await this.ctx.storage.delete("analysis_prewarm_at");
       await this.core.prewarmAnalysis().catch((error) => {
         console.warn("analysis.container.prewarm.failure", {
+          shot_id: this.ctx.id.name ?? this.ctx.id.toString(),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+    const preload = await this.ctx.storage.get<AnalysisPreload>("analysis_preload");
+    if (preload) {
+      await this.ctx.storage.delete("analysis_preload");
+      await this.core.preloadAnalysis(preload).catch((error) => {
+        console.warn("analysis.session.preload.failure", {
           shot_id: this.ctx.id.name ?? this.ctx.id.toString(),
           error: error instanceof Error ? error.message : String(error),
         });

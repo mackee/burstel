@@ -386,7 +386,7 @@ func TestWindowStoreCachesPartsAcrossSessions(t *testing.T) {
 
 	// A second session for the same shot must reuse the cached part and report
 	// its key so the Worker can skip the R2 download entirely.
-	_, cached, err := store.OpenWindowWithCache("s2", window, []analysis.SegmentMeta{meta})
+	_, cached, err := store.OpenWindowWithCache(ctx, "s2", window, []analysis.SegmentMeta{meta}, false)
 	if err != nil {
 		t.Fatalf("OpenWindowWithCache: %v", err)
 	}

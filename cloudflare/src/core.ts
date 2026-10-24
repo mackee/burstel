@@ -77,6 +77,29 @@ export interface HeartbeatScheduler {
   set(atMs: number): Promise<void> | void;
 }
 
+/** One materialization part the analysis container downloads directly (spec 035). */
+export interface PreloadPart {
+  object_key: string;
+  size_bytes: number;
+  sha256: string;
+  first_received_at?: number;
+  last_received_at?: number;
+}
+
+/** Durable preload request written by the MaterializeDO alarm (spec 035). */
+export interface AnalysisPreload {
+  window: {
+    start: string;
+    end: string;
+    provenance?: string;
+    clock_trust?: string;
+    instances?: string[];
+    name?: string;
+  };
+  parts: PreloadPart[];
+  at?: number;
+}
+
 export interface ShotCoreDeps {
   shotId: string;
   sql: SyncSql;
@@ -96,6 +119,12 @@ export interface ShotCoreDeps {
   internalTokenError?: "missing" | "not_distinct";
   /** Extra environment for the container process. */
   containerEnv?: Record<string, string>;
+  /**
+   * Spec 035: extra environment for the analysis container (bucket-scoped R2
+   * credential) and whether that path may use container egress.
+   */
+  analysisEnv?: Record<string, string>;
+  analysisEgress?: boolean;
   /** R2 key prefix; defaults to `shots`. */
   artifactPrefix?: string;
   drainTimeoutMs?: number;
@@ -129,6 +158,8 @@ export class ShotCore {
   private readonly internalTokenReady: boolean;
   private readonly internalTokenError: "missing" | "not_distinct";
   private readonly extraEnv: Record<string, string>;
+  private readonly analysisExtraEnv: Record<string, string>;
+  private readonly analysisEgress: boolean;
   private readonly prefix: string;
   private readonly drainTimeoutMs: number;
   private readonly analysisMaxRows: number;
@@ -157,6 +188,8 @@ export class ShotCore {
     this.internalTokenReady = deps.internalTokenReady ?? true;
     this.internalTokenError = deps.internalTokenError ?? "missing";
     this.extraEnv = deps.containerEnv ?? {};
+    this.analysisExtraEnv = deps.analysisEnv ?? {};
+    this.analysisEgress = deps.analysisEgress === true;
     this.prefix = deps.artifactPrefix ?? "shots";
     this.drainTimeoutMs = deps.drainTimeoutMs ?? DEFAULT_DRAIN_TIMEOUT_MS;
     this.analysisMaxRows = deps.analysisMaxRows ?? 1000;
@@ -605,7 +638,7 @@ export class ShotCore {
     this.requireInternalAuth();
     if (!this.container.running) {
       const started = Date.now();
-      this.container.start(this.analysisEnvironment());
+      this.container.start(this.analysisEnvironment(), { internet: this.analysisEgress });
       await this.container.ensureReady();
       await this.container.keepAlive(ANALYSIS_KEEPALIVE_MS).catch(() => undefined);
       this.analysisRestored.clear();
@@ -624,6 +657,47 @@ export class ShotCore {
   async prewarmAnalysis(): Promise<void> {
     await this.ensureLoaded();
     await this.ensureAnalysisOnly();
+  }
+
+  /**
+   * Spec 035: open the shot's window session, download every part directly from
+   * R2 and commit the zero-copy views. Runs from the ShotDO alarm after the
+   * MaterializeDO reports a complete run, so `shot analyze` only runs queries.
+   * A no-op when direct part download is not configured (the Worker then keeps
+   * streaming part bytes into the session).
+   */
+  async preloadAnalysis(preload: AnalysisPreload): Promise<void> {
+    await this.ensureLoaded();
+    if (!this.analysisEgress) return;
+    await this.ensureAnalysisOnly();
+    const startMs = Date.parse(preload.window.start);
+    const endMs = Date.parse(preload.window.end);
+    const catalog = preload.parts.map((part) => ({
+      key: part.object_key,
+      instance_id: "all",
+      instance: "",
+      status: "verified",
+      size: part.size_bytes,
+      sha256: part.sha256,
+      first_received_at: part.first_received_at || (Number.isFinite(startMs) ? startMs : 0),
+      last_received_at: part.last_received_at || (Number.isFinite(endMs) ? endMs : 0),
+      event_min_ns: null,
+      event_max_ns: null,
+    }));
+    const started = Date.now();
+    const out = await this.analysisJson("/internal/window/preload", {
+      session_id: `w-${this.shotId}`,
+      window: preload.window,
+      catalog,
+      download: true,
+    });
+    console.log("analysis.session.preload", {
+      shot_id: this.shotId,
+      parts: catalog.length,
+      duration_ms: Date.now() - started,
+      cached_parts: Array.isArray(out.cached_keys) ? out.cached_keys.length : undefined,
+      timings: out.timings ?? undefined,
+    });
   }
 
   /** Opens a logical-window session and returns the justified segment selection. */
@@ -732,7 +806,7 @@ export class ShotCore {
   private async ensureAnalysis(selfFreeze: FreezeMetadata): Promise<void> {
     this.requireInternalAuth();
     if (!this.container.running) {
-      this.container.start(this.analysisEnvironment());
+      this.container.start(this.analysisEnvironment(), { internet: this.analysisEgress });
       await this.container.ensureReady();
       // Best effort: analysis containers are cheap to recreate from R2.
       await this.container.keepAlive(ANALYSIS_KEEPALIVE_MS).catch(() => undefined);
@@ -801,7 +875,7 @@ export class ShotCore {
   }
 
   private analysisEnvironment(): Record<string, string> {
-    const env = this.containerEnvironment();
+    const env = { ...this.containerEnvironment(), ...this.analysisExtraEnv };
     env["BURSTEL_ANALYSIS"] = "1";
     return env;
   }

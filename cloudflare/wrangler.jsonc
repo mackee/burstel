@@ -49,11 +49,11 @@
     "COMPACTION_LEASE_TTL_MS": "900000",
     // Spec 029: explicit CompactorCore -> container request deadline.
     "COMPACTION_CONTAINER_TIMEOUT_MS": "60000",
-    // Spec 033: fixed materializer pool `materializer-0..P-1`. P must stay at
-    // least one below the CompactorDO max_instances (4) so continuous
+    // Spec 033/035: fixed materializer pool `materializer-0..P-1`. P must stay
+    // at least one below the CompactorDO max_instances (6) so continuous
     // compaction always has a container slot.
-    "MATERIALIZE_PARALLELISM": "3",
-    "MATERIALIZE_MAX_INSTANCES": "4",
+    "MATERIALIZE_PARALLELISM": "5",
+    "MATERIALIZE_MAX_INSTANCES": "6",
     "MATERIALIZE_WAIT_MS": "90000",
     "MATERIALIZE_MAX_OBJECTS": "200000",
     // Spec 032: the coordinator DO alarm owns the run. Parts have a lease and
@@ -83,6 +83,8 @@
     "MATERIALIZE_MAX_PART_TIMEOUT_MS": "600000",
     // Spec 034: parallel pipeline defaults (container-side).
     "MATERIALIZE_CONCURRENCY": "32",
+    // Spec 035: concurrent direct R2 part downloads in the analysis container.
+    "ANALYSIS_FETCH_PARALLELISM": "16",
     // Spec 031 D1: the bucket whose scoped token is injected into the
     // compactor/materializer container. The credential itself is a Worker secret.
     "R2_BUCKET_NAME": "burstel-shots"
@@ -96,7 +98,11 @@
       // repository root so the Dockerfile can `COPY` the Go sources.
       "image": "../Dockerfile",
       "image_build_context": "..",
-      "instance_type": "standard-1",
+      // Spec 035: the ShotDO hosts the analysis container, which now ATTACHes
+      // every part zero-copy and downloads parts directly from R2. standard-4
+      // (4 vCPU / 12 GiB) bounds query and download latency; legacy recording
+      // shots share the same class and therefore the same size.
+      "instance_type": "standard-4",
       // A limited number of concurrent Container instances; exceeding this is
       // surfaced to clients as a retryable capacity error.
       "max_instances": 10
@@ -109,12 +115,12 @@
       "image": "../Dockerfile.compactor",
       "image_build_context": "..",
       // Spec 034 R2: the materializer containers build projection-only parts
-      // with a parallel appender pipeline. `standard-4` (4 vCPU / 8 GiB) is the
-      // documented cost/throughput choice; ShotDO stays on `standard-1`.
+      // with a parallel appender pipeline. `standard-4` (4 vCPU / 12 GiB) is the
+      // documented cost/throughput choice.
       "instance_type": "standard-4",
-      // Spec 031: up to four parallel materializer containers per shot. The
-      // fenced lease still enforces a single active *compaction* per partition.
-      "max_instances": 4
+      // Spec 035: six instances leave five parallel materializers plus one
+      // CompactorDO slot for continuous compaction (P <= max - 1, preflight).
+      "max_instances": 6
     }
   ],
 

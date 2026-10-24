@@ -22,6 +22,7 @@ import type { MaterializePrewarmState, MaterializeRunState } from "./materialize
 export interface MaterializeEnv {
   INGEST_DO?: unknown;
   COMPACTOR_DO?: unknown;
+  SHOT_DO?: unknown;
   MATERIALIZE_PARALLELISM?: string;
   MATERIALIZE_MAX_INSTANCES?: string;
   MATERIALIZE_MAX_ATTEMPTS?: string;
@@ -69,8 +70,8 @@ export class MaterializeDO extends DurableObject<MaterializeEnv> {
       scheduler: { set: (atMs) => ctx.storage.setAlarm(atMs) },
       now: () => Date.now(),
       config: {
-        parallelism: int(env.MATERIALIZE_PARALLELISM, 3),
-        maxInstances: int(env.MATERIALIZE_MAX_INSTANCES, 4),
+        parallelism: int(env.MATERIALIZE_PARALLELISM, 5),
+        maxInstances: int(env.MATERIALIZE_MAX_INSTANCES, 6),
         maxAttempts: int(env.MATERIALIZE_MAX_ATTEMPTS, 3),
         leaseTtlMs: int(env.MATERIALIZE_LEASE_TTL_MS, 300_000),
         retryDelayMs: int(env.MATERIALIZE_RETRY_MS, 5_000),
@@ -83,6 +84,9 @@ export class MaterializeDO extends DurableObject<MaterializeEnv> {
         partSpansPerKiB: int(env.MATERIALIZE_SPANS_PER_KIB, 40),
       },
       log: (message, fields) => console.log(message, fields ?? {}),
+      // Spec 035: a complete run arms the ShotDO alarm, which opens the shot
+      // session and downloads the parts before `shot analyze` is called.
+      preloadAnalysis: (shotId) => this.notifyAnalysisPreload(shotId),
     });
   }
 
@@ -144,9 +148,47 @@ export class MaterializeDO extends DurableObject<MaterializeEnv> {
     await this.driver.alarm();
   }
 
+  /**
+   * Spec 035: posts the completed shot window and parts to the ShotDO. The
+   * ShotDO persists them and its alarm downloads and attaches the parts; this
+   * method never touches the analysis container itself.
+   */
+  private async notifyAnalysisPreload(shotId: string): Promise<void> {
+    const shot = (this.env as unknown as { SHOT_DO?: { getByName(name: string): { fetch(request: Request): Promise<Response> } } })
+      .SHOT_DO;
+    if (!shot) return;
+    const record = await this.loadShot(shotId);
+    if (!record?.window) return;
+    if (record.materialization?.state !== "complete") {
+      throw new Error(`materialization for shot ${shotId} is ${record.materialization?.state ?? "unknown"}, not complete`);
+    }
+    const window = record.window;
+    const resp = await shot.getByName(shotId).fetch(
+      new Request(`${DO_ORIGIN}/internal/analysis/preload`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          shot_id: shotId,
+          window: {
+            start: new Date(window.start_ms).toISOString(),
+            end: new Date(window.end_ms).toISOString(),
+            provenance: window.provenance,
+            clock_trust: window.clock_trust,
+            instances: window.instances,
+            name: window.name,
+          },
+          parts: record.materialization.parts,
+        }),
+      }),
+    );
+    await resp.body?.cancel().catch(() => undefined);
+    if (resp.status < 200 || resp.status >= 300) {
+      throw new Error(`analysis preload request failed with status ${resp.status}`);
+    }
+  }
+
   /** Reads the authoritative shot record from the ControlDO. */
-  private async loadShot(shotId: string): Promise<WindowShotRecord | null> {
-    const ingest = (this.env as unknown as { INGEST_DO: IngestNamespaceLike }).INGEST_DO;
+  private async loadShot(shotId: string): Promise<WindowShotRecord | null> {    const ingest = (this.env as unknown as { INGEST_DO: IngestNamespaceLike }).INGEST_DO;
     const resp = await ingest.getByName("ingest-primary").fetch(
       new Request(`${DO_ORIGIN}/internal/shot/get`, {
         method: "POST",

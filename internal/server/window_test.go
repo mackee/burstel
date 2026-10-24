@@ -5,14 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mackee/burstel/internal/analysis"
 	"github.com/mackee/burstel/internal/compaction"
+	"github.com/mackee/burstel/internal/config"
 	"github.com/mackee/burstel/internal/otlp"
 )
 
@@ -201,6 +204,94 @@ func TestWindowSessionMissingSegmentIncomplete(t *testing.T) {
 	resp = h.postJSON("/internal/window/query", testToken, map[string]any{"session_id": "sess-2", "sql": "SELECT count(*) FROM spans"})
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("query status %d", resp.StatusCode)
+	}
+	resp.Body.Close()
+}
+
+// Spec 035: the container downloads the shot's parts directly from R2 and the
+// preload endpoint opens, downloads and commits the session in one call.
+func TestWindowPreloadDownloadsPartsDirectly(t *testing.T) {
+	start := time.Now().UTC().Add(-5 * time.Minute).Truncate(time.Second)
+	window := analysis.NewServerWindow(start, start.Add(2*time.Minute), []string{"web-1"}, "preload")
+
+	key := "journal/inst-web/traces/preload.bin"
+	// Build the part first so its verified bytes are known.
+	tmp := newHarness(t)
+	meta, raw := buildWindowSegment(t, tmp.dir, key, "inst-web", "web-1", start.Add(time.Minute), []otlp.Span{
+		{Name: "GET /", ServiceName: "web-1", StartTimeUnixNano: uint64(window.StartNS() + 10), EndTimeUnixNano: uint64(window.StartNS() + 20), StatusCode: "STATUS_CODE_OK"},
+	})
+
+	var hits int32
+	objects := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, key) {
+			atomic.AddInt32(&hits, 1)
+			_, _ = w.Write(raw)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer objects.Close()
+
+	h := newHarnessWith(t, config.Config{
+		DataDir:                  t.TempDir(),
+		R2AccessKeyID:            "test-key",
+		R2SecretAccessKey:        "test-secret",
+		R2Bucket:                 "burstel-test",
+		R2Endpoint:               objects.URL,
+		AnalysisFetchParallelism: 2,
+	})
+
+	resp := h.postJSON("/internal/window/preload", testToken, analysis.WindowOpenRequest{
+		SessionID: "preload-1",
+		Window:    window,
+		Catalog:   []analysis.SegmentMeta{meta},
+		Download:  true,
+	})
+	if resp.StatusCode != http.StatusOK {
+		buf := new(bytes.Buffer)
+		_, _ = buf.ReadFrom(resp.Body)
+		t.Fatalf("preload status %d: %s", resp.StatusCode, buf.String())
+	}
+	var preloaded analysis.WindowPreloadResponse
+	if err := json.NewDecoder(resp.Body).Decode(&preloaded); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if !preloaded.Coverage.Complete {
+		t.Fatalf("preload coverage = %+v", preloaded.Coverage)
+	}
+	if len(preloaded.CachedKeys) != 1 || preloaded.CachedKeys[0] != key {
+		t.Fatalf("cached keys = %v", preloaded.CachedKeys)
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("direct R2 GETs = %d, want 1", got)
+	}
+
+	// The preloaded session is already committed: analysis runs queries only.
+	resp = h.postJSON("/internal/window/query", testToken, map[string]any{"session_id": "preload-1", "sql": "SELECT count(*) FROM spans"})
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("query status %d", resp.StatusCode)
+	}
+	var qr analysis.QueryResult
+	if err := json.NewDecoder(resp.Body).Decode(&qr); err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if qr.RowCount != 1 {
+		t.Fatalf("query rows = %d", qr.RowCount)
+	}
+
+	// Without a bucket-scoped credential the endpoint fails closed and the
+	// Worker keeps the legacy streaming path.
+	plain := newHarness(t)
+	resp = plain.postJSON("/internal/window/preload", testToken, analysis.WindowOpenRequest{
+		SessionID: "preload-2",
+		Window:    window,
+		Catalog:   []analysis.SegmentMeta{meta},
+		Download:  true,
+	})
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("preload without R2 credential = %d, want 503", resp.StatusCode)
 	}
 	resp.Body.Close()
 }

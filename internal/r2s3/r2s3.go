@@ -110,6 +110,24 @@ func (c *Client) Get(ctx context.Context, key string) ([]byte, error) {
 	return data, nil
 }
 
+// GetTo streams one object into w and returns the number of bytes written.
+//
+// Spec 035: the analysis container downloads materialization parts directly
+// from R2 and verifies the SHA-256 while writing, so it needs a streaming GET
+// that never holds the whole part in memory.
+func (c *Client) GetTo(ctx context.Context, key string, w io.Writer) (int64, error) {
+	resp, err := c.do(ctx, http.MethodGet, key, nil, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close() //nolint:errcheck
+	n, err := io.Copy(w, resp.Body)
+	if err != nil {
+		return n, fmt.Errorf("r2s3: read %s: %w", key, err)
+	}
+	return n, nil
+}
+
 // Put uploads one object, replacing any existing value at key.
 func (c *Client) Put(ctx context.Context, key string, data []byte, contentType string) error {
 	headers := map[string]string{}

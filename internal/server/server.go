@@ -13,6 +13,7 @@ import (
 	"github.com/mackee/burstel/internal/analysis"
 	"github.com/mackee/burstel/internal/config"
 	"github.com/mackee/burstel/internal/otlp"
+	"github.com/mackee/burstel/internal/r2s3"
 	"github.com/mackee/burstel/internal/recorder"
 )
 
@@ -34,7 +35,23 @@ func New(cfg config.Config, rec *recorder.Recorder) *Server {
 		sem: make(chan struct{}, cfg.MaxInflight),
 	}
 	s.analysis = analysis.NewStore(filepath.Join(cfg.DataDir, "analysis"), analysis.StoreOptions{})
-	s.window = analysis.NewWindowStore(filepath.Join(cfg.DataDir, "windows"), analysis.WindowStoreOptions{})
+	var fetcher analysis.ObjectFetcher
+	if cfg.R2AccessKeyID != "" && cfg.R2SecretAccessKey != "" && cfg.R2Bucket != "" && (cfg.R2AccountID != "" || cfg.R2Endpoint != "") {
+		client, err := r2s3.New(r2s3.Config{
+			AccountID:       cfg.R2AccountID,
+			AccessKeyID:     cfg.R2AccessKeyID,
+			SecretAccessKey: cfg.R2SecretAccessKey,
+			Bucket:          cfg.R2Bucket,
+			Endpoint:        cfg.R2Endpoint,
+		})
+		if err == nil {
+			fetcher = client
+		}
+	}
+	s.window = analysis.NewWindowStore(filepath.Join(cfg.DataDir, "windows"), analysis.WindowStoreOptions{
+		Fetcher:          fetcher,
+		FetchParallelism: cfg.AnalysisFetchParallelism,
+	})
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", s.handleHealth)
@@ -58,6 +75,7 @@ func New(cfg config.Config, rec *recorder.Recorder) *Server {
 	// verified segment bytes streamed by the Durable Object; user SQL only runs
 	// against the resulting shot-scoped snapshot.
 	mux.HandleFunc("POST /internal/window/open", s.internal(s.handleWindowOpen))
+	mux.HandleFunc("POST /internal/window/preload", s.internal(s.handleWindowPreload))
 	mux.HandleFunc("POST /internal/window/segment", s.internal(s.handleWindowSegment))
 	mux.HandleFunc("POST /internal/window/commit", s.internal(s.handleWindowCommit))
 	mux.HandleFunc("POST /internal/window/query", s.internal(s.handleWindowQuery))

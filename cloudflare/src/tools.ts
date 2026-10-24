@@ -69,6 +69,12 @@ export interface ToolContext {
   materialize?: MaterializeOptions;
   /** Spec 032 Durable Object alarm driver, keyed by shot id. */
   materializer?: MaterializerNamespaceLike;
+  /**
+   * Spec 035: the analysis container downloads parts directly from R2. When
+   * true the Worker never streams part bytes; when false (no bucket-scoped
+   * credential) the legacy streaming path stays in place.
+   */
+  partDownload?: boolean;
 }
 
 export interface FreezeRef {
@@ -751,6 +757,36 @@ export async function queryShot(
   return doJson(stub, "/internal/analysis/query", "POST", { sql, max_rows: maxRows });
 }
 
+/**
+ * Spec 035: returns a `202 {state: preparing}` body while a window shot's
+ * materialization run is still pending/running, instead of letting the HTTP
+ * request block past the Worker's 60 s limit. A terminal `failed` run keeps its
+ * existing error path, and a shot without materialization metadata (pre-031
+ * backlog) falls through to the normal segment analysis.
+ */
+export async function analyzeReadiness(
+  ctx: ToolContext,
+  shotId: string,
+): Promise<Record<string, unknown> | null> {
+  requireShotId(shotId);
+  if (!ctx.materializer) return null;
+  const record = await getShotRecord(ctx, shotId);
+  if (!record || record.kind !== "window" || !record.window) return null;
+  const state = record.materialization?.state;
+  if (state !== "pending" && state !== "running") return null;
+  return {
+    shot_id: record.shot_id,
+    kind: "window",
+    state: "preparing",
+    materialization_state: state,
+    parts_done: record.materialization?.parts_done ?? 0,
+    parts_total: record.materialization?.parts_total ?? 0,
+    retry_after_ms: 5_000,
+    message:
+      "materialization is still running; retry in about 5 s. The analysis session opens and downloads parts as soon as the run completes.",
+  };
+}
+
 export async function analyzeShot(
   ctx: ToolContext,
   shotId: string,
@@ -887,7 +923,9 @@ async function openWindowSession(
   lookback_in_range: boolean;
   lookback_floor_ms: number | null;
 }> {
-  if (!ctx.bucket) throw new HttpError(503, "window analysis requires the object bucket binding", true, "bucket_unavailable");
+  if (!ctx.bucket && ctx.partDownload !== true) {
+    throw new HttpError(503, "window analysis requires the object bucket binding", true, "bucket_unavailable");
+  }
   const instances = await ingestCall<{ instances: InstanceMetadata[] }>(ctx, "/internal/instance/list", "GET").catch(
     () => ({ instances: [] as InstanceMetadata[] }),
   );
@@ -913,6 +951,7 @@ async function openWindowSession(
       session_id: sessionId,
       window: windowWire(window),
       catalog: catalogWire,
+      download: ctx.partDownload === true,
     });
     const cached = cachedKeysFromOpen(opened);
     console.log("analysis.window.open", {
@@ -921,27 +960,35 @@ async function openWindowSession(
       open_ms: Date.now() - openStarted,
       parts: parts.length,
       cached_parts: cached.size,
+      direct_download: ctx.partDownload === true,
       timings: opened.timings ?? undefined,
     });
     let downloadMs = 0;
     let streamed = 0;
-    for (const part of parts) {
-      if (cached.has(part.object_key)) continue;
-      const started = Date.now();
-      const object = await ctx.bucket.get(part.object_key);
-      if (!object || !object.body) {
-        throw new HttpError(503, `materialization part ${part.object_key} is missing from R2`, true, "part_missing");
+    // Spec 035: with a bucket-scoped credential the container already fetched
+    // (and verified) every selected part during open; the Worker sends no bytes.
+    if (ctx.partDownload !== true) {
+      for (const part of parts) {
+        if (cached.has(part.object_key)) continue;
+        const started = Date.now();
+        if (!ctx.bucket) {
+          throw new HttpError(503, "window analysis requires the object bucket binding", true, "bucket_unavailable");
+        }
+        const object = await ctx.bucket.get(part.object_key);
+        if (!object || !object.body) {
+          throw new HttpError(503, `materialization part ${part.object_key} is missing from R2`, true, "part_missing");
+        }
+        await doRawJson(stub, "/internal/window/segment", {
+          "content-type": "application/octet-stream",
+          "x-burstel-session-id": sessionId,
+          "x-burstel-segment-key": part.object_key,
+          "x-burstel-segment-instance": "",
+          "x-burstel-size": String(part.size_bytes),
+          "x-burstel-sha256": part.sha256,
+        }, object.body);
+        downloadMs += Date.now() - started;
+        streamed += 1;
       }
-      await doRawJson(stub, "/internal/window/segment", {
-        "content-type": "application/octet-stream",
-        "x-burstel-session-id": sessionId,
-        "x-burstel-segment-key": part.object_key,
-        "x-burstel-segment-instance": "",
-        "x-burstel-size": String(part.size_bytes),
-        "x-burstel-sha256": part.sha256,
-      }, object.body);
-      downloadMs += Date.now() - started;
-      streamed += 1;
     }
     const commitStarted = Date.now();
     const committed = await doJson(stub, "/internal/window/commit", "POST", { session_id: sessionId });
@@ -985,6 +1032,11 @@ async function openWindowSession(
     };
   }
 
+  // The segment path (pre-materialization backlog) is always Worker-streamed.
+  if (!ctx.bucket) {
+    throw new HttpError(503, "window analysis requires the object bucket binding", true, "bucket_unavailable");
+  }
+  const segmentBucket = ctx.bucket;
   const metas: WindowSegmentMeta[] = catalog.map((s) => ({
     segment_key: s.segment_key,
     instance_id: s.instance_id,
@@ -1027,7 +1079,7 @@ async function openWindowSession(
       continue;
     }
     const started = Date.now();
-    const object = await ctx.bucket.get(row.object_key);
+    const object = await segmentBucket.get(row.object_key);
     if (!object || !object.body) {
       missing.push(sel.segment_key);
       continue;
@@ -1156,7 +1208,9 @@ async function withWindowSessions<T>(
   run: () => Promise<T>,
   releaseIds: string[],
 ): Promise<T> {
-  if (!ctx.bucket) throw new HttpError(503, "window analysis requires the object bucket binding", true, "bucket_unavailable");
+  if (!ctx.bucket && ctx.partDownload !== true) {
+    throw new HttpError(503, "window analysis requires the object bucket binding", true, "bucket_unavailable");
+  }
   const catalog = await listAllSegments(ctx);
   for (const session of sessions) {
     if (!session.record.window) throw badRequest("shot is not a window shot");

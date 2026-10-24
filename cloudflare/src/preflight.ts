@@ -242,7 +242,7 @@ export function validateWranglerConfig(
   const expectedWorkerName = opts.expectedWorkerName ?? "burstel";
   const expectedImage = opts.expectedImage ?? "../Dockerfile";
   const expectedContext = opts.expectedImageBuildContext ?? "..";
-  const expectedInstanceType = opts.expectedInstanceType ?? "standard-1";
+  const expectedInstanceType = opts.expectedInstanceType ?? "standard-4";
   const expectedCompactorImage = opts.expectedCompactorImage ?? "../Dockerfile.compactor";
   const expectedCompactorInstanceType = opts.expectedCompactorInstanceType ?? "standard-4";
   const checks: Check[] = [];
@@ -327,9 +327,9 @@ export function validateWranglerConfig(
     typeof compactor?.max_instances === "number" &&
       Number.isInteger(compactor.max_instances) &&
       compactor.max_instances >= 1 &&
-      compactor.max_instances <= 4,
+      compactor.max_instances <= 8,
     true,
-    `CompactorDO max_instances=${compactor?.max_instances ?? "<unset>"} must be 1..4 (shot materialization parallelism cap)`,
+    `CompactorDO max_instances=${compactor?.max_instances ?? "<unset>"} must be 1..8 (spec 035: six instances = five parallel materializers + one compaction slot)`,
   );
 
   const bindings = cfg.durable_objects?.bindings ?? [];
@@ -544,6 +544,16 @@ export function validateWranglerConfig(
     Number.isInteger(materializeConcurrency) && materializeConcurrency >= 1 && materializeConcurrency <= 256,
     true,
     `MATERIALIZE_CONCURRENCY=${vars["MATERIALIZE_CONCURRENCY"] ?? "<default 32>"} must be 1..256`,
+  );
+  // Spec 035: bounded direct R2 download parallelism in the analysis container.
+  const analysisFetchParallelism = Number.parseInt(String(vars["ANALYSIS_FETCH_PARALLELISM"] ?? "16"), 10);
+  add(
+    "analysis_fetch_parallelism_bounded",
+    Number.isInteger(analysisFetchParallelism) &&
+      analysisFetchParallelism >= 1 &&
+      analysisFetchParallelism <= 64,
+    true,
+    `ANALYSIS_FETCH_PARALLELISM=${vars["ANALYSIS_FETCH_PARALLELISM"] ?? "<default 16>"} must be 1..64`,
   );
   const insecure = vars["BURSTEL_DEV_INSECURE_AUTH"];
   add(

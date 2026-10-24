@@ -149,6 +149,8 @@ func writeAnalysisError(w http.ResponseWriter, err error) {
 		_ = json.NewEncoder(w).Encode(map[string]string{"error": windowErr.Message, "code": windowErr.Code})
 	case errors.Is(err, analysis.ErrRestoreNotFound):
 		writeError(w, http.StatusNotFound, errors.New("frozen shot has not been restored"))
+	case errors.Is(err, analysis.ErrPartFetchUnavailable):
+		writeError(w, http.StatusServiceUnavailable, errors.New("direct part download is not configured; stream part bytes instead"))
 	case errors.Is(err, context.DeadlineExceeded):
 		writeError(w, http.StatusGatewayTimeout, errors.New("analysis query timed out"))
 	case errors.Is(err, context.Canceled):

@@ -34,7 +34,7 @@
 //	shot materialize <shot-id> [--no-force] [--wait]
 //	                                    retry/restart durable materialization
 //	shot query <shot-id> --sql "SELECT ..." [--max-rows N]
-//	shot analyze <shot-id> [--sections a,b] [--top-n N]
+//	shot analyze <shot-id> [--sections a,b] [--top-n N] [--timeout 180s]
 //	shot schema <shot-id>
 //	shot compare <shot-id> --other <shot-id> [--top-n N]
 //
@@ -292,7 +292,19 @@ func newClient(base, token, tokenFile string) (*client, error) {
 	if token == "" {
 		return nil, fmt.Errorf("no admin token: set --token, $BURSTEL_API_TOKEN or --token-file")
 	}
-	return &client{base: base, token: token, http: &http.Client{Timeout: 120 * time.Second}}, nil
+	return &client{base: base, token: token, http: &http.Client{Timeout: defaultHTTPTimeout}}, nil
+}
+
+// defaultHTTPTimeout is deliberately longer than the Worker's 60 s analysis
+// wait: spec 035 requires `shot analyze` to survive a cold materialization plus
+// the first part download.
+const defaultHTTPTimeout = 180 * time.Second
+
+// withTimeout returns a copy of the client with a per-command HTTP timeout.
+func (c *client) withTimeout(timeout time.Duration) *client {
+	clone := *c
+	clone.http = &http.Client{Timeout: timeout}
+	return &clone
 }
 
 // doctorReport is the machine-readable output of `burstel-cli doctor`.
@@ -519,6 +531,26 @@ func (c *client) postJSON(method, path string, body any) error {
 		return err
 	}
 	return printJSON(v)
+}
+
+// postJSONHint prints the JSON response and, for the analyze preparing state,
+// tells the operator when to retry (spec 035).
+func (c *client) postJSONHint(method, path string, body any) error {
+	var v map[string]any
+	if err := c.do(method, path, body, &v); err != nil {
+		return err
+	}
+	if err := printJSON(v); err != nil {
+		return err
+	}
+	if state, _ := v["state"].(string); state == "preparing" {
+		retry := 5 * time.Second
+		if ms, ok := v["retry_after_ms"].(float64); ok && ms > 0 {
+			retry = time.Duration(ms) * time.Millisecond
+		}
+		fmt.Fprintf(os.Stderr, "analysis is still preparing; retry in %s (the shot's materialization or part download is not complete yet)\n", retry)
+	}
+	return nil
 }
 
 func printJSON(v any) error {
@@ -900,13 +932,21 @@ func (c *client) shotCommand(args []string) error {
 		}
 		return c.postJSON(http.MethodPost, "/api/shots/"+id+"/query", body)
 	case "analyze":
-		pos, opts, err := parseOpts(rest, map[string]bool{"sections": true, "top-n": true})
+		pos, opts, err := parseOpts(rest, map[string]bool{"sections": true, "top-n": true, "timeout": true})
 		if err != nil {
 			return err
 		}
 		id, err := oneShotID(pos)
 		if err != nil {
 			return err
+		}
+		out := c
+		if raw := last(opts, "timeout"); raw != "" {
+			timeout, err := time.ParseDuration(raw)
+			if err != nil || timeout <= 0 {
+				return fmt.Errorf("--timeout must be a positive duration (for example 180s), got %q", raw)
+			}
+			out = c.withTimeout(timeout)
 		}
 		body := map[string]any{}
 		if s := last(opts, "sections"); s != "" {
@@ -917,7 +957,7 @@ func (c *client) shotCommand(args []string) error {
 		} else if ok {
 			body["top_n"] = n
 		}
-		return c.postJSON(http.MethodPost, "/api/shots/"+id+"/analyze", body)
+		return out.postJSONHint(http.MethodPost, "/api/shots/"+id+"/analyze", body)
 	case "compare":
 		pos, opts, err := parseOpts(rest, map[string]bool{"other": true, "top-n": true})
 		if err != nil {
@@ -1006,7 +1046,8 @@ Commands:
   shot materialize <shot-id> [--no-force] [--wait]
                                       retry/restart the durable materialization run
   shot query <shot-id> --sql "SELECT ..." [--max-rows N]
-  shot analyze <shot-id> [--sections a,b] [--top-n N]
+  shot analyze <shot-id> [--sections a,b] [--top-n N] [--timeout 180s]
+                                      run analysis sections; --timeout bounds the HTTP wait (default 180s)
   shot schema <shot-id>
   shot compare <shot-id> --other <shot-id> [--top-n N]
 
