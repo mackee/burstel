@@ -21,6 +21,7 @@ import { DurableObject } from "cloudflare:workers";
 
 import type { R2BucketLike } from "./artifacts";
 import { IngestCore } from "./ingest-core";
+import { lateWriteLimitMs } from "./env";
 import type { SqlCursor, SqlValue, SyncSql } from "./store";
 import type { Env } from "./shot-do";
 
@@ -37,11 +38,15 @@ export class IngestDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const sql = createSqlAdapter(ctx.storage);
+    const maxMaterializeObjects = Number.parseInt((env as { MATERIALIZE_MAX_OBJECTS?: string }).MATERIALIZE_MAX_OBJECTS ?? "", 10);
     this.core = new IngestCore({
       sql,
       now: () => Date.now(),
       // Spec 023 D3.4: pending/backlog counts come from the R2 listing.
       bucket: env.BUCKET as unknown as R2BucketLike,
+      // Spec 031 D4: materialization starts at end + late-write limit.
+      lateWriteLimitMs: lateWriteLimitMs(env),
+      maxMaterializeObjects: Number.isFinite(maxMaterializeObjects) && maxMaterializeObjects > 0 ? maxMaterializeObjects : undefined,
     });
     ctx.blockConcurrencyWhile(async () => {
       await this.core.load();

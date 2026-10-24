@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -11,7 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	_ "github.com/duckdb/duckdb-go/v2"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 
 	"github.com/mackee/burstel/internal/otlp"
 )
@@ -95,7 +96,6 @@ CREATE TABLE IF NOT EXISTS spans (
   dropped_links_count      BIGINT,
   events_count             BIGINT,
   links_count              BIGINT,
-  PRIMARY KEY (source_key, ordinal)
 );
 CREATE TABLE IF NOT EXISTS log_records (
   instance_id              VARCHAR NOT NULL,
@@ -117,7 +117,6 @@ CREATE TABLE IF NOT EXISTS log_records (
   event_name               VARCHAR,
   flags                    BIGINT,
   dropped_attributes_count BIGINT,
-  PRIMARY KEY (source_key, ordinal)
 );
 CREATE TABLE IF NOT EXISTS metric_points (
   instance_id             VARCHAR NOT NULL,
@@ -147,8 +146,13 @@ CREATE TABLE IF NOT EXISTS metric_points (
   bucket_counts           VARCHAR,
   explicit_bounds         VARCHAR,
   detail                  VARCHAR,
-  PRIMARY KEY (source_key, ordinal)
 );
+`
+
+// Secondary indexes are built once after the bulk append. Creating them before
+// the insert makes every appended row maintain three ART indexes, which is the
+// dominant cost for a multi-million-span build (spec 031 D2).
+const segmentIndexes = `
 CREATE INDEX IF NOT EXISTS idx_seg_spans_service ON spans (service_name);
 CREATE INDEX IF NOT EXISTS idx_seg_logs_trace ON log_records (trace_id);
 CREATE INDEX IF NOT EXISTS idx_seg_metrics_name ON metric_points (metric_name);
@@ -185,7 +189,24 @@ func NewScratchSegment(workDir, key string) (string, func(), error) {
 // projections. It CHECKPOINTs and closes before hashing the file so the caller
 // uploads a stable object.
 func BuildSegment(ctx context.Context, path, key, instanceID, instanceName string, records []JournalRecord) (SegmentInfo, error) {
-	if len(records) == 0 {
+	return buildSegment(ctx, path, key, instanceID, instanceName, records, false)
+}
+
+// BuildPart writes one shot-materialization part. Unlike a compacted segment it
+// may legitimately contain zero records (for example when every journal object
+// in a chunk was excluded); the schema, checksum and metadata contract are
+// identical so analysis can ATTACH a part exactly like a segment.
+func BuildPart(ctx context.Context, path, key, instanceID, instanceName string, records []JournalRecord) (SegmentInfo, error) {
+	return buildSegment(ctx, path, key, instanceID, instanceName, records, true)
+}
+
+func buildSegment(
+	ctx context.Context,
+	path, key, instanceID, instanceName string,
+	records []JournalRecord,
+	allowEmpty bool,
+) (SegmentInfo, error) {
+	if len(records) == 0 && !allowEmpty {
 		return SegmentInfo{}, fmt.Errorf("compaction: cannot build an empty segment")
 	}
 	_ = os.Remove(path)
@@ -201,61 +222,79 @@ func BuildSegment(ctx context.Context, path, key, instanceID, instanceName strin
 		return SegmentInfo{}, fmt.Errorf("compaction: segment schema: %w", err)
 	}
 
-	info := SegmentInfo{Key: key, Path: path, FirstReceivedAt: records[0].Object.ReceivedAtMS}
-	info.LastReceivedAt = records[0].Object.ReceivedAtMS
+	// A single connection owns the transaction and the appenders. DuckDB
+	// appenders write through the session's current transaction, so every raw
+	// batch row and its projection rows commit (or roll back) atomically.
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return SegmentInfo{}, fmt.Errorf("compaction: segment connection: %w", err)
+	}
+	defer conn.Close()
+
+	var driverConn driver.Conn
+	if err := conn.Raw(func(dc any) error {
+		resolved, ok := dc.(driver.Conn)
+		if !ok {
+			return fmt.Errorf("unexpected driver connection type %T", dc)
+		}
+		driverConn = resolved
+		return nil
+	}); err != nil {
+		return SegmentInfo{}, fmt.Errorf("compaction: resolve driver connection: %w", err)
+	}
+
+	appenders := map[string]*duckdb.Appender{}
+	dropAppenders := func() {
+		for table, a := range appenders {
+			_ = a.Close()
+			delete(appenders, table)
+		}
+	}
+	appender := func(table string) (*duckdb.Appender, error) {
+		if a, ok := appenders[table]; ok {
+			return a, nil
+		}
+		a, err := duckdb.NewAppenderFromConn(driverConn, "", table)
+		if err != nil {
+			return nil, fmt.Errorf("compaction: open appender %s: %w", table, err)
+		}
+		appenders[table] = a
+		return a, nil
+	}
+
+	if _, err := conn.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {
+		return SegmentInfo{}, fmt.Errorf("compaction: begin segment: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			// Flush/close the appenders into the open transaction first, then
+			// roll the whole unit back. The reverse order would let an appender
+			// flush buffered rows *after* ROLLBACK.
+			dropAppenders()
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	info := SegmentInfo{Key: key, Path: path}
+	if len(records) > 0 {
+		info.FirstReceivedAt = records[0].Object.ReceivedAtMS
+		info.LastReceivedAt = records[0].Object.ReceivedAtMS
+	}
 	var minEvent, maxEvent int64
 	haveEvent := false
-
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return SegmentInfo{}, err
-	}
-	defer tx.Rollback() //nolint:errcheck
-
-	insertBatch, err := tx.PrepareContext(ctx, `INSERT INTO otlp_batches
-		(instance_id, source_key, request_id, signal, received_at, content_encoding,
-		 wire_sha256, payload_sha256, record_count, payload_length, resource_summary, wire_payload, payload)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-	if err != nil {
-		return SegmentInfo{}, err
-	}
-	defer insertBatch.Close()
-	insertSpan, err := tx.PrepareContext(ctx, `INSERT INTO spans
-		(instance_id, source_key, ordinal, trace_id, span_id, parent_span_id, trace_state, name, kind,
-		 start_time_unix_nano, end_time_unix_nano, status_code, status_message,
-		 service_name, scope_name, scope_version, resource_attributes, scope_attributes, attributes,
-		 flags, dropped_attributes_count, dropped_events_count, dropped_links_count, events_count, links_count)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-	if err != nil {
-		return SegmentInfo{}, err
-	}
-	defer insertSpan.Close()
-	insertLog, err := tx.PrepareContext(ctx, `INSERT INTO log_records
-		(instance_id, source_key, ordinal, time_unix_nano, observed_time_unix_nano, severity_number, severity_text, body,
-		 service_name, scope_name, scope_version, resource_attributes, scope_attributes, attributes,
-		 trace_id, span_id, event_name, flags, dropped_attributes_count)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-	if err != nil {
-		return SegmentInfo{}, err
-	}
-	defer insertLog.Close()
-	insertMetric, err := tx.PrepareContext(ctx, `INSERT INTO metric_points
-		(instance_id, source_key, ordinal, metric_name, metric_type, metric_unit, metric_description,
-		 service_name, scope_name, scope_version, resource_attributes, scope_attributes, attributes,
-		 start_time_unix_nano, time_unix_nano, flags, value_double, value_int,
-		 aggregation_temporality, is_monotonic, count, sum, min, max, bucket_counts, explicit_bounds, detail)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-	if err != nil {
-		return SegmentInfo{}, err
-	}
-	defer insertMetric.Close()
+	seenSources := make(map[string]struct{}, len(records))
 
 	for _, rec := range records {
 		o := rec.Object
-		if o.ReceivedAtMS < info.FirstReceivedAt {
+		if _, duplicate := seenSources[o.Key]; duplicate {
+			return SegmentInfo{}, fmt.Errorf("compaction: duplicate source key %s", o.Key)
+		}
+		seenSources[o.Key] = struct{}{}
+		if info.RequestCount == 0 || o.ReceivedAtMS < info.FirstReceivedAt {
 			info.FirstReceivedAt = o.ReceivedAtMS
 		}
-		if o.ReceivedAtMS > info.LastReceivedAt {
+		if info.RequestCount == 0 || o.ReceivedAtMS > info.LastReceivedAt {
 			info.LastReceivedAt = o.ReceivedAtMS
 		}
 		// A cross-instance bucket keeps each row's real instance attribution.
@@ -270,12 +309,16 @@ func BuildSegment(ctx context.Context, path, key, instanceID, instanceName strin
 		if rq != nil {
 			recordCount = rq.RecordCount
 		}
-		if _, err := insertBatch.ExecContext(ctx,
+		batchAppender, err := appender("otlp_batches")
+		if err != nil {
+			return SegmentInfo{}, err
+		}
+		if err := batchAppender.AppendRow(
 			rowInstanceID, o.Key, o.RequestID, string(o.Signal), o.ReceivedAt.UTC(),
 			o.ContentEncoding, wireSHA, payloadSHA, recordCount, int64(len(rec.Payload)),
 			resourceSummaryOf(rq), rec.Wire, rec.Payload,
 		); err != nil {
-			return SegmentInfo{}, fmt.Errorf("compaction: insert batch: %w", err)
+			return SegmentInfo{}, fmt.Errorf("compaction: append batch: %w", err)
 		}
 		info.RequestCount++
 		info.RecordCount += recordCount
@@ -283,42 +326,66 @@ func BuildSegment(ctx context.Context, path, key, instanceID, instanceName strin
 		if rq == nil {
 			continue
 		}
-		for i, sp := range rq.Spans {
-			if _, err := insertSpan.ExecContext(ctx, append([]any{rowInstanceID, o.Key, int64(i)}, spanArgs(sp)...)...); err != nil {
-				return SegmentInfo{}, fmt.Errorf("compaction: insert span: %w", err)
+		if len(rq.Spans) > 0 {
+			a, err := appender("spans")
+			if err != nil {
+				return SegmentInfo{}, err
 			}
-			if sp.StartTimeUnixNano > 0 {
-				minEvent, maxEvent = extend(minEvent, maxEvent, int64(sp.StartTimeUnixNano), &haveEvent)
-			}
-			if sp.EndTimeUnixNano > 0 {
-				minEvent, maxEvent = extend(minEvent, maxEvent, int64(sp.EndTimeUnixNano), &haveEvent)
+			for i, sp := range rq.Spans {
+				if err := a.AppendRow(driverValues(append([]any{rowInstanceID, o.Key, int64(i)}, spanArgs(sp)...))...); err != nil {
+					return SegmentInfo{}, fmt.Errorf("compaction: append span: %w", err)
+				}
+				if sp.StartTimeUnixNano > 0 {
+					minEvent, maxEvent = extend(minEvent, maxEvent, int64(sp.StartTimeUnixNano), &haveEvent)
+				}
+				if sp.EndTimeUnixNano > 0 {
+					minEvent, maxEvent = extend(minEvent, maxEvent, int64(sp.EndTimeUnixNano), &haveEvent)
+				}
 			}
 		}
 		info.SpanCount += int64(len(rq.Spans))
-		for i, lr := range rq.LogRecords {
-			if _, err := insertLog.ExecContext(ctx, append([]any{rowInstanceID, o.Key, int64(i)}, logArgs(lr)...)...); err != nil {
-				return SegmentInfo{}, fmt.Errorf("compaction: insert log: %w", err)
+		if len(rq.LogRecords) > 0 {
+			a, err := appender("log_records")
+			if err != nil {
+				return SegmentInfo{}, err
 			}
-			if lr.TimeUnixNano > 0 {
-				minEvent, maxEvent = extend(minEvent, maxEvent, int64(lr.TimeUnixNano), &haveEvent)
-			}
-			if lr.ObservedTimeUnixNano > 0 {
-				minEvent, maxEvent = extend(minEvent, maxEvent, int64(lr.ObservedTimeUnixNano), &haveEvent)
+			for i, lr := range rq.LogRecords {
+				if err := a.AppendRow(driverValues(append([]any{rowInstanceID, o.Key, int64(i)}, logArgs(lr)...))...); err != nil {
+					return SegmentInfo{}, fmt.Errorf("compaction: append log: %w", err)
+				}
+				if lr.TimeUnixNano > 0 {
+					minEvent, maxEvent = extend(minEvent, maxEvent, int64(lr.TimeUnixNano), &haveEvent)
+				}
+				if lr.ObservedTimeUnixNano > 0 {
+					minEvent, maxEvent = extend(minEvent, maxEvent, int64(lr.ObservedTimeUnixNano), &haveEvent)
+				}
 			}
 		}
 		info.LogCount += int64(len(rq.LogRecords))
-		for i, mp := range rq.MetricPoints {
-			if _, err := insertMetric.ExecContext(ctx, append([]any{rowInstanceID, o.Key, int64(i)}, metricArgs(mp)...)...); err != nil {
-				return SegmentInfo{}, fmt.Errorf("compaction: insert metric: %w", err)
+		if len(rq.MetricPoints) > 0 {
+			a, err := appender("metric_points")
+			if err != nil {
+				return SegmentInfo{}, err
 			}
-			if mp.StartTimeUnixNano > 0 {
-				minEvent, maxEvent = extend(minEvent, maxEvent, int64(mp.StartTimeUnixNano), &haveEvent)
-			}
-			if mp.TimeUnixNano > 0 {
-				minEvent, maxEvent = extend(minEvent, maxEvent, int64(mp.TimeUnixNano), &haveEvent)
+			for i, mp := range rq.MetricPoints {
+				if err := a.AppendRow(driverValues(append([]any{rowInstanceID, o.Key, int64(i)}, metricArgs(mp)...))...); err != nil {
+					return SegmentInfo{}, fmt.Errorf("compaction: append metric: %w", err)
+				}
+				if mp.StartTimeUnixNano > 0 {
+					minEvent, maxEvent = extend(minEvent, maxEvent, int64(mp.StartTimeUnixNano), &haveEvent)
+				}
+				if mp.TimeUnixNano > 0 {
+					minEvent, maxEvent = extend(minEvent, maxEvent, int64(mp.TimeUnixNano), &haveEvent)
+				}
 			}
 		}
 		info.MetricCount += int64(len(rq.MetricPoints))
+	}
+
+	for table, a := range appenders {
+		if err := a.Flush(); err != nil {
+			return SegmentInfo{}, fmt.Errorf("compaction: flush %s: %w", table, err)
+		}
 	}
 
 	meta := map[string]string{
@@ -332,24 +399,32 @@ func BuildSegment(ctx context.Context, path, key, instanceID, instanceName strin
 		"record_count":      fmt.Sprint(info.RecordCount),
 	}
 	for k, v := range meta {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_meta (key, value) VALUES (?, ?)
+		if _, err := conn.ExecContext(ctx, `INSERT INTO schema_meta (key, value) VALUES (?, ?)
 			ON CONFLICT (key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
 			return SegmentInfo{}, err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO segment_meta (key, value) VALUES (?, ?)
+		if _, err := conn.ExecContext(ctx, `INSERT INTO segment_meta (key, value) VALUES (?, ?)
 			ON CONFLICT (key) DO UPDATE SET value = excluded.value`, k, v); err != nil {
 			return SegmentInfo{}, err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)
+	if _, err := conn.ExecContext(ctx, `INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)
 		ON CONFLICT (key) DO UPDATE SET value = excluded.value`, SchemaVersion); err != nil {
 		return SegmentInfo{}, err
 	}
-	if err := tx.Commit(); err != nil {
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		return SegmentInfo{}, fmt.Errorf("compaction: commit segment: %w", err)
 	}
-	if _, err := db.ExecContext(ctx, "CHECKPOINT"); err != nil {
+	committed = true
+	dropAppenders()
+	if _, err := conn.ExecContext(ctx, segmentIndexes); err != nil {
+		return SegmentInfo{}, fmt.Errorf("compaction: index segment: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "CHECKPOINT"); err != nil {
 		return SegmentInfo{}, fmt.Errorf("compaction: checkpoint segment: %w", err)
+	}
+	if err := conn.Close(); err != nil {
+		return SegmentInfo{}, fmt.Errorf("compaction: close segment connection: %w", err)
 	}
 	if err := db.Close(); err != nil {
 		return SegmentInfo{}, fmt.Errorf("compaction: close segment: %w", err)
@@ -387,6 +462,14 @@ func extend(minV, maxV, v int64, have *bool) (int64, int64) {
 		maxV = v
 	}
 	return minV, maxV
+}
+
+func driverValues(args []any) []driver.Value {
+	out := make([]driver.Value, len(args))
+	for i, arg := range args {
+		out[i] = arg
+	}
+	return out
 }
 
 func spanArgs(sp otlp.Span) []any {

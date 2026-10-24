@@ -18,6 +18,7 @@ import { CompactorCore } from "./compactor-core";
 import type { CompactorConfig } from "./compactor-core";
 import { resolveCompactorContainerEnv } from "./compactor-env";
 import { createContainerControl } from "./container";
+import { MaterializerCore } from "./materializer-core";
 import { containerPort, requireContainer } from "./shot-do";
 
 export interface CompactorEnv extends Cloudflare.Env {
@@ -25,10 +26,16 @@ export interface CompactorEnv extends Cloudflare.Env {
   BURSTEL_INTERNAL_TOKEN?: string;
   BURSTEL_DEV_INSECURE_AUTH?: string;
   CONTAINER_PORT?: string;
+  /** Spec 031: bucket-scoped R2 S3 credential (Container env only). */
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  R2_ACCOUNT_ID?: string;
+  R2_BUCKET_NAME?: string;
 }
 
 export class CompactorDO extends DurableObject<CompactorEnv> {
   private readonly core: CompactorCore;
+  private readonly materializer: MaterializerCore;
 
   constructor(ctx: DurableObjectState, env: CompactorEnv) {
     super(ctx, env);
@@ -54,9 +61,24 @@ export class CompactorDO extends DurableObject<CompactorEnv> {
       scheduler: { set: (atMs) => ctx.storage.setAlarm(atMs) },
       log: (message, fields) => console.log(message, fields ?? {}),
     });
+    this.materializer = new MaterializerCore({
+      container,
+      containerEnv,
+      internalToken: internal.ok && internal.token.length > 0 ? internal.token : undefined,
+      internalReady: internal.ok,
+      holder: ctx.id.name ?? ctx.id.toString(),
+      config: {
+        containerTimeoutMs: compactorConfigFromEnv(env).containerTimeoutMs,
+      },
+      log: (message, fields) => console.log(message, fields ?? {}),
+    });
   }
 
   override async fetch(request: Request): Promise<Response> {
+    const path = new URL(request.url).pathname;
+    if (path.startsWith("/internal/materialize")) {
+      return this.materializer.handleInternal(request);
+    }
     return this.core.handleInternal(request);
   }
 

@@ -20,6 +20,16 @@ export interface CompactorContainerEnv {
   env: Record<string, string>;
   /** The same token resolution the coordinator uses for request headers. */
   internal: InternalTokenResolution;
+  /** True when a complete bucket-scoped R2 credential was injected. */
+  r2: boolean;
+}
+
+export interface CompactorR2Env {
+  R2_ACCESS_KEY_ID?: string;
+  R2_SECRET_ACCESS_KEY?: string;
+  R2_ACCOUNT_ID?: string;
+  /** Public bucket name; the credential itself is scoped server-side. */
+  R2_BUCKET_NAME?: string;
 }
 
 /**
@@ -32,7 +42,10 @@ export interface CompactorContainerEnv {
  * and never inject a token; the container's internal routes are intentionally
  * ungated in that mode.
  */
-export function resolveCompactorContainerEnv(env: InternalAuthEnv, port: number): CompactorContainerEnv {
+export function resolveCompactorContainerEnv(
+  env: InternalAuthEnv & CompactorR2Env,
+  port: number,
+): CompactorContainerEnv {
   const internal = resolveInternalToken(env);
   const containerEnv: Record<string, string> = {
     BURSTEL_ADDR: `:${port}`,
@@ -43,5 +56,20 @@ export function resolveCompactorContainerEnv(env: InternalAuthEnv, port: number)
   } else if (internal.ok) {
     containerEnv["BURSTEL_DEV_INSECURE_AUTH"] = "1";
   }
-  return { env: containerEnv, internal };
+  // Spec 031 D1: a bucket-scoped R2 credential is injected into the
+  // compactor/materializer container only. It is never exported to the
+  // Worker's public surface and never logged.
+  let r2 = false;
+  const access = env.R2_ACCESS_KEY_ID?.trim() ?? "";
+  const secret = env.R2_SECRET_ACCESS_KEY?.trim() ?? "";
+  const account = env.R2_ACCOUNT_ID?.trim() ?? "";
+  const bucket = env.R2_BUCKET_NAME?.trim() ?? "";
+  if (access && secret && account && bucket) {
+    containerEnv["R2_ACCESS_KEY_ID"] = access;
+    containerEnv["R2_SECRET_ACCESS_KEY"] = secret;
+    containerEnv["R2_ACCOUNT_ID"] = account;
+    containerEnv["R2_BUCKET"] = bucket;
+    r2 = true;
+  }
+  return { env: containerEnv, internal, r2 };
 }

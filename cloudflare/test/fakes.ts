@@ -712,6 +712,8 @@ export function makeIngest(
     generateTokenId?: () => string;
     sql?: BunSql;
     bucket?: R2BucketLike;
+    lateWriteLimitMs?: number;
+    maxMaterializeObjects?: number;
   } = {},
 ): IngestHarness {
   const sql = options.sql ?? new BunSql();
@@ -722,6 +724,8 @@ export function makeIngest(
     generateInstanceId: options.generateInstanceId,
     generateTokenId: options.generateTokenId,
     bucket: options.bucket,
+    lateWriteLimitMs: options.lateWriteLimitMs,
+    maxMaterializeObjects: options.maxMaterializeObjects,
   });
   return { core, sql };
 }

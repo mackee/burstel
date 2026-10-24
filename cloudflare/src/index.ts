@@ -28,8 +28,8 @@ export { CompactorDO } from "./compactor-do";
 export type { Env } from "./shot-do";
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    return handleRequest(request, env);
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return handleRequest(request, env, ctx);
   },
 
   /**

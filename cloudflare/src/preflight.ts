@@ -318,9 +318,9 @@ export function validateWranglerConfig(
     typeof compactor?.max_instances === "number" &&
       Number.isInteger(compactor.max_instances) &&
       compactor.max_instances >= 1 &&
-      compactor.max_instances <= 2,
+      compactor.max_instances <= 4,
     true,
-    `CompactorDO max_instances=${compactor?.max_instances ?? "<unset>"} must be 1 or 2`,
+    `CompactorDO max_instances=${compactor?.max_instances ?? "<unset>"} must be 1..4 (shot materialization parallelism cap)`,
   );
 
   const bindings = cfg.durable_objects?.bindings ?? [];
@@ -448,7 +448,14 @@ export function validateWranglerConfig(
     "late_write_limit_configured",
     Number.isFinite(lateWrite) && lateWrite > 0,
     true,
-    "LATE_WRITE_LIMIT_MS must be a positive number of milliseconds (spec 023 D2.2)",
+    "LATE_WRITE_LIMIT_MS must be a positive number of milliseconds (spec 031 D4 default 10000)",
+  );
+  const parallelism = Number.parseInt(String(vars["MATERIALIZE_PARALLELISM"] ?? "4"), 10);
+  add(
+    "materialize_parallelism_bounded",
+    Number.isInteger(parallelism) && parallelism >= 1 && parallelism <= (compactor?.max_instances ?? 1),
+    true,
+    `MATERIALIZE_PARALLELISM=${vars["MATERIALIZE_PARALLELISM"] ?? "<default 4>"} must be 1..container max_instances (${compactor?.max_instances ?? "<unset>"})`,
   );
   const insecure = vars["BURSTEL_DEV_INSECURE_AUTH"];
   add(
@@ -541,7 +548,15 @@ export function parseSecretList(text: string): string[] {
 
 export function validateSecrets(
   names: string[],
-  required: string[] = ["BURSTEL_API_TOKEN", "BURSTEL_INTERNAL_TOKEN"],
+  required: string[] = [
+    "BURSTEL_API_TOKEN",
+    "BURSTEL_INTERNAL_TOKEN",
+    // Spec 031 D1: the compactor/materializer container needs a bucket-scoped
+    // R2 S3 credential; it is never exposed to the ShotDO recorder.
+    "R2_ACCESS_KEY_ID",
+    "R2_SECRET_ACCESS_KEY",
+    "R2_ACCOUNT_ID",
+  ],
 ): Check[] {
   return required.map((name) => ({
     name: `secret_present_${name}`,

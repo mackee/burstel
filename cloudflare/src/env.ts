@@ -152,8 +152,9 @@ export function compactionGraceMs(env: { COMPACTION_GRACE_MS?: string }): number
 }
 
 /**
- * Late-write budget (spec 023, D2.2): `LATE_WRITE_LIMIT_MS` when configured,
- * otherwise half the compaction grace. A non-positive value disables the guard.
+ * Late-write budget (spec 023, D2.2; spec 031, D4): `LATE_WRITE_LIMIT_MS` when
+ * configured, otherwise 10 s. The guard still answers a slower PUT with a
+ * retryable 503, but shot materialization no longer waits 45 s for it.
  */
 export function lateWriteLimitMs(env: { LATE_WRITE_LIMIT_MS?: string; COMPACTION_GRACE_MS?: string }): number {
   const raw = env.LATE_WRITE_LIMIT_MS?.trim();
@@ -161,7 +162,7 @@ export function lateWriteLimitMs(env: { LATE_WRITE_LIMIT_MS?: string; COMPACTION
     const parsed = Number.parseInt(raw, 10);
     if (Number.isFinite(parsed) && parsed >= 0) return parsed;
   }
-  return Math.max(1, Math.floor(compactionGraceMs(env) / 2));
+  return 10_000;
 }
 
 /** Parses the revoked-object audit retention, falling back to 7 days. */

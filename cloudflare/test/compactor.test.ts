@@ -505,4 +505,19 @@ describe("compactor coordinator (spec 018)", () => {
     expect(after.scheduler_active).toBe(true);
     expect(after.last_tick_at).not.toBeNull();
   });
+
+  test("compaction yields while a shot materialization is active (spec 031)", async () => {
+    const h = makeHarness();
+    await seed(h, { instanceId: "inst-a", instance: "inst-a", signal: "traces", receivedAt: h.clock.now - 600_000 });
+    await h.ingest.beginMaterializationRun("shot-yield", 60_000);
+    const yielded = await h.compactor.tick();
+    expect(yielded.skipped).toBe("materialization_in_progress");
+    expect(yielded.segments_published).toBe(0);
+    expect((await h.ingest.listSegments({ limit: 10, offset: 0 })).total).toBe(0);
+
+    await h.ingest.endMaterializationRun("shot-yield");
+    const resumed = await h.compactor.tick();
+    expect(resumed.ok).toBe(true);
+    expect(resumed.segments_published).toBe(1);
+  });
 });

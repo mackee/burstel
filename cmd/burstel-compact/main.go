@@ -9,10 +9,12 @@
 //     mirror of the bucket (`-store-dir`) plus a durable DuckDB manifest. This
 //     is what the 60 s / 180 s trials and the failure-injection tests use.
 //
-//   - Service mode (`-serve`): a short-lived HTTP service the coordinator
-//     Durable Object drives. It never talks to R2; the DO streams bounded raw
-//     journal bodies in and streams the immutable segment bytes back out, so no
-//     account-wide R2/S3 credential ever reaches the Container instance.
+//   - Service mode (`-serve`): an HTTP service the coordinator Durable Object
+//     drives. Continuous compaction streams bounded raw journal bodies in and
+//     the immutable segment bytes back out, so the account-wide credential is
+//     never needed there. Spec 031 adds `/v1/materialize`, which uses a
+//     bucket-scoped R2 S3 credential (injected into the container env only) to
+//     read `journal/` and write `shots/<shot_id>/part-*.duckdb` directly.
 //
 // Typical short-lived Container invocation:
 //
@@ -34,6 +36,7 @@ import (
 	"time"
 
 	"github.com/mackee/burstel/internal/compaction"
+	"github.com/mackee/burstel/internal/r2s3"
 )
 
 func main() {
@@ -141,6 +144,27 @@ func main() {
 	}
 }
 
+// r2ClientFromEnv builds the bucket-scoped S3 client the materializer uses.
+// All configuration comes from the Container environment injected by the
+// Worker; nil (no configuration) simply leaves materialization disabled.
+func r2ClientFromEnv() (*r2s3.Client, error) {
+	account := envString("R2_ACCOUNT_ID", envString("BURSTEL_R2_ACCOUNT_ID", ""))
+	access := envString("R2_ACCESS_KEY_ID", "")
+	secret := envString("R2_SECRET_ACCESS_KEY", "")
+	bucket := envString("R2_BUCKET", envString("BURSTEL_R2_BUCKET", ""))
+	endpoint := envString("R2_ENDPOINT", "")
+	if account == "" && access == "" && secret == "" && bucket == "" && endpoint == "" {
+		return nil, nil
+	}
+	return r2s3.New(r2s3.Config{
+		AccountID:       account,
+		AccessKeyID:     access,
+		SecretAccessKey: secret,
+		Bucket:          bucket,
+		Endpoint:        endpoint,
+	})
+}
+
 // runService starts the bounded compactor HTTP service used by the coordinator
 // Durable Object (spec 018). It fails closed without BURSTEL_INTERNAL_TOKEN
 // unless the explicit local-development opt-in is set.
@@ -157,7 +181,18 @@ func runService(addr, workDir string) {
 	cfg.MaxSegmentBytes = envInt64("BURSTEL_COMPACT_MAX_SEGMENT_BYTES", cfg.MaxSegmentBytes)
 	cfg.SegmentTTL = envDuration("BURSTEL_COMPACT_SEGMENT_TTL", cfg.SegmentTTL)
 
-	svc := compaction.NewService(cfg)
+	// Spec 031: shot-time materialization reads journal/ and writes shots/
+	// directly through the bucket-scoped R2 S3 credential. Continuous
+	// compaction stays coordinator-mediated, so a missing credential only
+	// disables the materialization endpoint (fail closed).
+	var remote compaction.RemoteStore
+	if client, err := r2ClientFromEnv(); err != nil {
+		log.Printf("burstel-compact: materialization disabled: %v", err)
+	} else if client != nil {
+		remote = client
+	}
+
+	svc := compaction.NewServiceWithRemote(cfg, remote, envInt("BURSTEL_MATERIALIZE_CONCURRENCY", 32))
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           svc.Handler(),

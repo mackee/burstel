@@ -92,7 +92,13 @@ func SelectSegments(window TimeWindow, segments []SegmentMeta, opts SelectionOpt
 	}
 	for _, seg := range segments {
 		if len(want) > 0 {
-			if _, ok := want[strings.ToLower(seg.Instance)]; !ok {
+			// A cross-instance segment scope is the synthetic `all`; its rows
+			// carry real instance ids and the SQL view filters them. Spec 031
+			// materialization parts use the same scope so ATTACH-based analysis
+			// never drops a multi-instance part.
+			if seg.InstanceID == "all" {
+				// keep
+			} else if _, ok := want[strings.ToLower(seg.Instance)]; !ok {
 				// Fall back to matching the instance id so a caller that only
 				// knows ids is still scoped correctly.
 				if _, ok := want[strings.ToLower(seg.InstanceID)]; !ok {

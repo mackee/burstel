@@ -213,12 +213,24 @@ describe("wrangler whoami / secret / r2 parsing", () => {
     const raw = JSON.stringify([
       { name: "BURSTEL_API_TOKEN", type: "secret_text" },
       { name: "BURSTEL_INTERNAL_TOKEN", type: "secret_text" },
+      { name: "R2_ACCESS_KEY_ID", type: "secret_text" },
+      { name: "R2_SECRET_ACCESS_KEY", type: "secret_text" },
+      { name: "R2_ACCOUNT_ID", type: "secret_text" },
     ]);
     const names = parseSecretList(raw);
-    expect(names).toEqual(["BURSTEL_API_TOKEN", "BURSTEL_INTERNAL_TOKEN"]);
+    expect(names).toEqual([
+      "BURSTEL_API_TOKEN",
+      "BURSTEL_INTERNAL_TOKEN",
+      "R2_ACCESS_KEY_ID",
+      "R2_ACCOUNT_ID",
+      "R2_SECRET_ACCESS_KEY",
+    ]);
     expect(finalize(validateSecrets(names)).ok).toBe(true);
     expect(finalize(validateSecrets(["BURSTEL_API_TOKEN"])).failed_required).toEqual([
       "secret_present_BURSTEL_INTERNAL_TOKEN",
+      "secret_present_R2_ACCESS_KEY_ID",
+      "secret_present_R2_SECRET_ACCESS_KEY",
+      "secret_present_R2_ACCOUNT_ID",
     ]);
   });
 

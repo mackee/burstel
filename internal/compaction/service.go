@@ -124,10 +124,21 @@ type Service struct {
 	now  func() time.Time
 	mu   sync.Mutex
 	segs map[string]*storedSegment
+	// Spec 031: direct, bucket-scoped R2 access for shot-time materialization.
+	// The continuous compaction path still streams through the coordinator.
+	remote                 RemoteStore
+	materializeConcurrency int
 }
 
 // NewService builds a compactor service.
 func NewService(cfg ServiceConfig) *Service {
+	return NewServiceWithRemote(cfg, nil, 0)
+}
+
+// NewServiceWithRemote builds a compactor service that can additionally
+// materialize shot parts directly from R2. A nil remote leaves /v1/materialize
+// fail-closed with a 503.
+func NewServiceWithRemote(cfg ServiceConfig, remote RemoteStore, concurrency int) *Service {
 	if cfg.MaxBatchObjects <= 0 {
 		cfg.MaxBatchObjects = 256
 	}
@@ -140,7 +151,16 @@ func NewService(cfg ServiceConfig) *Service {
 	if cfg.SegmentTTL <= 0 {
 		cfg.SegmentTTL = 5 * time.Minute
 	}
-	return &Service{cfg: cfg, now: func() time.Time { return time.Now().UTC() }, segs: map[string]*storedSegment{}}
+	if concurrency <= 0 {
+		concurrency = 32
+	}
+	return &Service{
+		cfg:                    cfg,
+		now:                    func() time.Time { return time.Now().UTC() },
+		segs:                   map[string]*storedSegment{},
+		remote:                 remote,
+		materializeConcurrency: concurrency,
+	}
 }
 
 // Handler returns the HTTP handler for the service.
@@ -151,6 +171,7 @@ func (s *Service) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/segments", s.auth(s.handleBuild))
 	mux.HandleFunc("GET /v1/segments/{token}", s.auth(s.handleDownload))
 	mux.HandleFunc("DELETE /v1/segments/{token}", s.auth(s.handleDelete))
+	mux.HandleFunc("POST /v1/materialize", s.auth(s.handleMaterialize))
 	return mux
 }
 
@@ -206,6 +227,30 @@ func (s *Service) handleBuild(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "code": "build_failed"})
+		return
+	}
+	writeJSON(w, http.StatusCreated, resp)
+}
+
+func (s *Service) handleMaterialize(w http.ResponseWriter, r *http.Request) {
+	body, err := readLimited(r, s.cfg.MaxBatchBytes*64)
+	if err != nil {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{"error": err.Error(), "code": "payload_too_large"})
+		return
+	}
+	var req MaterializeRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON request", "code": "bad_request"})
+		return
+	}
+	resp, err := s.Materialize(r.Context(), req)
+	if err != nil {
+		var be *badRequestError
+		if errors.As(err, &be) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": be.Error(), "code": "bad_request"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error(), "code": "materialize_failed"})
 		return
 	}
 	writeJSON(w, http.StatusCreated, resp)

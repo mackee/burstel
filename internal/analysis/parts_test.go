@@ -1,0 +1,89 @@
+package analysis
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"google.golang.org/protobuf/proto"
+
+	"github.com/mackee/burstel/internal/compaction"
+	"github.com/mackee/burstel/internal/fixtures"
+	"github.com/mackee/burstel/internal/otlp"
+)
+
+func TestScopedEngineAttachesMultipleMaterializationParts(t *testing.T) {
+	ctx := context.Background()
+	baseMS := int64(1_700_000_000_000)
+	baseNS := uint64(baseMS) * 1_000_000
+
+	build := func(name string, n int, offset uint64) SegmentRef {
+		spans := make([]fixtures.SpanProfile, 0, n)
+		for i := 0; i < n; i++ {
+			traceID := make([]byte, 16)
+			spanID := make([]byte, 8)
+			traceID[0] = byte(i + 1)
+			spanID[0] = byte(i + 1)
+			spans = append(spans, fixtures.SpanProfile{
+				Name:          "op",
+				Service:       "svc",
+				StartNanos:    baseNS + offset + uint64(i)*1_000_000,
+				DurationNanos: 1_000_000,
+				TraceID:       traceID,
+				SpanID:        spanID,
+			})
+		}
+		wire, err := proto.Marshal(fixtures.TraceExportProfiled(spans))
+		if err != nil {
+			t.Fatal(err)
+		}
+		decoded, err := otlp.Decode(otlp.Traces, wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rec := compaction.JournalRecord{
+			Object: compaction.JournalObject{
+				Key:          "journal/inst-1/traces/" + name,
+				InstanceID:   "inst-1",
+				Instance:     "node-1",
+				Signal:       otlp.Traces,
+				ReceivedAt:   time.UnixMilli(baseMS + int64(offset)/1_000_000).UTC(),
+				ReceivedAtMS: baseMS + int64(offset)/1_000_000,
+			},
+			Wire: wire, Payload: wire, Decoded: decoded,
+		}
+		path := filepath.Join(t.TempDir(), name+".duckdb")
+		if _, err := compaction.BuildPart(ctx, path, "shots/shot-1/"+name+".duckdb", "", "", []compaction.JournalRecord{rec}); err != nil {
+			t.Fatalf("build part: %v", err)
+		}
+		return SegmentRef{Key: "shots/shot-1/" + name + ".duckdb", Instance: "node-1", Path: path}
+	}
+
+	refs := []SegmentRef{
+		build("part-0", 3, 0),
+		build("part-1", 4, 10_000_000),
+	}
+	window := NewServerWindow(
+		time.UnixMilli(baseMS).UTC(),
+		time.UnixMilli(baseMS+60_000).UTC(),
+		[]string{"node-1"},
+		"parts",
+	)
+	scoped, err := BuildScopedEngine(ctx, window, refs, ScopedOptions{WorkDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("build scoped: %v", err)
+	}
+	defer scoped.Close()
+
+	res, err := scoped.Engine.Query(ctx, ScopedPolicy(DefaultPolicy()), QueryRequest{SQL: "SELECT COUNT(*) AS n FROM spans"})
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if len(res.Rows) != 1 || len(res.Rows[0]) != 1 {
+		t.Fatalf("unexpected result %+v", res)
+	}
+	if got := res.Rows[0][0]; got != int64(7) && got != float64(7) && got != "7" {
+		t.Fatalf("expected 7 spans across both parts, got %v (%T)", got, got)
+	}
+}

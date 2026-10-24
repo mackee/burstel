@@ -70,7 +70,11 @@ import type { ToolContext } from "./tools";
 
 export type { AppEnv, AuthNamespaceLike, DoStubLike, IngestNamespaceLike, ShotNamespaceLike } from "./env";
 
-export async function handleRequest(request: Request, env: AppEnv): Promise<Response> {
+export async function handleRequest(
+  request: Request,
+  env: AppEnv,
+  execution?: { waitUntil(promise: Promise<unknown>): void },
+): Promise<Response> {
   try {
     const url = new URL(request.url);
     const path = url.pathname;
@@ -117,7 +121,7 @@ export async function handleRequest(request: Request, env: AppEnv): Promise<Resp
       });
     }
 
-    const ctx = toolContext(env, url);
+    const ctx = toolContext(env, url, execution);
 
     // -------------------------------------------------- instance registry
     // admin and member may manage operational instance credentials.
@@ -362,7 +366,7 @@ function ingestSignal(path: string): Signal | null {
   return match[1] as Signal;
 }
 
-function toolContext(env: AppEnv, url: URL): ToolContext {
+function toolContext(env: AppEnv, url: URL, execution?: { waitUntil(promise: Promise<unknown>): void }): ToolContext {
   return {
     namespace: env.SHOT_DO,
     ingest: env.INGEST_DO,
@@ -372,6 +376,30 @@ function toolContext(env: AppEnv, url: URL): ToolContext {
     publicBaseUrl: env.PUBLIC_BASE_URL,
     bucket: env.BUCKET,
     tokens: env.INSTANCE_TOKENS,
+    materialize: materializeOptions(env),
+    waitUntil: execution ? (promise) => execution.waitUntil(promise) : undefined,
+  };
+}
+
+/** Reads the spec-031 materialization bounds from the Worker vars. */
+export function materializeOptions(env: AppEnv): {
+  parallelism: number;
+  maxInstances: number;
+  waitMs: number;
+} {
+  const num = (raw: string | undefined, def: number): number => {
+    const parsed = Number.parseInt(raw ?? "", 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : def;
+  };
+  const vars = env as AppEnv & {
+    MATERIALIZE_PARALLELISM?: string;
+    MATERIALIZE_MAX_INSTANCES?: string;
+    MATERIALIZE_WAIT_MS?: string;
+  };
+  return {
+    parallelism: Math.min(8, num(vars.MATERIALIZE_PARALLELISM, 4)),
+    maxInstances: Math.min(8, num(vars.MATERIALIZE_MAX_INSTANCES, 4)),
+    waitMs: Math.min(300_000, num(vars.MATERIALIZE_WAIT_MS, 90_000)),
   };
 }
 

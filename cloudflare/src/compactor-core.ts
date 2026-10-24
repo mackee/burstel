@@ -352,6 +352,18 @@ export class CompactorCore {
       return report;
     }
 
+    // Spec 031 D3.5: continuous compaction is background retention and must not
+    // compete with an active shot materialization. The flag is TTL-bounded so a
+    // crashed materializer can never stall compaction forever.
+    const yieldState = await this.ingestCall<{ yield?: boolean }>("/internal/compaction/yield", "GET").catch(
+      () => ({ yield: false }),
+    );
+    if (yieldState.yield === true) {
+      report.skipped = "materialization_in_progress";
+      await this.finish(report, start);
+      return report;
+    }
+
     let lease: CompactionLease | null = null;
     let discovery: DiscoveryResult | null = null;
     let lastCompactedAt: number | null = null;

@@ -26,8 +26,9 @@
   // when COMPACTION_GC is explicitly enabled.
   "vars": {
     "MAX_INGEST_BYTES": "8388608",
-    // Spec 023 D2.2: late-write guard = COMPACTION_GRACE_MS / 2 by default.
-    "LATE_WRITE_LIMIT_MS": "45000",
+    // Spec 023 D2.2 / spec 031 D4: late-write guard. Slower PUTs still get a
+    // retryable 503, but shot materialization starts at end + this limit.
+    "LATE_WRITE_LIMIT_MS": "10000",
     "COMPACTION_WINDOW_MS": "60000",
     "COMPACTION_GRACE_MS": "90000",
     // Spec 023 D3.1: every run re-lists this lookback (>= 2 x grace).
@@ -47,7 +48,15 @@
     "COMPACTION_SCHEDULE_MS": "120000",
     "COMPACTION_LEASE_TTL_MS": "900000",
     // Spec 029: explicit CompactorCore -> container request deadline.
-    "COMPACTION_CONTAINER_TIMEOUT_MS": "60000"
+    "COMPACTION_CONTAINER_TIMEOUT_MS": "60000",
+    // Spec 031: shot-time parallel materialization bounds.
+    "MATERIALIZE_PARALLELISM": "4",
+    "MATERIALIZE_MAX_INSTANCES": "4",
+    "MATERIALIZE_WAIT_MS": "90000",
+    "MATERIALIZE_MAX_OBJECTS": "200000",
+    // Spec 031 D1: the bucket whose scoped token is injected into the
+    // compactor/materializer container. The credential itself is a Worker secret.
+    "R2_BUCKET_NAME": "burstel-shots"
   },
 
   "containers": [
@@ -71,9 +80,9 @@
       "image": "../Dockerfile.compactor",
       "image_build_context": "..",
       "instance_type": "standard-1",
-      // At most one active compactor instance; the fenced lease enforces a
-      // single active compaction per partition regardless.
-      "max_instances": 1
+      // Spec 031: up to four parallel materializer containers per shot. The
+      // fenced lease still enforces a single active *compaction* per partition.
+      "max_instances": 4
     }
   ],
 

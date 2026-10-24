@@ -78,6 +78,58 @@ export interface RegisteredShot {
   sha256: string | null;
 }
 
+/** One materialized shot part (`shots/<shot_id>/part-<i>.duckdb`). */
+export interface MaterializationPart {
+  index: number;
+  object_key: string;
+  size_bytes: number;
+  sha256: string;
+  object_count: number;
+  request_count: number;
+  record_count: number;
+  span_count: number;
+  log_count: number;
+  metric_count: number;
+  first_received_at: number;
+  last_received_at: number;
+}
+
+/** Durable status of shot-time parallel materialization (spec 031). */
+export interface MaterializationRecord {
+  state: "pending" | "running" | "complete" | "failed";
+  parts_done: number;
+  parts_total: number;
+  spans: number;
+  started_at: number | null;
+  finished_at: number | null;
+  parts: MaterializationPart[];
+  error?: string | null;
+}
+
+/** One journal object included in a materialization plan. */
+export interface MaterializationObject {
+  key: string;
+  signal: string;
+  received_at: number;
+  content_encoding: string;
+  content_type: string;
+  size: number;
+  sha256: string;
+  instance_id: string;
+  instance: string;
+}
+
+/** The ControlDO's bounded enumeration of a shot's journal keys. */
+export interface MaterializationPlan {
+  shot_id: string;
+  from_ms: number;
+  to_ms: number;
+  objects: MaterializationObject[];
+  excluded: string[];
+  total_bytes: number;
+  truncated: boolean;
+}
+
 /** One registered logical-window shot (spec 016). */
 export interface WindowShotRecord extends RegisteredShot {
   kind: "window" | "recording";
@@ -85,6 +137,7 @@ export interface WindowShotRecord extends RegisteredShot {
   window: ShotWindow | null;
   query_watermark_ms: number | null;
   coverage: WindowCoverage | null;
+  materialization: MaterializationRecord | null;
 }
 
 /** Completeness of a window shot. Missing data is always disclosed. */
@@ -346,6 +399,13 @@ export interface IngestCoreDeps {
    * client-supplied hash. Optional only for pure unit tests.
    */
   bucket?: R2BucketLike;
+  /**
+   * Late-write budget used to extend a shot's materialization range
+   * (`end + LATE_WRITE_LIMIT_MS`). Defaults to 10 000 ms (spec 031 D4).
+   */
+  lateWriteLimitMs?: number;
+  /** Upper bound on journal objects in one materialization plan. */
+  maxMaterializeObjects?: number;
 }
 
 const SCHEMA_STATEMENTS: string[] = [
@@ -363,7 +423,8 @@ const SCHEMA_STATEMENTS: string[] = [
      name             TEXT,
      window_json      TEXT,
      query_watermark_ms INTEGER,
-     coverage_json    TEXT
+     coverage_json    TEXT,
+     materialization_json TEXT
    )`,
   `CREATE INDEX IF NOT EXISTS shot_registry_created ON shot_registry (created_at)`,
   // Durable raw-journal index: one row per acknowledged OTLP export. The raw
@@ -465,6 +526,13 @@ const SCHEMA_STATEMENTS: string[] = [
      expires_at  INTEGER
    )`,
   `CREATE INDEX IF NOT EXISTS segment_pins_shot ON segment_pins (shot_id)`,
+  // Spec 031: active materialization runs make continuous compaction yield.
+  // Rows carry an expiry so a crashed materializer can never stall compaction.
+  `CREATE TABLE IF NOT EXISTS materialization_runs (
+     shot_id    TEXT PRIMARY KEY,
+     started_at INTEGER NOT NULL,
+     expires_at INTEGER NOT NULL
+   )`,
 ];
 
 export class IngestCore {
@@ -472,6 +540,8 @@ export class IngestCore {
   private readonly now: () => number;
   private readonly instances: InstanceCore;
   private readonly bucket?: R2BucketLike;
+  private readonly lateWriteLimitMs: number;
+  private readonly maxMaterializeObjects: number;
   private loaded = false;
   private loading?: Promise<void>;
 
@@ -479,6 +549,8 @@ export class IngestCore {
     this.sql = deps.sql;
     this.now = deps.now ?? (() => Date.now());
     this.bucket = deps.bucket;
+    this.lateWriteLimitMs = Math.max(0, deps.lateWriteLimitMs ?? 10_000);
+    this.maxMaterializeObjects = Math.max(1, deps.maxMaterializeObjects ?? 200_000);
     this.instances = new InstanceCore({
       sql: deps.sql,
       now: deps.now,
@@ -497,6 +569,7 @@ export class IngestCore {
       `ALTER TABLE shot_registry ADD COLUMN window_json TEXT`,
       `ALTER TABLE shot_registry ADD COLUMN query_watermark_ms INTEGER`,
       `ALTER TABLE shot_registry ADD COLUMN coverage_json TEXT`,
+      `ALTER TABLE shot_registry ADD COLUMN materialization_json TEXT`,
       // Additive migration for a segment_pins table created before TTL support.
       `ALTER TABLE segment_pins ADD COLUMN expires_at INTEGER`,
       // Additive migration for coverage rows created before spec 023 GC markers.
@@ -607,7 +680,7 @@ export class IngestCore {
     const rows = this.sql
       .exec(
         `SELECT shot_id, owner, created_at, state, stopped_at, size_bytes, sha256,
-                kind, name, window_json, query_watermark_ms, coverage_json
+                kind, name, window_json, query_watermark_ms, coverage_json, materialization_json
            FROM shot_registry ${where}
           ORDER BY created_at DESC, shot_id DESC
           LIMIT ? OFFSET ?`,
@@ -636,6 +709,7 @@ export class IngestCore {
     this.upsertWindowRow(input.shot_id, input.owner, window, state, coverage, input.metadata);
     // Protect the shot's receive-time range from GC (TTL-bounded).
     await this.addPin(input.shot_id, null, window.start_ms, window.end_ms, DEFAULT_SHOT_PIN_TTL_MS);
+    this.ensureMaterializationPending(input.shot_id);
     const row = this.getShotRecord(input.shot_id);
     if (!row) throw new Error("failed to persist window shot");
     return row;
@@ -710,14 +784,14 @@ export class IngestCore {
     );
     // Refresh the GC pin over the finalized window range (TTL-bounded).
     await this.addPin(shotId, null, window.start_ms, window.end_ms, DEFAULT_SHOT_PIN_TTL_MS);
+    this.ensureMaterializationPending(shotId);
     const updated = this.getShotRecord(shotId);
     if (!updated) throw new Error("failed to persist stopped window shot");
     return updated;
   }
 
   /** Records the coverage/completeness computed by an analysis pass. */
-  async setWindowCoverage(shotId: string, coverage: WindowCoverage): Promise<WindowShotRecord> {
-    await this.ensureLoaded();
+  async setWindowCoverage(shotId: string, coverage: WindowCoverage): Promise<WindowShotRecord> {    await this.ensureLoaded();
     const row = this.getShotRecord(shotId);
     if (!row) throw badRequest("unknown window shot");
     const normalized = normalizeCoverage(coverage, row.window?.instances ?? []);
@@ -733,12 +807,170 @@ export class IngestCore {
     return updated;
   }
 
+  /**
+   * Enumerates the journal objects a shot needs, bounded to
+   * `[start - 5s, end + LATE_WRITE_LIMIT_MS]` for every selected instance and
+   * signal (spec 031 D3.1). Keys sort by `received_at`, so the JS coordinator
+   * can split contiguous chunks by byte size without another listing.
+   */
+  async materializationPlan(shotId: string): Promise<MaterializationPlan> {
+    await this.ensureLoaded();
+    const row = this.getShotRecord(shotId);
+    if (!row) throw badRequest("unknown window shot");
+    if (!row.window) throw badRequest("shot is not a window shot");
+    if (!this.bucket) throw badRequest("object bucket binding is unavailable");
+    const window = row.window;
+    const fromMs = Math.max(0, window.start_ms - 5_000);
+    const toMs = window.end_ms + this.lateWriteLimitMs;
+
+    let instanceIds: string[] = [];
+    if (window.instances.length > 0) {
+      const listed = await this.instances.list();
+      const wanted = new Set(window.instances);
+      instanceIds = listed.instances.filter((i) => wanted.has(i.name)).map((i) => i.instance_id);
+    }
+    const listed = await listJournalObjects(this.bucket, {
+      instanceIds: instanceIds.length > 0 ? instanceIds : undefined,
+      fromMs,
+      toMs,
+      maxObjects: this.maxMaterializeObjects,
+      maxScan: this.maxMaterializeObjects * 4,
+      pageSize: 1000,
+    });
+    const excludedRows = this.sql
+      .exec(`SELECT journal_key FROM excluded_journal WHERE received_at >= ? AND received_at < ?`, fromMs, toMs)
+      .toArray();
+    const excluded = new Set(excludedRows.map((r) => String(r.journal_key)));
+    const objects: MaterializationObject[] = [];
+    let totalBytes = 0;
+    for (const info of listed.objects) {
+      if (excluded.has(info.key)) continue;
+      totalBytes += info.size;
+      objects.push({
+        key: info.key,
+        signal: info.signal,
+        received_at: info.received_at,
+        content_encoding: info.content_encoding,
+        content_type: info.content_type,
+        size: info.size,
+        sha256: info.sha256,
+        instance_id: info.instance_id,
+        instance: info.instance,
+      });
+    }
+    return {
+      shot_id: shotId,
+      from_ms: fromMs,
+      to_ms: toMs,
+      objects,
+      excluded: [...excluded].sort(),
+      total_bytes: totalBytes,
+      truncated: listed.truncated,
+    };
+  }
+
+  /** Initializes `materialization.state = pending` exactly once. */
+  private ensureMaterializationPending(shotId: string): void {
+    const pending: MaterializationRecord = {
+      state: "pending",
+      parts_done: 0,
+      parts_total: 0,
+      spans: 0,
+      started_at: null,
+      finished_at: null,
+      parts: [],
+      error: null,
+    };
+    this.sql.exec(
+      `UPDATE shot_registry SET materialization_json = ?
+        WHERE shot_id = ? AND (materialization_json IS NULL OR materialization_json = '')`,
+      JSON.stringify(pending),
+      shotId,
+    );
+  }
+
+  /** Persists the current materialization status for a shot. */
+  async setMaterialization(shotId: string, record: MaterializationRecord): Promise<WindowShotRecord> {
+    await this.ensureLoaded();
+    const row = this.getShotRecord(shotId);
+    if (!row) throw badRequest("unknown window shot");
+    if (!["pending", "running", "complete", "failed"].includes(record.state)) {
+      throw badRequest("invalid materialization state");
+    }
+    const normalized: MaterializationRecord = {
+      state: record.state,
+      parts_done: numOr(record.parts_done, 0),
+      parts_total: numOr(record.parts_total, 0),
+      spans: numOr(record.spans, 0),
+      started_at: typeof record.started_at === "number" ? record.started_at : null,
+      finished_at: typeof record.finished_at === "number" ? record.finished_at : null,
+      parts: Array.isArray(record.parts) ? record.parts : [],
+      error: record.error ?? null,
+    };
+    this.sql.exec(
+      `UPDATE shot_registry SET materialization_json = ? WHERE shot_id = ?`,
+      JSON.stringify(normalized),
+      shotId,
+    );
+    const updated = this.getShotRecord(shotId);
+    if (!updated) throw new Error("failed to persist materialization");
+    return updated;
+  }
+
+  /**
+   * Marks a materialization as active so continuous compaction yields. The
+   * lease is TTL-bounded: a crashed coordinator cannot stall compaction.
+   */
+  async beginMaterializationRun(shotId: string, ttlMs: number): Promise<{ active: number }> {
+    await this.ensureLoaded();
+    const now = this.now();
+    const ttl = Math.max(1_000, ttlMs > 0 ? ttlMs : 5 * 60 * 1000);
+    this.pruneMaterializationRuns(now);
+    this.sql.exec(
+      `INSERT INTO materialization_runs (shot_id, started_at, expires_at) VALUES (?, ?, ?)
+       ON CONFLICT (shot_id) DO UPDATE SET started_at = excluded.started_at, expires_at = excluded.expires_at`,
+      shotId,
+      now,
+      now + ttl,
+    );
+    return { active: this.activeMaterializationRuns(now) };
+  }
+
+  /** Releases one materialization run. */
+  async endMaterializationRun(shotId: string): Promise<{ active: number }> {
+    await this.ensureLoaded();
+    const now = this.now();
+    this.pruneMaterializationRuns(now);
+    this.sql.exec(`DELETE FROM materialization_runs WHERE shot_id = ?`, shotId);
+    return { active: this.activeMaterializationRuns(now) };
+  }
+
+  /** True while any unexpired materialization run is active. */
+  async materializationYield(): Promise<{ yield: boolean; active: number }> {
+    await this.ensureLoaded();
+    const now = this.now();
+    this.pruneMaterializationRuns(now);
+    const active = this.activeMaterializationRuns(now);
+    return { yield: active > 0, active };
+  }
+
+  private pruneMaterializationRuns(now: number): void {
+    this.sql.exec(`DELETE FROM materialization_runs WHERE expires_at <= ?`, now);
+  }
+
+  private activeMaterializationRuns(now: number): number {
+    const rows = this.sql
+      .exec(`SELECT COUNT(*) AS n FROM materialization_runs WHERE expires_at > ?`, now)
+      .toArray();
+    return Number(rows[0]?.n ?? 0);
+  }
+
   /** One registry row (window or legacy), or null. */
   getShotRecord(shotId: string): WindowShotRecord | null {
     const rows = this.sql
       .exec(
         `SELECT shot_id, owner, created_at, state, stopped_at, size_bytes, sha256,
-                kind, name, window_json, query_watermark_ms, coverage_json
+                kind, name, window_json, query_watermark_ms, coverage_json, materialization_json
            FROM shot_registry WHERE shot_id = ?`,
         shotId,
       )
@@ -756,11 +988,13 @@ export class IngestCore {
   ): void {
     this.sql.exec(
       `INSERT INTO shot_registry
-         (shot_id, owner, created_at, state, kind, name, window_json, coverage_json)
-       VALUES (?, ?, ?, ?, 'window', ?, ?, ?)
+         (shot_id, owner, created_at, state, kind, name, window_json, coverage_json, materialization_json)
+       VALUES (?, ?, ?, ?, 'window', ?, ?, ?, ?)
        ON CONFLICT (shot_id) DO UPDATE SET
          owner = excluded.owner, state = excluded.state, kind = 'window',
-         name = excluded.name, window_json = excluded.window_json, coverage_json = excluded.coverage_json`,
+         name = excluded.name, window_json = excluded.window_json,
+         coverage_json = excluded.coverage_json,
+         materialization_json = COALESCE(shot_registry.materialization_json, excluded.materialization_json)`,
       shotId,
       owner && owner.trim() !== "" ? owner.trim() : "legacy",
       this.now(),
@@ -768,6 +1002,7 @@ export class IngestCore {
       window.name ?? null,
       windowToJSON(window),
       JSON.stringify(coverage),
+      null,
     );
     void metadata;
   }
@@ -2027,6 +2262,44 @@ export class IngestCore {
         }
         return json(200, await this.setWindowCoverage(body.shot_id, body.coverage ?? ({} as WindowCoverage)));
       }
+      if (path === "/internal/shot/materialize-plan") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ shot_id?: string }>(request);
+        if (typeof body.shot_id !== "string" || body.shot_id === "") {
+          return json(400, { error: "shot_id is required", code: "bad_request" });
+        }
+        return json(200, await this.materializationPlan(body.shot_id));
+      }
+      if (path === "/internal/shot/materialization") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ shot_id?: string; materialization?: MaterializationRecord }>(request);
+        if (typeof body.shot_id !== "string" || body.shot_id === "" || !body.materialization) {
+          return json(400, { error: "shot_id and materialization are required", code: "bad_request" });
+        }
+        return json(200, await this.setMaterialization(body.shot_id, body.materialization));
+      }
+      if (path === "/internal/materialization/begin") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ shot_id?: string; ttl_ms?: number }>(request);
+        if (typeof body.shot_id !== "string" || body.shot_id === "") {
+          return json(400, { error: "shot_id is required", code: "bad_request" });
+        }
+        return json(200, await this.beginMaterializationRun(body.shot_id, body.ttl_ms ?? 0));
+      }
+      if (path === "/internal/materialization/end") {
+        if (request.method !== "POST") return json(405, { error: "method not allowed" });
+        const body = await readJson<{ shot_id?: string }>(request);
+        if (typeof body.shot_id !== "string" || body.shot_id === "") {
+          return json(400, { error: "shot_id is required", code: "bad_request" });
+        }
+        return json(200, await this.endMaterializationRun(body.shot_id));
+      }
+      if (path === "/internal/compaction/yield") {
+        if (request.method !== "GET" && request.method !== "POST") {
+          return json(405, { error: "method not allowed" });
+        }
+        return json(200, await this.materializationYield());
+      }
       if (path === "/internal/shot/get") {
         if (request.method !== "POST") return json(405, { error: "method not allowed" });
         const body = await readJson<{ shot_id?: string }>(request);
@@ -2167,6 +2440,14 @@ function registeredRow(row: SqlRow): WindowShotRecord {
       coverage = null;
     }
   }
+  let materialization: MaterializationRecord | null = null;
+  if (row.materialization_json != null && String(row.materialization_json) !== "") {
+    try {
+      materialization = JSON.parse(String(row.materialization_json)) as MaterializationRecord;
+    } catch {
+      materialization = null;
+    }
+  }
   return {
     shot_id: String(row.shot_id),
     owner: row.owner == null ? "legacy" : String(row.owner),
@@ -2180,6 +2461,7 @@ function registeredRow(row: SqlRow): WindowShotRecord {
     window,
     query_watermark_ms: row.query_watermark_ms == null ? null : Number(row.query_watermark_ms),
     coverage,
+    materialization,
   };
 }
 

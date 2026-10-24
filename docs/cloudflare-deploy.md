@@ -45,6 +45,9 @@ runs as the nonroot user `burstel` (uid 10001).
 | --- | --- | --- |
 | `BURSTEL_API_TOKEN` | admin: `/api/*`, `/mcp`, legacy per-shot path | Worker secret |
 | `BURSTEL_INTERNAL_TOKEN` | recorder `/internal/*` defense-in-depth | Worker secret, injected into the container by the `ShotDO` |
+| `R2_ACCESS_KEY_ID` | bucket-scoped S3 credential: read `journal/`, write `segments/` + `shots/` | Worker secret, injected into the **compactor/materializer container only** (spec 031 D1) |
+| `R2_SECRET_ACCESS_KEY` | paired secret for the scoped token | Worker secret, same injection scope |
+| `R2_ACCOUNT_ID` | R2 S3 endpoint account (`https://<id>.r2.cloudflarestorage.com`) | Worker secret, same injection scope |
 | instance push token | `POST /ingest/v1/{traces,metrics,logs}` only, exactly 24h, routes to its named instance | minted at runtime by `POST /api/instances/{name}/tokens` (admin\|member), shown **once**; only its digest is stored in the control DO (and positively cached in KV) |
 | per-person token | `/api/*` + `/mcp` as `admin` or `member` (member = full operational, no registry) | minted at runtime by `POST /api/tokens` (admin only), shown **once**; only its digest is stored in `AuthDO` |
 
@@ -66,6 +69,33 @@ read back after it is set:
 scripts/secret-put.sh BURSTEL_API_TOKEN       # or: make cf-secret-put NAME=BURSTEL_API_TOKEN
 scripts/secret-put.sh BURSTEL_INTERNAL_TOKEN  # pass --show to print it once
 ```
+
+### 2a. Bucket-scoped R2 credential for materialization (spec 031)
+
+Shot-time materialization needs the compactor container to GET `journal/` and
+PUT `shots/<shot_id>/part-*.duckdb` directly. Create a dedicated R2 API token
+in the dashboard (or with the R2 token API) and scope it to the **single**
+bucket configured in `wrangler.jsonc` (`r2_buckets[BUCKET].bucket_name`):
+
+1. Permissions: **Object Read & Write** for that bucket only. No account-level
+   R2 admin, no other bucket.
+2. Bucket scope: the one bucket from the Wrangler config. Do not use an
+   account-wide token.
+3. Put the three values as Worker secrets. They are injected into the
+   `CompactorDO` container env only (never the `ShotDO` recorder, never the
+   public Worker response):
+
+```bash
+wrangler secret put R2_ACCESS_KEY_ID
+wrangler secret put R2_SECRET_ACCESS_KEY
+wrangler secret put R2_ACCOUNT_ID
+```
+
+`R2_BUCKET_NAME` (in `vars`) tells the container which bucket the token is
+scoped to; it must match the `BUCKET` binding. The preflight only checks that
+the three secret **names** exist; it never reads values. Rotating the token is
+an explicit operator action: set the new pair, deploy, then revoke the old R2
+token.
 
 ## 3. Build and prove the image first
 
@@ -123,7 +153,8 @@ The full preflight checks, without mutating anything:
 * Worker/DO collision lookup (a deploy updates in place; resources are never
   recreated);
 * effective secret **presence** via `wrangler secret list` (names only — values
-  are never read or printed);
+  are never read or printed), including the spec-031 bucket-scoped
+  `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` / `R2_ACCOUNT_ID`;
 * `docker`/`buildx`/`linux/amd64` compatibility;
 * the `wrangler.jsonc` invariants: `ShotDO` container on `standard-1`, bounded
   `max_instances`, SQLite `ShotDO`/`IngestDO`/`AuthDO` exports, the deploy-safe
@@ -151,7 +182,28 @@ If the deployment partially fails, the Worker and Container may be at different
 revisions; re-run the deploy after fixing the image/config rather than patching
 live.
 
-## 5a. Upgrade order from 018/022 to 023+ (spec 024 R2)
+## 5b. Shot-time materialization (spec 031)
+
+`shot_stop` returns immediately and starts background materialization. On the
+first `shot_analyze`/`shot_query`/`shot_compare` for an unmaterialized window the
+Worker also starts it lazily. The ControlDO enumerates journal keys in
+`[start - 5 s, end + LATE_WRITE_LIMIT_MS]`, splits them into
+`MATERIALIZE_PARALLELISM` byte-balanced chunks, and each chunk runs on a
+distinct `CompactorDO` name (`materializer-<shot>-<i>`). Every part is written to
+`shots/<shot_id>/part-<i>.duckdb`; the shot record exposes:
+
+```json
+{"materialization":{"state":"complete","parts_done":4,"parts_total":4,
+  "spans":8000000,"started_at":"...","finished_at":"...","parts":[...]}}
+```
+
+`shot_analyze` waits up to `MATERIALIZE_WAIT_MS` (default 90 s) for completion.
+While a materialization is active, continuous compaction reports
+`skipped: "materialization_in_progress"` and resumes after the TTL-bounded run
+ends. `LATE_WRITE_LIMIT_MS` defaults to 10 s (spec 031 D4); slower PUTs still
+receive a retryable 503.
+
+
 
 An existing installation deployed at 018/022 has `IngestDO` storage and `bit_`
 instance tokens that predate the 023 KV admission cache. Upgrade in this exact

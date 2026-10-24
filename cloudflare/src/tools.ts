@@ -27,7 +27,9 @@ import type {
 } from "./env";
 import { badRequest, conflict, HttpError, unknownInstance } from "./errors";
 import { INGEST_DO_NAME, isValidInstanceName, normalizeInstanceName } from "./ingest-core";
-import type { CreateWindowShotInput, InstanceMetadata, InstanceTokenIssue, InstanceTokenMetadata, JournalListingStats, SegmentManifestRow, StartWindowShotInput, WindowShotRecord } from "./ingest-core";
+import type { CreateWindowShotInput, InstanceMetadata, InstanceTokenIssue, InstanceTokenMetadata, JournalListingStats, MaterializationPart, SegmentManifestRow, StartWindowShotInput, WindowShotRecord } from "./ingest-core";
+import { ensureMaterialized, materializeShot } from "./materialize";
+import type { MaterializeOptions } from "./materialize";
 import { isShotId, newShotId } from "./ids";
 import { isValidInstanceLabel, normalizeInstances, selectSegments } from "./shot-window";
 import type { ShotWindow, WindowSegmentMeta } from "./shot-window";
@@ -54,6 +56,10 @@ export interface ToolContext {
    * tokens.
    */
   tokens?: KVNamespaceLike;
+  /** Spec 031 materialization bounds (parallelism/wait/instance cap). */
+  materialize?: MaterializeOptions;
+  /** Keeps background materialization alive after shot_stop returns. */
+  waitUntil?: (promise: Promise<unknown>) => void;
 }
 
 export interface FreezeRef {
@@ -263,7 +269,13 @@ export async function dispatchStop(
 ): Promise<Record<string, unknown>> {
   const record = await getShotRecord(ctx, shotId);
   if (record && record.kind === "window") {
-    return windowShotInfo(await stopWindowShot(ctx, shotId, endedAtMs), ctx);
+    const stopped = await stopWindowShot(ctx, shotId, endedAtMs);
+    // Spec 031 D4: shot_stop returns immediately. Materialization runs in the
+    // background; shot_analyze/query/compare lazily waits for it and can start
+    // it itself if this background attempt was lost.
+    const started = materializeShot(ctx, stopped).catch(() => undefined);
+    if (ctx.waitUntil) ctx.waitUntil(started);
+    return windowShotInfo(stopped, ctx);
   }
   return stopShot(ctx, shotId);
 }
@@ -288,6 +300,30 @@ export function windowShotInfo(record: WindowShotRecord, ctx: ToolContext): Reco
       : undefined,
     query_watermark: record.query_watermark_ms === null ? undefined : new Date(record.query_watermark_ms).toISOString(),
     coverage: record.coverage ?? undefined,
+    materialization: record.materialization
+      ? {
+          state: record.materialization.state,
+          parts_done: record.materialization.parts_done,
+          parts_total: record.materialization.parts_total,
+          spans: record.materialization.spans,
+          started_at:
+            record.materialization.started_at === null
+              ? undefined
+              : new Date(record.materialization.started_at).toISOString(),
+          finished_at:
+            record.materialization.finished_at === null
+              ? undefined
+              : new Date(record.materialization.finished_at).toISOString(),
+          parts: record.materialization.parts.map((part) => ({
+            index: part.index,
+            object_key: part.object_key,
+            size_bytes: part.size_bytes,
+            sha256: part.sha256,
+            spans: part.span_count,
+          })),
+          error: record.materialization.error ?? undefined,
+        }
+      : undefined,
     created_at: new Date(record.created_at).toISOString(),
     stopped_at: record.stopped_at === null ? undefined : new Date(record.stopped_at).toISOString(),
     otlp_base_url: `${base}/ingest`,
@@ -730,8 +766,10 @@ async function openWindowSession(
   sessionId: string,
   window: ShotWindow,
   catalog: SegmentManifestRow[],
+  parts: MaterializationPart[] | null = null,
 ): Promise<{
   selected: number;
+  expected: number;
   available: number;
   missing: string[];
   pending_journal: number;
@@ -744,6 +782,71 @@ async function openWindowSession(
     () => ({ instances: [] as InstanceMetadata[] }),
   );
   const nameById = new Map(instances.instances.map((i) => [i.instance_id, i.name]));
+
+  if (parts !== null) {
+    // Spec 031: a materialized shot is ATTACHed directly from its part files.
+    // No continuous-compaction segment, no pending-journal disclaimer.
+    const catalogWire = parts.map((part) => ({
+      key: part.object_key,
+      instance_id: "all",
+      instance: "",
+      status: "verified",
+      size: part.size_bytes,
+      sha256: part.sha256,
+      first_received_at: part.first_received_at || window.start_ms,
+      last_received_at: part.last_received_at || window.end_ms,
+      event_min_ns: null,
+      event_max_ns: null,
+    }));
+    await doJson(stub, "/internal/window/open", "POST", {
+      session_id: sessionId,
+      window: windowWire(window),
+      catalog: catalogWire,
+    });
+    for (const part of parts) {
+      const object = await ctx.bucket.get(part.object_key);
+      if (!object || !object.body) {
+        throw new HttpError(503, `materialization part ${part.object_key} is missing from R2`, true, "part_missing");
+      }
+      await doRawJson(stub, "/internal/window/segment", {
+        "content-type": "application/octet-stream",
+        "x-burstel-session-id": sessionId,
+        "x-burstel-segment-key": part.object_key,
+        "x-burstel-segment-instance": "",
+        "x-burstel-size": String(part.size_bytes),
+        "x-burstel-sha256": part.sha256,
+      }, object.body);
+    }
+    await doJson(stub, "/internal/window/commit", "POST", { session_id: sessionId });
+    // Materialization consumes the journal in the range, so `pending_journal`
+    // is zero; the compaction lookback warning is still disclosed because it
+    // says objects may be missing from *any* view, including a part.
+    const windowNames = new Set(window.instances);
+    const instanceIds =
+      windowNames.size === 0
+        ? []
+        : instances.instances.filter((i) => windowNames.has(i.name)).map((i) => i.instance_id);
+    const pending = await ingestCall<{
+      lookback_truncated?: boolean;
+      lookback_in_range?: boolean;
+      lookback_floor_ms?: number | null;
+    }>(ctx, "/internal/compaction/pending", "POST", {
+      instance_ids: instanceIds,
+      from_ms: window.start_ms,
+      to_ms: window.end_ms,
+    }).catch(() => ({ lookback_truncated: false, lookback_in_range: false, lookback_floor_ms: null }));
+    return {
+      selected: parts.length,
+      expected: parts.length,
+      available: parts.length,
+      missing: [],
+      pending_journal: 0,
+      lookback_truncated: pending.lookback_truncated === true,
+      lookback_in_range: pending.lookback_in_range === true,
+      lookback_floor_ms: typeof pending.lookback_floor_ms === "number" ? pending.lookback_floor_ms : null,
+    };
+  }
+
   const metas: WindowSegmentMeta[] = catalog.map((s) => ({
     segment_key: s.segment_key,
     instance_id: s.instance_id,
@@ -809,6 +912,7 @@ async function openWindowSession(
   }));
   return {
     selected: selection.selected.length,
+    expected: selection.expected,
     available,
     missing,
     pending_journal: pending.pending_journal,
@@ -816,6 +920,21 @@ async function openWindowSession(
     lookback_in_range: pending.lookback_in_range === true,
     lookback_floor_ms: typeof pending.lookback_floor_ms === "number" ? pending.lookback_floor_ms : null,
   };
+}
+
+/** Lazily materializes a window before analysis (spec 031 D3.1/D4). */
+async function ensureWindowMaterialized(ctx: ToolContext, record: WindowShotRecord): Promise<WindowShotRecord> {
+  if (!ctx.compactor || !record.window) return record;
+  if (record.materialization?.state === "complete") return record;
+  try {
+    return await ensureMaterialized(ctx, record, ctx.materialize ?? {});
+  } catch (error) {
+    // A materialization failure must not make pre-031 backlog analysis
+    // impossible: fall back to the segment path, except for a timeout where the
+    // caller explicitly asked to wait for completion.
+    if (error instanceof HttpError && error.code === "materialization_timeout") throw error;
+    return record;
+  }
 }
 
 /** Runs `run` against a freshly committed window session, then releases it. */
@@ -827,9 +946,11 @@ async function withWindowSession<T>(
   if (!record.window) throw badRequest("shot is not a window shot");
   const stub = ctx.namespace.getByName(record.shot_id);
   const sessionId = `w-${record.shot_id}`;
+  const current = await ensureWindowMaterialized(ctx, record);
   const catalog = await listAllSegments(ctx);
-  const result = await openWindowSession(ctx, stub, sessionId, record.window, catalog);
-  await syncCoverage(ctx, record, catalog, result);
+  const parts = current.materialization?.state === "complete" ? current.materialization.parts : null;
+  const result = await openWindowSession(ctx, stub, sessionId, current.window!, catalog, parts);
+  await syncCoverage(ctx, current, catalog, result);
   try {
     return await run(sessionId);
   } finally {
@@ -848,8 +969,10 @@ async function withWindowSessions<T>(
   const catalog = await listAllSegments(ctx);
   for (const session of sessions) {
     if (!session.record.window) throw badRequest("shot is not a window shot");
-    const result = await openWindowSession(ctx, stub, session.sessionId, session.record.window, catalog);
-    await syncCoverage(ctx, session.record, catalog, result);
+    const current = await ensureWindowMaterialized(ctx, session.record);
+    const parts = current.materialization?.state === "complete" ? current.materialization.parts : null;
+    const result = await openWindowSession(ctx, stub, session.sessionId, current.window!, catalog, parts);
+    await syncCoverage(ctx, current, catalog, result);
   }
   try {
     return await run();
@@ -867,6 +990,7 @@ async function syncCoverage(
   catalog: SegmentManifestRow[],
   result: {
     missing?: string[];
+    expected?: number;
     pending_journal?: number;
     lookback_truncated?: boolean;
     lookback_in_range?: boolean;
@@ -882,8 +1006,8 @@ async function syncCoverage(
     await ingestCall(ctx, "/internal/shot/window/coverage", "POST", {
       shot_id: record.shot_id,
       coverage: {
-        expected_segments: catalog.length,
-        available_segments: catalog.length - missing.length,
+        expected_segments: result.expected ?? catalog.length,
+        available_segments: (result.expected ?? catalog.length) - missing.length,
         missing_segments: missing,
         instances: record.window?.instances ?? [],
         pending_journal: pending,
