@@ -67,6 +67,12 @@ export interface MaterializeRunState {
   analysis_preloaded?: boolean;
   /** Spec 035: bounded attempts to reach the ShotDO preload alarm. */
   analysis_preload_attempts?: number;
+  /**
+   * Spec 037: pool member index -> epoch ms until which the member is
+   * considered unhealthy after a capacity error. Persisted so a cooldown
+   * survives the capacity backoff alarm.
+   */
+  member_cooldowns?: Record<string, number>;
 }
 
 export interface MaterializeStore {
@@ -100,6 +106,11 @@ export interface MaterializeDriverConfig {
   partTargetSpans: number;
   /** Spec 034: measured spans per KiB of stored journal bytes (default 40). */
   partSpansPerKiB: number;
+  /**
+   * Spec 037: how long a pool member stays unhealthy after a capacity error
+   * (default 60 s). Its queued parts are stolen by healthy idle members.
+   */
+  memberCooldownMs: number;
 }
 
 export interface MaterializeDriverDeps {
@@ -150,6 +161,7 @@ const DEFAULT_CONFIG: MaterializeDriverConfig = {
   partsPerMember: 2,
   partTargetSpans: 500_000,
   partSpansPerKiB: 40,
+  memberCooldownMs: 60_000,
 };
 
 interface PartOutcome {
@@ -160,6 +172,14 @@ interface PartOutcome {
   capacity?: boolean;
   durationMs: number;
   bytes: number;
+}
+
+/** Spec 037: one pool tick's outcome flags for alarm scheduling. */
+interface PoolRound {
+  /** A part exhausted its attempts; the run is terminally failed. */
+  terminal: boolean;
+  /** Parts remain but every pool member is cooling down. */
+  capacityBackoff: boolean;
 }
 
 export class MaterializeDriver {
@@ -212,6 +232,7 @@ export class MaterializeDriver {
       partsPerMember: clampInt(config.partsPerMember, 1, 8, DEFAULT_CONFIG.partsPerMember),
       partTargetSpans: clampInt(config.partTargetSpans, 1_000, 10_000_000, DEFAULT_CONFIG.partTargetSpans),
       partSpansPerKiB: clampInt(config.partSpansPerKiB, 1, 10_000, DEFAULT_CONFIG.partSpansPerKiB),
+      memberCooldownMs: clampInt(config.memberCooldownMs, 1_000, 3_600_000, DEFAULT_CONFIG.memberCooldownMs),
     };
   }
 
@@ -447,97 +468,14 @@ export class MaterializeDriver {
         terminal = this.releaseExpiredLeases(run, now);
       }
 
-      // Spec 033: fixed pool assignment with queueing. Only free pool members
-      // receive a part; the rest stay `pending` for a later iteration/alarm.
-      while (!terminal) {
-        const busy = new Set<number>();
-        for (const part of run.parts) {
-          if (part.state === "running" && typeof part.pool_member === "number") busy.add(part.pool_member);
-        }
-        const free: number[] = [];
-        for (let member = 0; member < this.parallelism(); member++) {
-          if (!busy.has(member)) free.push(member);
-        }
-        const claimable = run.parts.filter((part) => part.state === "pending").slice(0, free.length);
-        if (claimable.length === 0) break;
-        for (let i = 0; i < claimable.length; i++) {
-          const part = claimable[i]!;
-          if (part.attempts >= this.config.maxAttempts) {
-            part.state = "failed";
-            part.error ??= `part gave up after ${part.attempts} attempts`;
-            run.error = `part ${part.index} failed after ${part.attempts} attempts: ${part.error}`;
-            terminal = "failed";
-            break;
-          }
-          part.state = "running";
-          part.attempts += 1;
-          part.pool_member = free[i]!;
-          part.lease_owner = run.run_id;
-          part.lease_expires_at = this.now() + this.config.leaseTtlMs;
-          part.started_at ??= this.now();
-        }
-        if (terminal) break;
-
-        await this.persist(run);
-        const outcomes = await Promise.all(
-          claimable.map((part) =>
-            this.runPart(run, part, chunks[part.index], chunks.length, plan.excluded, part.pool_member ?? 0),
-          ),
-        );
-        let retry = false;
-        for (const outcome of outcomes) {
-          const part = outcome.part;
-          if (outcome.capacity) {
-            // No platform capacity is a transient queue condition: refund the
-            // attempt so a busy installation cannot exhaust max_attempts.
-            part.attempts = Math.max(0, part.attempts - 1);
-            part.state = "pending";
-            part.lease_owner = null;
-            part.lease_expires_at = null;
-            part.pool_member = null;
-            part.error = outcome.error ?? "no container instance available";
-            capacityBackoff = true;
-            this.log("materialize.part.capacity_retry", {
-              shot_id: run.shot_id,
-              part: part.index,
-              attempt: part.attempts,
-              error: part.error,
-            });
-            continue;
-          }
-          part.pool_member = null;
-          if (outcome.result) {
-            part.state = "complete";
-            part.finished_at = this.now();
-            part.lease_owner = null;
-            part.lease_expires_at = null;
-            part.error = null;
-            run.results.push(outcome.result);
-            run.spans += outcome.result.span_count;
-          } else {
-            part.lease_owner = null;
-            part.lease_expires_at = null;
-            part.error = outcome.error ?? "unknown materializer failure";
-            if (part.attempts >= this.config.maxAttempts) {
-              part.state = "failed";
-              terminal = "failed";
-              run.error = `part ${part.index} failed after ${part.attempts} attempts: ${part.error}`;
-            } else {
-              part.state = "pending";
-              retry = true;
-              this.log("materialize.part.retry", {
-                shot_id: run.shot_id,
-                part: part.index,
-                attempt: part.attempts,
-                error: part.error,
-              });
-            }
-          }
-        }
-        run.results.sort((a, b) => a.index - b.index);
-        if (terminal) break;
-        await this.persist(run);
-        if (retry || capacityBackoff) break;
+      // Spec 037: healthy members pull parts from a shared queue. A finished
+      // member immediately takes the next pending part, and a member that hits
+      // a capacity error is cooled down while the idle healthy members steal
+      // its part. No alarm round-trip is needed between parts.
+      if (!terminal) {
+        const round = await this.runPool(run, chunks, plan.excluded);
+        if (round.terminal) terminal = "failed";
+        capacityBackoff = round.capacityBackoff;
       }
 
       if (!terminal && run.parts.length > 0 && run.parts.every((part) => part.state === "complete")) {
@@ -687,6 +625,198 @@ export class MaterializeDriver {
       });
     }
     return null;
+  }
+
+  /**
+   * Spec 037: runs pending parts with a pull-based fixed pool.
+   *
+   * Every healthy member takes the next pending part and, as soon as it
+   * finishes, takes another one. A capacity error is local to the member: it
+   * cools down for `memberCooldownMs`, its part goes to the front of the queue
+   * and the next idle healthy member steals it. Only when no member is left
+   * healthy does the alarm fall back to the spec-033 capacity backoff.
+   */
+  private async runPool(
+    run: MaterializeRunState,
+    chunks: ReturnType<typeof chunkMaterializationPlan>,
+    excluded: string[],
+  ): Promise<PoolRound> {
+    const pending = run.parts.filter((part) => part.state === "pending");
+    const busy = new Set<number>();
+    for (const part of run.parts) {
+      // A part already running under an unexpired lease keeps its member busy.
+      if (part.state === "running" && typeof part.pool_member === "number") busy.add(part.pool_member);
+    }
+    const inflight = new Map<number, Promise<void>>();
+    /** Part index -> member that just lost it to a capacity error. */
+    const stolen = new Map<number, number>();
+    const round: PoolRound = { terminal: false, capacityBackoff: false };
+    let stop = false;
+
+    const healthy = (member: number): boolean => {
+      const until = run.member_cooldowns?.[String(member)];
+      return typeof until !== "number" || until <= this.now();
+    };
+    const anyHealthy = (): boolean => {
+      for (let member = 0; member < this.parallelism(); member++) {
+        if (healthy(member)) return true;
+      }
+      return false;
+    };
+    const idleMember = (): number | null => {
+      for (let member = 0; member < this.parallelism(); member++) {
+        if (!busy.has(member) && healthy(member)) return member;
+      }
+      return null;
+    };
+    const claim = (member: number): MaterializePartRun | null => {
+      while (pending.length > 0) {
+        const part = pending[0]!;
+        if (part.attempts >= this.config.maxAttempts) {
+          pending.shift();
+          part.state = "failed";
+          part.pool_member = null;
+          part.error ??= `part gave up after ${part.attempts} attempts`;
+          run.error = `part ${part.index} failed after ${part.attempts} attempts: ${part.error}`;
+          round.terminal = true;
+          stop = true;
+          return null;
+        }
+        pending.shift();
+        part.state = "running";
+        part.attempts += 1;
+        part.pool_member = member;
+        part.lease_owner = run.run_id;
+        part.lease_expires_at = this.now() + this.config.leaseTtlMs;
+        part.started_at ??= this.now();
+        const from = stolen.get(part.index);
+        if (from !== undefined) {
+          stolen.delete(part.index);
+          this.log("materialize.part.stolen", {
+            shot_id: run.shot_id,
+            part: part.index,
+            from_member: from,
+            to_member: member,
+            attempt: part.attempts,
+            reason: "capacity",
+          });
+        }
+        return part;
+      }
+      return null;
+    };
+
+    while (!stop) {
+      while (pending.length > 0) {
+        const member = idleMember();
+        if (member === null) break;
+        const part = claim(member);
+        if (!part) break;
+        busy.add(member);
+        // A claim is durable before the container starts: a crashed alarm
+        // leaves a lease that expires instead of silently dropping the part.
+        await this.persist(run);
+        const task = this.runPart(run, part, chunks[part.index], chunks.length, excluded, member)
+          .then(async (outcome) => {
+            if (await this.recordOutcome(run, outcome, pending, stolen, round)) stop = true;
+          })
+          .finally(() => {
+            busy.delete(member);
+            inflight.delete(member);
+          });
+        inflight.set(member, task);
+      }
+      if (inflight.size === 0) break;
+      await Promise.race(inflight.values());
+    }
+    // Let members that are already running finish (and persist their outcomes)
+    // before the alarm decides the next schedule.
+    await Promise.allSettled([...inflight.values()]);
+    round.capacityBackoff = pending.length > 0 && !anyHealthy();
+    return round;
+  }
+
+  /**
+   * Applies one part outcome to the durable state. Returns true when the pool
+   * must stop handing out new parts (a non-capacity retry or a terminal part
+   * failure), mirroring the spec-032 retry cadence.
+   */
+  private async recordOutcome(
+    run: MaterializeRunState,
+    outcome: PartOutcome,
+    pending: MaterializePartRun[],
+    stolen: Map<number, number>,
+    round: PoolRound,
+  ): Promise<boolean> {
+    const part = outcome.part;
+    if (outcome.capacity) {
+      const member = part.pool_member ?? 0;
+      // No platform capacity is a transient queue condition: refund the
+      // attempt so a busy installation cannot exhaust max_attempts.
+      part.attempts = Math.max(0, part.attempts - 1);
+      part.state = "pending";
+      part.lease_owner = null;
+      part.lease_expires_at = null;
+      part.pool_member = null;
+      part.error = outcome.error ?? "no container instance available";
+      const until = this.now() + this.config.memberCooldownMs;
+      run.member_cooldowns ??= {};
+      run.member_cooldowns[String(member)] = until;
+      this.log("materialize.member.unhealthy", {
+        shot_id: run.shot_id,
+        run_id: run.run_id,
+        pool_member: member,
+        part: part.index,
+        cooldown_ms: this.config.memberCooldownMs,
+        unhealthy_until: new Date(until).toISOString(),
+        error: part.error,
+      });
+      this.log("materialize.part.capacity_retry", {
+        shot_id: run.shot_id,
+        part: part.index,
+        attempt: part.attempts,
+        pool_member: member,
+        error: part.error,
+      });
+      // Front of the queue: a healthy idle member steals it immediately.
+      pending.unshift(part);
+      stolen.set(part.index, member);
+      await this.persist(run);
+      return false;
+    }
+
+    part.pool_member = null;
+    if (outcome.result) {
+      part.state = "complete";
+      part.finished_at = this.now();
+      part.lease_owner = null;
+      part.lease_expires_at = null;
+      part.error = null;
+      run.results.push(outcome.result);
+      run.spans += outcome.result.span_count;
+      run.results.sort((a, b) => a.index - b.index);
+      await this.persist(run);
+      return false;
+    }
+
+    part.lease_owner = null;
+    part.lease_expires_at = null;
+    part.error = outcome.error ?? "unknown materializer failure";
+    if (part.attempts >= this.config.maxAttempts) {
+      part.state = "failed";
+      round.terminal = true;
+      run.error = `part ${part.index} failed after ${part.attempts} attempts: ${part.error}`;
+    } else {
+      part.state = "pending";
+      this.log("materialize.part.retry", {
+        shot_id: run.shot_id,
+        part: part.index,
+        attempt: part.attempts,
+        error: part.error,
+      });
+    }
+    await this.persist(run);
+    return true;
   }
 
   private async runPart(
@@ -893,6 +1023,7 @@ function newRun(shotId: string, scheduledAt: number, force: boolean): Materializ
     mirrored: false,
     analysis_preloaded: false,
     analysis_preload_attempts: 0,
+    member_cooldowns: {},
   };
 }
 

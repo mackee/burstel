@@ -44,10 +44,14 @@ class MemoryPrewarmStore {
 class FakeMaterializers implements CompactorNamespaceLike {
   readonly names: string[] = [];
   readonly requests: Array<Record<string, unknown>> = [];
+  /** Spec 037: which member attempted which part, in call order. */
+  readonly assignments: Array<{ member: string; part: number }> = [];
   readonly prewarms: string[] = [];
   readonly keepAlives: string[] = [];
   fail = false;
   capacity = false;
+  /** Spec 037: capacity errors only on these pool members. */
+  readonly capacityMembers = new Set<string>();
   /** Optional per-part hold; lets a test observe pool queueing. */
   gate: ((body: Record<string, unknown>) => Promise<void>) | undefined;
 
@@ -74,17 +78,18 @@ class FakeMaterializers implements CompactorNamespaceLike {
     if (path !== "/internal/materialize") {
       return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
     }
+    const body = (await request.json()) as Record<string, unknown>;
+    const index = Number(body.part_index ?? 0);
+    this.assignments.push({ member: name, part: index });
     if (this.fail) return new Response(JSON.stringify({ error: "container exploded" }), { status: 500 });
-    if (this.capacity) {
+    if (this.capacity || this.capacityMembers.has(name)) {
       return new Response(
         JSON.stringify({ error: "There is no container instance that can be provided to this Durable Object" }),
         { status: 503 },
       );
     }
-    const body = (await request.json()) as Record<string, unknown>;
     if (this.gate) await this.gate(body);
     this.requests.push(body);
-    const index = Number(body.part_index ?? 0);
     const objects = (body.objects ?? []) as MaterializationObject[];
     return new Response(
       JSON.stringify({
@@ -137,6 +142,7 @@ interface Harness {
   compactor: FakeMaterializers;
   driver: MaterializeDriver;
   stopped: WindowShotRecord;
+  logs: Array<{ message: string; fields?: Record<string, unknown> }>;
 }
 
 async function harness(
@@ -144,6 +150,7 @@ async function harness(
     maxAttempts?: number;
     parallelism?: number;
     capacityBackoffMs?: number;
+    memberCooldownMs?: number;
     preloadAnalysis?: (shotId: string) => Promise<void>;
   } = {},
 ): Promise<Harness> {
@@ -159,6 +166,7 @@ async function harness(
   const prewarmStore = new MemoryPrewarmStore();
   const scheduler = new FakeScheduler();
   const compactor = new FakeMaterializers();
+  const logs: Array<{ message: string; fields?: Record<string, unknown> }> = [];
   const driver = new MaterializeDriver({
     shotId: "shot_alarm_materialize",
     ingest,
@@ -177,11 +185,14 @@ async function harness(
       lateWriteLimitMs: 10_000,
       keepAliveMs: 10 * 60 * 1000,
       capacityBackoffMs: options.capacityBackoffMs ?? 2_000,
+      memberCooldownMs: options.memberCooldownMs ?? 1_000,
     },
-    log: () => undefined,
+    log: (message, fields) => {
+      logs.push({ message, fields });
+    },
     preloadAnalysis: options.preloadAnalysis,
   });
-  return { clock, core, ingest, store, prewarmStore, scheduler, compactor, driver, stopped };
+  return { clock, core, ingest, store, prewarmStore, scheduler, compactor, driver, stopped, logs };
 }
 
 describe("alarm-driven materialization", () => {
@@ -492,6 +503,108 @@ describe("spec 033 fixed materializer pool", () => {
     await h.driver.alarm();
     expect(h.compactor.prewarms).toEqual(["materializer-0", "materializer-1"]);
     expect(h.prewarmStore.state?.done).toBe(true);
+  });
+});
+
+describe("spec 037 materializer work stealing", () => {
+  test("a capacity failure cools only that member down and an idle member steals the part", async () => {
+    const h = await harness({ parallelism: 2, capacityBackoffMs: 2_000, memberCooldownMs: 60_000 });
+    h.compactor.capacityMembers.add("materializer-0");
+    await h.driver.schedule(h.stopped);
+    h.clock.now = h.stopped.window!.end_ms + 10_000;
+    await h.driver.alarm();
+
+    const run = await h.store.load();
+    expect(run?.state).toBe("complete");
+    expect(run?.results.length).toBe(4);
+    expect(run?.parts.every((part) => part.state === "complete")).toBe(true);
+    // The stolen part was retried once on the healthy member; the capacity
+    // error itself never consumed an attempt.
+    expect(run?.parts[0]?.attempts).toBe(1);
+    expect(h.compactor.assignments.filter((a) => a.member === "materializer-1").length).toBe(4);
+    expect(h.compactor.assignments.filter((a) => a.member === "materializer-0").length).toBe(1);
+
+    const unhealthy = h.logs.find((entry) => entry.message === "materialize.member.unhealthy");
+    expect(unhealthy?.fields?.["pool_member"]).toBe(0);
+    expect(unhealthy?.fields?.["cooldown_ms"]).toBe(60_000);
+    const stolen = h.logs.find((entry) => entry.message === "materialize.part.stolen");
+    expect(stolen?.fields?.["part"]).toBe(0);
+    expect(stolen?.fields?.["from_member"]).toBe(0);
+    expect(stolen?.fields?.["to_member"]).toBe(1);
+
+    // No capacity backoff alarm: the run finished inside this tick.
+    expect(h.scheduler.armed.at(-1)).toBeLessThanOrEqual(h.clock.now);
+  });
+
+  test("a finished member pulls the next part while another member is still running", async () => {
+    const h = await harness({ parallelism: 2 });
+    const started: number[] = [];
+    const finished: number[] = [];
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    h.compactor.gate = async (body) => {
+      const index = Number(body.part_index);
+      started.push(index);
+      // Hold part 0 until part 1 is in flight, so the concurrency assertion
+      // does not depend on request ordering.
+      if (index === 0) {
+        while (!started.includes(1)) await new Promise((resolve) => setTimeout(resolve, 1));
+      }
+      // Part 1 holds member 1 until member 0 has pulled part 2.
+      if (index === 1) await blocked;
+      finished.push(index);
+    };
+    await h.driver.schedule(h.stopped);
+    h.clock.now = h.stopped.window!.end_ms + 10_000;
+    const alarm = h.driver.alarm();
+    const deadline = Date.now() + 5_000;
+    while (!started.includes(2) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    }
+    // Part 2 started while part 1 is still inside the gate, i.e. the finished
+    // member pulled the next pending part without an alarm round-trip.
+    expect(started).toContain(2);
+    expect(finished).not.toContain(1);
+    release();
+    await alarm;
+
+    const run = await h.store.load();
+    expect(run?.state).toBe("complete");
+    expect(run?.results.length).toBe(4);
+    expect(h.compactor.requests.length).toBe(4);
+  });
+
+  test("all-unhealthy members keep the capacity backoff until the cooldown expires", async () => {
+    const h = await harness({ parallelism: 1, capacityBackoffMs: 2_000, memberCooldownMs: 60_000 });
+    h.compactor.capacity = true;
+    await h.driver.schedule(h.stopped);
+    h.clock.now = h.stopped.window!.end_ms + 10_000;
+    await h.driver.alarm();
+
+    let run = await h.store.load();
+    expect(run?.state).toBe("scheduled");
+    expect(run?.scheduled_at).toBe(h.clock.now + 2_000);
+    expect(run?.parts.every((part) => part.state === "pending" && part.attempts === 0)).toBe(true);
+    const cooldownUntil = run?.member_cooldowns?.["0"];
+    expect(cooldownUntil).toBe(h.clock.now + 60_000);
+
+    // Inside the cooldown the only member is unhealthy: same backoff, no work.
+    h.clock.now = run!.scheduled_at;
+    await h.driver.alarm();
+    run = await h.store.load();
+    expect(run?.state).toBe("scheduled");
+    expect(run?.scheduled_at).toBe(h.clock.now + 2_000);
+    expect(h.compactor.assignments.length).toBe(1);
+
+    // Once the cooldown expires the parts run normally.
+    h.compactor.capacity = false;
+    h.clock.now = cooldownUntil!;
+    await h.driver.alarm();
+    run = await h.store.load();
+    expect(run?.state).toBe("complete");
+    expect(run?.parts.every((part) => part.attempts === 1)).toBe(true);
   });
 });
 

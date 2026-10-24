@@ -316,6 +316,11 @@ Containers are ephemeral and are destroyed on freeze/idle.
   keeps a ~8M-span shot inside the 60 s materialization budget. Never set
   `MATERIALIZE_PARALLELISM` above `max_instances - 1`; preflight enforces it so
   compaction cannot be starved.
+* Pool scheduling is work-stealing (spec 037): a finished member immediately
+  pulls the next queued part, and a member that hits the platform's "no
+  container instance" error cools down for `MATERIALIZE_MEMBER_COOLDOWN_MS`
+  (60 s) while an idle healthy member steals its part. Only when every member
+  is unhealthy does the run keep retrying at `MATERIALIZE_CAPACITY_BACKOFF_MS`.
 * Stop shots promptly; a recording Container holds an ephemeral disk.
 * The durable raw journal writes one R2 object per accepted export under
   `journal/*`; add an R2 lifecycle rule for old `shots/*` **and** `journal/*`

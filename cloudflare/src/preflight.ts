@@ -502,6 +502,15 @@ export function validateWranglerConfig(
     true,
     `MATERIALIZE_PARTS_PER_MEMBER=${vars["MATERIALIZE_PARTS_PER_MEMBER"] ?? "<default 2>"} must be 1..8`,
   );
+  // Spec 037: a capacity failure only cools down its pool member; the part is
+  // stolen by a healthy idle member instead of waiting for the cooldown.
+  const memberCooldown = Number.parseInt(String(vars["MATERIALIZE_MEMBER_COOLDOWN_MS"] ?? "60000"), 10);
+  add(
+    "materialize_member_cooldown_bounded",
+    Number.isFinite(memberCooldown) && memberCooldown >= 1_000 && memberCooldown <= 3_600_000,
+    true,
+    `MATERIALIZE_MEMBER_COOLDOWN_MS=${vars["MATERIALIZE_MEMBER_COOLDOWN_MS"] ?? "<default 60000>"} must be 1000..3600000`,
+  );
   // Spec 034: row-based part planning + projection-only part limits.
   const targetSpans = Number.parseInt(String(vars["MATERIALIZE_PART_TARGET_SPANS"] ?? "500000"), 10);
   add(

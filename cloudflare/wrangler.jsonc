@@ -66,6 +66,10 @@
     // off (without burning an attempt) when the platform has no free instance.
     "MATERIALIZE_KEEPALIVE_MS": "600000",
     "MATERIALIZE_CAPACITY_BACKOFF_MS": "10000",
+    // Spec 037: after a capacity error only that pool member is unhealthy;
+    // its part is stolen by an idle healthy member. All-unhealthy still backs
+    // off with MATERIALIZE_CAPACITY_BACKOFF_MS.
+    "MATERIALIZE_MEMBER_COOLDOWN_MS": "60000",
     // Spec 033: split into 2x pool parts so a freed member immediately takes a
     // queued part (and R2 GET concurrency doubles).
     "MATERIALIZE_PARTS_PER_MEMBER": "2",

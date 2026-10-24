@@ -34,6 +34,8 @@ export interface MaterializeEnv {
   MATERIALIZE_KEEPALIVE_MS?: string;
   MATERIALIZE_CAPACITY_BACKOFF_MS?: string;
   MATERIALIZE_PARTS_PER_MEMBER?: string;
+  /** Spec 037: per-member cooldown after a capacity error. */
+  MATERIALIZE_MEMBER_COOLDOWN_MS?: string;
   /** Spec 034: row-based part planning. */
   MATERIALIZE_PART_TARGET_SPANS?: string;
   MATERIALIZE_SPANS_PER_KIB?: string;
@@ -82,6 +84,7 @@ export class MaterializeDO extends DurableObject<MaterializeEnv> {
         partsPerMember: int(env.MATERIALIZE_PARTS_PER_MEMBER, 2),
         partTargetSpans: int(env.MATERIALIZE_PART_TARGET_SPANS, 500_000),
         partSpansPerKiB: int(env.MATERIALIZE_SPANS_PER_KIB, 40),
+        memberCooldownMs: int(env.MATERIALIZE_MEMBER_COOLDOWN_MS, 60_000),
       },
       log: (message, fields) => console.log(message, fields ?? {}),
       // Spec 035: a complete run arms the ShotDO alarm, which opens the shot

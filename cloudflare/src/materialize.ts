@@ -41,6 +41,8 @@ export const MATERIALIZE_MAX_INSTANCES = 4;
 export const MATERIALIZE_KEEPALIVE_MS = 10 * 60 * 1000;
 /** Backoff after "no container instance" before a queued part is retried. */
 export const MATERIALIZE_CAPACITY_BACKOFF_MS = 10_000;
+/** Spec 037: how long a pool member cools down after a capacity error. */
+export const MATERIALIZE_MEMBER_COOLDOWN_MS = 60_000;
 
 export interface MaterializeOptions {
   parallelism?: number;
