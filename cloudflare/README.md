@@ -225,6 +225,22 @@ measured loadgen settings are in
 `-compression gzip|none`, `-batch-size` and `-queue-size`; the effective values
 appear in the JSON report as `client_settings` (defaults = SDK 512/2048/none).
 
+### 180 s client drop (spec 033)
+
+A 60 s run with gzip + batch 8192 + queue 131072 dropped **0 %**, but the same
+settings over **180 s** exported 7,267,044 of 8,060,850 spans (**≈ 10 %**) with
+zero exporter errors and p50 607 ms. The stock Go SDK has no queue-drop counter,
+so client loss is inferred from `generated - exported`; the loadgen report now
+includes `signals.*.dropped`, `per_exporter_signals`, and a per-second
+`client_drop.per_exporter[*].samples` series.
+
+For 180 s, use gzip + batch 8192 + queue **262144** and split the offered load
+across **two exporters per host** (each ≤ 7.5k spans/s at a 15k spans/s host
+target), with a ≥ 20 s provider shutdown. That is the settings target the
+staging operator validates against the `client_drop` series; the previous
+one-exporter/131072 setting is not sufficient at 180 s even though it passed at
+60 s.
+
 ## Shared multi-user access (spec 013, Part B)
 
 A deployment can be shared by several people, each with their **own revocable

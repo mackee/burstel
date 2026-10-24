@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type sectionDef struct {
@@ -202,11 +203,14 @@ func (e *Engine) Analyze(ctx context.Context, policy Policy, shotID string, req 
 		}
 	}
 
+	startedAt := time.Now()
 	result := &AnalyzeResult{
 		ShotID:        shotID,
 		SchemaVersion: e.schema,
 		RawCounts:     map[string]int64{},
+		Timings:       &AnalyzeTimings{SectionsMS: map[string]int64{}},
 	}
+	rawStart := time.Now()
 	for _, table := range []string{"otlp_batches", "spans", "log_records", "metric_points"} {
 		qr, err := e.run(ctx, "SELECT count(*) FROM "+table, 1, policy)
 		if err != nil {
@@ -216,8 +220,10 @@ func (e *Engine) Analyze(ctx context.Context, policy Policy, shotID string, req 
 			result.RawCounts[table] = asInt64(qr.Rows[0][0])
 		}
 	}
+	result.Timings.RawCountsMS = time.Since(rawStart).Milliseconds()
 
 	for _, name := range wanted {
+		sectionStart := time.Now()
 		def, ok := sectionByName(name)
 		if !ok {
 			return nil, policyErr("unknown_section", "unknown analysis section "+name)
@@ -231,6 +237,7 @@ func (e *Engine) Analyze(ctx context.Context, policy Policy, shotID string, req 
 				result.Observed = append(result.Observed, name)
 			}
 			result.Sections = append(result.Sections, sec)
+			result.Timings.SectionsMS[name] = time.Since(sectionStart).Milliseconds()
 			continue
 		}
 		section := Section{
@@ -260,7 +267,9 @@ func (e *Engine) Analyze(ctx context.Context, policy Policy, shotID string, req 
 			result.Observed = append(result.Observed, name)
 		}
 		result.Sections = append(result.Sections, section)
+		result.Timings.SectionsMS[name] = time.Since(sectionStart).Milliseconds()
 	}
+	result.Timings.TotalMS = time.Since(startedAt).Milliseconds()
 
 	result.Notes = []string{
 		"Values in sections and raw_counts are query-derived from the frozen DuckDB snapshot.",

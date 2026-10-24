@@ -49,8 +49,10 @@
     "COMPACTION_LEASE_TTL_MS": "900000",
     // Spec 029: explicit CompactorCore -> container request deadline.
     "COMPACTION_CONTAINER_TIMEOUT_MS": "60000",
-    // Spec 031: shot-time parallel materialization bounds.
-    "MATERIALIZE_PARALLELISM": "4",
+    // Spec 033: fixed materializer pool `materializer-0..P-1`. P must stay at
+    // least one below the CompactorDO max_instances (4) so continuous
+    // compaction always has a container slot.
+    "MATERIALIZE_PARALLELISM": "3",
     "MATERIALIZE_MAX_INSTANCES": "4",
     "MATERIALIZE_WAIT_MS": "90000",
     "MATERIALIZE_MAX_OBJECTS": "200000",
@@ -60,6 +62,13 @@
     "MATERIALIZE_LEASE_TTL_MS": "120000",
     "MATERIALIZE_RETRY_MS": "5000",
     "MATERIALIZE_HEARTBEAT_MS": "30000",
+    // Spec 033: keep a finished pool member warm for the next shot, and back
+    // off (without burning an attempt) when the platform has no free instance.
+    "MATERIALIZE_KEEPALIVE_MS": "600000",
+    "MATERIALIZE_CAPACITY_BACKOFF_MS": "10000",
+    // Spec 033: split into 2x pool parts so a freed member immediately takes a
+    // queued part (and R2 GET concurrency doubles).
+    "MATERIALIZE_PARTS_PER_MEMBER": "2",
     // Spec 031 D1: the bucket whose scoped token is injected into the
     // compactor/materializer container. The credential itself is a Worker secret.
     "R2_BUCKET_NAME": "burstel-shots"

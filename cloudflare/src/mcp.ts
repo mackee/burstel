@@ -67,7 +67,8 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
     bucket: env.BUCKET,
     tokens: env.INSTANCE_TOKENS,
     materialize: {
-      parallelism: Number.parseInt((env as { MATERIALIZE_PARALLELISM?: string }).MATERIALIZE_PARALLELISM ?? "4", 10) || 4,
+      // Spec 033: fixed pool, one CompactorDO slot reserved for compaction.
+      parallelism: Number.parseInt((env as { MATERIALIZE_PARALLELISM?: string }).MATERIALIZE_PARALLELISM ?? "3", 10) || 3,
       maxInstances: Number.parseInt((env as { MATERIALIZE_MAX_INSTANCES?: string }).MATERIALIZE_MAX_INSTANCES ?? "4", 10) || 4,
       waitMs: Number.parseInt((env as { MATERIALIZE_WAIT_MS?: string }).MATERIALIZE_WAIT_MS ?? "90000", 10) || 90_000,
     },

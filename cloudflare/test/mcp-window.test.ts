@@ -28,7 +28,12 @@ class FakeShotNamespace implements ShotNamespaceLike {
       this.shots.set(name, harness);
     }
     const core = harness.core;
-    return { fetch: (request: Request) => core.handleInternal(request) };
+    return {
+      fetch: (request: Request) =>
+        new URL(request.url).pathname === "/internal/prewarm"
+          ? Promise.resolve(new Response(JSON.stringify({ prewarm: "scheduled" }), { status: 202 }))
+          : core.handleInternal(request),
+    };
   }
 }
 
@@ -138,8 +143,11 @@ describe("MCP window shots and token tools", () => {
     expect(started["kind"]).toBe("window");
     expect(started["state"]).toBe("open");
     expect(started["otlp_endpoints"]).toBeUndefined();
-    // No legacy ShotDO / recording container is created for the default path.
-    expect((env.SHOT_DO as unknown as FakeShotNamespace).shots.size).toBe(0);
+    // Spec 033: a warm ShotDO is created only to prewarm the analysis
+    // container; no recording shot state/container is created on this path.
+    const prewarmed = [...(env.SHOT_DO as unknown as FakeShotNamespace).shots.values()];
+    expect(prewarmed.length).toBeLessThanOrEqual(1);
+    await expect(prewarmed[0]!.core.status()).rejects.toThrow(/unknown shot/);
   });
 
   test("explicit mode=recording still works and is flagged deprecated", async () => {

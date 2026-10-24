@@ -462,12 +462,36 @@ export function validateWranglerConfig(
     true,
     "LATE_WRITE_LIMIT_MS must be a positive number of milliseconds (spec 031 D4 default 10000)",
   );
-  const parallelism = Number.parseInt(String(vars["MATERIALIZE_PARALLELISM"] ?? "4"), 10);
+  const parallelism = Number.parseInt(String(vars["MATERIALIZE_PARALLELISM"] ?? "3"), 10);
+  const compactorInstances = compactor?.max_instances ?? 1;
   add(
     "materialize_parallelism_bounded",
-    Number.isInteger(parallelism) && parallelism >= 1 && parallelism <= (compactor?.max_instances ?? 1),
+    Number.isInteger(parallelism) &&
+      parallelism >= 1 &&
+      parallelism <= Math.max(1, compactorInstances - 1),
     true,
-    `MATERIALIZE_PARALLELISM=${vars["MATERIALIZE_PARALLELISM"] ?? "<default 4>"} must be 1..container max_instances (${compactor?.max_instances ?? "<unset>"})`,
+    `MATERIALIZE_PARALLELISM=${vars["MATERIALIZE_PARALLELISM"] ?? "<default 3>"} must be 1..max_instances-1 (${Math.max(1, compactorInstances - 1)}) so one CompactorDO instance stays free for continuous compaction`,
+  );
+  const keepalive = Number.parseInt(String(vars["MATERIALIZE_KEEPALIVE_MS"] ?? "600000"), 10);
+  add(
+    "materialize_keepalive_bounded",
+    Number.isFinite(keepalive) && keepalive >= 1_000 && keepalive <= 3_600_000,
+    true,
+    `MATERIALIZE_KEEPALIVE_MS=${vars["MATERIALIZE_KEEPALIVE_MS"] ?? "<default 600000>"} must be 1000..3600000`,
+  );
+  const capacityBackoff = Number.parseInt(String(vars["MATERIALIZE_CAPACITY_BACKOFF_MS"] ?? "10000"), 10);
+  add(
+    "materialize_capacity_backoff_bounded",
+    Number.isFinite(capacityBackoff) && capacityBackoff >= 1_000 && capacityBackoff <= 3_600_000,
+    true,
+    `MATERIALIZE_CAPACITY_BACKOFF_MS=${vars["MATERIALIZE_CAPACITY_BACKOFF_MS"] ?? "<default 10000>"} must be 1000..3600000`,
+  );
+  const partsPerMember = Number.parseInt(String(vars["MATERIALIZE_PARTS_PER_MEMBER"] ?? "2"), 10);
+  add(
+    "materialize_parts_per_member_bounded",
+    Number.isInteger(partsPerMember) && partsPerMember >= 1 && partsPerMember <= 8,
+    true,
+    `MATERIALIZE_PARTS_PER_MEMBER=${vars["MATERIALIZE_PARTS_PER_MEMBER"] ?? "<default 2>"} must be 1..8`,
   );
   const insecure = vars["BURSTEL_DEV_INSECURE_AUTH"];
   add(

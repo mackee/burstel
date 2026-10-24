@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/mackee/burstel/internal/analysis"
 )
@@ -23,15 +24,18 @@ func (s *Server) handleWindowOpen(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	selection, err := s.window.OpenWindow(req.SessionID, req.Window, req.Catalog)
+	started := time.Now()
+	selection, cached, err := s.window.OpenWindowWithCache(req.SessionID, req.Window, req.Catalog)
 	if err != nil {
 		writeAnalysisError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, analysis.WindowOpenResponse{
-		SessionID: req.SessionID,
-		Window:    req.Window,
-		Selection: selection,
+		SessionID:  req.SessionID,
+		Window:     req.Window,
+		Selection:  selection,
+		CachedKeys: cached,
+		Timings:    analysis.ScopedTimings{OpenMS: time.Since(started).Milliseconds()},
 	})
 }
 
@@ -71,12 +75,12 @@ func (s *Server) handleWindowCommit(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	cov, err := s.window.Commit(r.Context(), req.SessionID)
+	cov, timings, err := s.window.CommitWithTimings(r.Context(), req.SessionID)
 	if err != nil {
 		writeAnalysisError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, cov)
+	writeJSON(w, http.StatusOK, analysis.WindowCommitResponse{ScopedCoverage: cov, Timings: timings})
 }
 
 func (s *Server) handleWindowQuery(w http.ResponseWriter, r *http.Request) {

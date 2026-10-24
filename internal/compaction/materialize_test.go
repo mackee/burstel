@@ -90,6 +90,9 @@ func TestMaterializeBuildsVerifiedPartAndIsIdempotent(t *testing.T) {
 	if first.SizeBytes <= 0 || first.SHA256 == "" {
 		t.Fatalf("missing checksum/size: %+v", first)
 	}
+	if first.Timings.Objects != 2 || first.Timings.TotalMS < 0 || first.Timings.PutMS < 0 {
+		t.Fatalf("missing per-phase timings: %+v", first.Timings)
+	}
 
 	part := remote.objects[first.PartKey]
 	if int64(len(part)) != first.SizeBytes || sha256Hex(part) != first.SHA256 {

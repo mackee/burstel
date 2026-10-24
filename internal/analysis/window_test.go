@@ -343,6 +343,81 @@ func TestWindowHalfOpenHelpers(t *testing.T) {
 	}
 }
 
+func TestWindowStoreCachesPartsAcrossSessions(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Second)
+	start := now.Add(-3 * time.Minute)
+	end := now.Add(-time.Minute)
+	window := analysis.NewServerWindow(start, end, []string{"web-1"}, "cached")
+
+	d := &otlp.Decoded{
+		Signal:      otlp.Traces,
+		RecordCount: 2,
+		Spans: []otlp.Span{
+			spanAt("web-1", "a", window.StartNS()+10, window.StartNS()+20, "STATUS_CODE_OK"),
+			spanAt("web-1", "b", window.StartNS()+30, window.StartNS()+40, "STATUS_CODE_ERROR"),
+		},
+	}
+	dir := t.TempDir()
+	info, path := buildSegment(t, dir, "shots/shot-1/part-0.duckdb", "inst-web", "web-1", now.Add(-time.Minute).UnixMilli(), d)
+	meta := analysis.SegmentMeta{
+		Key: "shots/shot-1/part-0.duckdb", Instance: "web-1", Status: "verified",
+		Size: info.Size, SHA256: info.SHA256,
+		FirstReceivedAt: info.FirstReceivedAt, LastReceivedAt: info.LastReceivedAt,
+	}
+	store := analysis.NewWindowStore(filepath.Join(dir, "windows"), analysis.WindowStoreOptions{})
+	defer store.Close()
+
+	if _, err := store.OpenWindow("s1", window, []analysis.SegmentMeta{meta}); err != nil {
+		t.Fatalf("OpenWindow: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AddSegment(ctx, "s1", analysis.SegmentRef{Key: meta.Key, Instance: "web-1"}, f, info.Size, info.SHA256); err != nil {
+		t.Fatalf("AddSegment: %v", err)
+	}
+	f.Close()
+	if _, err := store.Commit(ctx, "s1"); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	store.Release("s1")
+
+	// A second session for the same shot must reuse the cached part and report
+	// its key so the Worker can skip the R2 download entirely.
+	_, cached, err := store.OpenWindowWithCache("s2", window, []analysis.SegmentMeta{meta})
+	if err != nil {
+		t.Fatalf("OpenWindowWithCache: %v", err)
+	}
+	if len(cached) != 1 || cached[0] != meta.Key {
+		t.Fatalf("cached keys = %v, want [%s]", cached, meta.Key)
+	}
+	// Re-adding the same part is idempotent: it must not duplicate rows.
+	f2, _ := os.Open(path)
+	if err := store.AddSegment(ctx, "s2", analysis.SegmentRef{Key: meta.Key, Instance: "web-1"}, f2, info.Size, info.SHA256); err != nil {
+		t.Fatalf("AddSegment cached: %v", err)
+	}
+	f2.Close()
+	cov, timings, err := store.CommitWithTimings(ctx, "s2")
+	if err != nil {
+		t.Fatalf("CommitWithTimings: %v", err)
+	}
+	if !cov.Complete {
+		t.Fatalf("expected complete cached coverage, got %+v", cov)
+	}
+	if timings.TotalMS < 0 || timings.AttachMS < 0 {
+		t.Fatalf("timings must be non-negative: %+v", timings)
+	}
+	res, err := store.Query(ctx, "s2", analysis.QueryRequest{SQL: "SELECT count(*) FROM spans"})
+	if err != nil {
+		t.Fatalf("Query: %v", err)
+	}
+	if got := res.Rows[0][0]; got != int64(2) && got != float64(2) && got != "2" {
+		t.Fatalf("expected 2 cached spans, got %v (%T)", got, got)
+	}
+}
+
 func TestWindowStoreSessionAndCompare(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Second)

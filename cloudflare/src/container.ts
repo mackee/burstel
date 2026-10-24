@@ -40,10 +40,29 @@ export interface ContainerControl {
   destroy(): Promise<void>;
 }
 
+/** Durable Object container classes that can own a process. */
+export type ContainerClass = "ShotDO" | "CompactorDO";
+
+/**
+ * Spec 033 egress policy: only the CompactorDO (continuous compaction plus the
+ * fixed materializer pool, which performs direct bucket-scoped R2 S3 GET/PUT)
+ * gets container internet access. The ShotDO recorder/analysis container never
+ * does.
+ */
+export function containerEgressFor(containerClass: ContainerClass): boolean {
+  return containerClass === "CompactorDO";
+}
+
 export interface ContainerControlOptions {
   port: number;
   readyTimeoutMs?: number;
   pollIntervalMs?: number;
+  /**
+   * Spec 033: allow the container process to reach the public internet. Only
+   * the CompactorDO materializer (direct R2 S3 GET/PUT) opts in; the ShotDO
+   * recorder/analysis container stays isolated.
+   */
+  enableInternet?: boolean;
 }
 
 export function createContainerControl(
@@ -63,7 +82,7 @@ export function createContainerControl(
 
     start(env) {
       if (container.running) return;
-      container.start({ enableInternet: false, env });
+      container.start({ enableInternet: options.enableInternet === true, env });
     },
 
     async keepAlive(durationMs) {

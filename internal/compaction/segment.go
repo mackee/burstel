@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	duckdb "github.com/duckdb/duckdb-go/v2"
 
@@ -189,7 +190,18 @@ func NewScratchSegment(workDir, key string) (string, func(), error) {
 // projections. It CHECKPOINTs and closes before hashing the file so the caller
 // uploads a stable object.
 func BuildSegment(ctx context.Context, path, key, instanceID, instanceName string, records []JournalRecord) (SegmentInfo, error) {
-	return buildSegment(ctx, path, key, instanceID, instanceName, records, false)
+	return buildSegment(ctx, path, key, instanceID, instanceName, records, false, nil)
+}
+
+// BuildProfile is the per-phase timing breakdown of one segment/part build
+// (spec 033). All values are milliseconds; a zero value means the phase was
+// skipped (for example an empty part still checkpoints but appends no rows).
+type BuildProfile struct {
+	AppendMS     int64
+	IndexMS      int64
+	CheckpointMS int64
+	CloseMS      int64
+	HashMS       int64
 }
 
 // BuildPart writes one shot-materialization part. Unlike a compacted segment it
@@ -197,7 +209,15 @@ func BuildSegment(ctx context.Context, path, key, instanceID, instanceName strin
 // in a chunk was excluded); the schema, checksum and metadata contract are
 // identical so analysis can ATTACH a part exactly like a segment.
 func BuildPart(ctx context.Context, path, key, instanceID, instanceName string, records []JournalRecord) (SegmentInfo, error) {
-	return buildSegment(ctx, path, key, instanceID, instanceName, records, true)
+	return buildSegment(ctx, path, key, instanceID, instanceName, records, true, nil)
+}
+
+// BuildPartProfile is BuildPart plus the per-phase timing breakdown used by the
+// materializer's structured logs (spec 033 requirement 5).
+func BuildPartProfile(ctx context.Context, path, key, instanceID, instanceName string, records []JournalRecord) (SegmentInfo, BuildProfile, error) {
+	var profile BuildProfile
+	info, err := buildSegment(ctx, path, key, instanceID, instanceName, records, true, &profile)
+	return info, profile, err
 }
 
 func buildSegment(
@@ -205,6 +225,7 @@ func buildSegment(
 	path, key, instanceID, instanceName string,
 	records []JournalRecord,
 	allowEmpty bool,
+	profile *BuildProfile,
 ) (SegmentInfo, error) {
 	if len(records) == 0 && !allowEmpty {
 		return SegmentInfo{}, fmt.Errorf("compaction: cannot build an empty segment")
@@ -262,6 +283,7 @@ func buildSegment(
 		return a, nil
 	}
 
+	appendStart := time.Now()
 	if _, err := conn.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {
 		return SegmentInfo{}, fmt.Errorf("compaction: begin segment: %w", err)
 	}
@@ -417,26 +439,45 @@ func buildSegment(
 	}
 	committed = true
 	dropAppenders()
+	if profile != nil {
+		profile.AppendMS = time.Since(appendStart).Milliseconds()
+	}
+	indexStart := time.Now()
 	if _, err := conn.ExecContext(ctx, segmentIndexes); err != nil {
 		return SegmentInfo{}, fmt.Errorf("compaction: index segment: %w", err)
 	}
+	if profile != nil {
+		profile.IndexMS = time.Since(indexStart).Milliseconds()
+	}
+	checkpointStart := time.Now()
 	if _, err := conn.ExecContext(ctx, "CHECKPOINT"); err != nil {
 		return SegmentInfo{}, fmt.Errorf("compaction: checkpoint segment: %w", err)
 	}
+	if profile != nil {
+		profile.CheckpointMS = time.Since(checkpointStart).Milliseconds()
+	}
+	closeStart := time.Now()
 	if err := conn.Close(); err != nil {
 		return SegmentInfo{}, fmt.Errorf("compaction: close segment connection: %w", err)
 	}
 	if err := db.Close(); err != nil {
 		return SegmentInfo{}, fmt.Errorf("compaction: close segment: %w", err)
 	}
+	if profile != nil {
+		profile.CloseMS = time.Since(closeStart).Milliseconds()
+	}
 
 	if haveEvent {
 		info.EventMinNS = &minEvent
 		info.EventMaxNS = &maxEvent
 	}
+	hashStart := time.Now()
 	size, sum, err := fileSizeAndSHA256(path)
 	if err != nil {
 		return SegmentInfo{}, err
+	}
+	if profile != nil {
+		profile.HashMS = time.Since(hashStart).Milliseconds()
 	}
 	info.Size = size
 	info.SHA256 = sum

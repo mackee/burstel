@@ -33,6 +33,7 @@ import {
   ensureMaterialized,
   materializeShot,
   MATERIALIZE_WAIT_MS,
+  prewarmMaterialization,
   requestMaterialization,
   scheduleMaterialization,
   waitForMaterialization,
@@ -236,7 +237,37 @@ export async function createWindowShot(ctx: ToolContext, input: CreateWindowShot
 export async function startWindowShot(ctx: ToolContext, input: StartWindowShotInput): Promise<WindowShotRecord> {
   if (typeof input.shot_id !== "string" || !isShotId(input.shot_id)) throw badRequest("invalid shot id");
   await requireKnownInstances(ctx, input.instances);
-  return ingestCall<WindowShotRecord>(ctx, "/internal/shot/window/start", "POST", input);
+  const record = await ingestCall<WindowShotRecord>(ctx, "/internal/shot/window/start", "POST", input);
+  // Spec 033: both requests only record a durable prewarm flag and arm a DO
+  // alarm; the container start never happens on this request path.
+  await prewarmWindowShot(ctx, record.shot_id).catch((error) => {
+    console.log("prewarm.schedule.failure", {
+      shot_id: record.shot_id,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
+  return record;
+}
+
+/**
+ * Spec 033 prewarm: arms the ShotDO analysis alarm and the MaterializeDO pool
+ * alarm. Deliberately not `waitUntil`: the DO alarm owns the actual start.
+ */
+export async function prewarmWindowShot(ctx: ToolContext, shotId: string): Promise<void> {
+  if (!ctx.namespace || !isShotId(shotId)) return;
+  const stub = ctx.namespace.getByName(shotId);
+  const resp = await stub.fetch(
+    new Request(`${DO_ORIGIN}/internal/prewarm`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ shot_id: shotId }),
+    }),
+  );
+  await resp.body?.cancel().catch(() => undefined);
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new HttpError(resp.status, `analysis prewarm failed with status ${resp.status}`, true, "prewarm_failed");
+  }
+  await prewarmMaterialization({ ingest: ctx.ingest, materializer: ctx.materializer }, shotId);
 }
 
 /** Stops and finalizes a server-clock window marker (idempotent). */
@@ -877,12 +908,26 @@ async function openWindowSession(
       event_min_ns: null,
       event_max_ns: null,
     }));
-    await doJson(stub, "/internal/window/open", "POST", {
+    const openStarted = Date.now();
+    const opened = await doJson(stub, "/internal/window/open", "POST", {
       session_id: sessionId,
       window: windowWire(window),
       catalog: catalogWire,
     });
+    const cached = cachedKeysFromOpen(opened);
+    console.log("analysis.window.open", {
+      session_id: sessionId,
+      shot_id: sessionId,
+      open_ms: Date.now() - openStarted,
+      parts: parts.length,
+      cached_parts: cached.size,
+      timings: opened.timings ?? undefined,
+    });
+    let downloadMs = 0;
+    let streamed = 0;
     for (const part of parts) {
+      if (cached.has(part.object_key)) continue;
+      const started = Date.now();
       const object = await ctx.bucket.get(part.object_key);
       if (!object || !object.body) {
         throw new HttpError(503, `materialization part ${part.object_key} is missing from R2`, true, "part_missing");
@@ -895,8 +940,22 @@ async function openWindowSession(
         "x-burstel-size": String(part.size_bytes),
         "x-burstel-sha256": part.sha256,
       }, object.body);
+      downloadMs += Date.now() - started;
+      streamed += 1;
     }
-    await doJson(stub, "/internal/window/commit", "POST", { session_id: sessionId });
+    const commitStarted = Date.now();
+    const committed = await doJson(stub, "/internal/window/commit", "POST", { session_id: sessionId });
+    console.log("analysis.part.download", {
+      session_id: sessionId,
+      shot_id: sessionId,
+      parts: parts.length,
+      streamed,
+      cached_parts: cached.size,
+      download_ms: downloadMs,
+      commit_ms: Date.now() - commitStarted,
+      attach_ms: (committed.timings as Record<string, unknown> | undefined)?.attach_ms ?? undefined,
+      timings: committed.timings ?? undefined,
+    });
     // Materialization consumes the journal in the range, so `pending_journal`
     // is zero; the compaction lookback warning is still disclosed because it
     // says objects may be missing from *any* view, including a part.
@@ -938,19 +997,36 @@ async function openWindowSession(
   }));
   const selection = selectSegments(window, metas);
   const byKey = new Map(catalog.map((s) => [s.segment_key, s]));
-  await doJson(stub, "/internal/window/open", "POST", {
+  const openStarted = Date.now();
+  const opened = await doJson(stub, "/internal/window/open", "POST", {
     session_id: sessionId,
     window: windowWire(window),
     catalog: catalog.map((s) => segmentMetaWire(s, nameById.get(s.instance_id) ?? "")),
   });
+  const cached = cachedKeysFromOpen(opened);
+  console.log("analysis.window.open", {
+    session_id: sessionId,
+    shot_id: sessionId,
+    open_ms: Date.now() - openStarted,
+    selected: selection.selected.length,
+    cached_segments: cached.size,
+    timings: opened.timings ?? undefined,
+  });
   const missing = [...selection.missing];
   let available = 0;
+  let downloadMs = 0;
+  let streamed = 0;
   for (const sel of selection.selected) {
     const row = byKey.get(sel.segment_key);
     if (!row) {
       missing.push(sel.segment_key);
       continue;
     }
+    if (cached.has(row.segment_key)) {
+      available += 1;
+      continue;
+    }
+    const started = Date.now();
     const object = await ctx.bucket.get(row.object_key);
     if (!object || !object.body) {
       missing.push(sel.segment_key);
@@ -964,9 +1040,22 @@ async function openWindowSession(
       "x-burstel-size": String(row.size_bytes),
       "x-burstel-sha256": row.sha256,
     }, object.body);
+    downloadMs += Date.now() - started;
+    streamed += 1;
     available += 1;
   }
-  await doJson(stub, "/internal/window/commit", "POST", { session_id: sessionId });
+  const commitStarted = Date.now();
+  const committed = await doJson(stub, "/internal/window/commit", "POST", { session_id: sessionId });
+  console.log("analysis.part.download", {
+    session_id: sessionId,
+    shot_id: sessionId,
+    selected: selection.selected.length,
+    streamed,
+    cached_segments: cached.size,
+    download_ms: downloadMs,
+    commit_ms: Date.now() - commitStarted,
+    timings: committed.timings ?? undefined,
+  });
   // Disclose un-compacted journal data in the window: never claim empty/complete
   // when the journal still holds data that has not become a segment yet.
   const windowNames = new Set(window.instances);
@@ -1022,6 +1111,13 @@ async function ensureWindowMaterialized(ctx: ToolContext, record: WindowShotReco
   }
 }
 
+/** Reads the container's part-cache hits from a `/internal/window/open` reply. */
+function cachedKeysFromOpen(opened: Record<string, unknown>): Set<string> {
+  const raw = opened.cached_keys;
+  if (!Array.isArray(raw)) return new Set();
+  return new Set(raw.filter((key): key is string => typeof key === "string"));
+}
+
 /** Runs `run` against a freshly committed window session, then releases it. */
 async function withWindowSession<T>(
   ctx: ToolContext,
@@ -1037,8 +1133,18 @@ async function withWindowSession<T>(
   const result = await openWindowSession(ctx, stub, sessionId, current.window!, catalog, parts);
   await syncCoverage(ctx, current, catalog, result);
   try {
-    return await run(sessionId);
+    const runStarted = Date.now();
+    const out = await run(sessionId);
+    console.log("analysis.window.run", {
+      session_id: sessionId,
+      shot_id: record.shot_id,
+      run_ms: Date.now() - runStarted,
+      timings: (out as { timings?: unknown } | null)?.timings ?? undefined,
+    });
+    return out;
   } finally {
+    // Spec 033: the shot's downloaded parts stay cached in the analysis
+    // container even after this session is released.
     await doJson(stub, "/internal/window/release", "POST", { session_id: sessionId }).catch(() => undefined);
   }
 }

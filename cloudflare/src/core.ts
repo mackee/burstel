@@ -604,11 +604,26 @@ export class ShotCore {
   private async ensureAnalysisOnly(): Promise<void> {
     this.requireInternalAuth();
     if (!this.container.running) {
+      const started = Date.now();
       this.container.start(this.analysisEnvironment());
       await this.container.ensureReady();
       await this.container.keepAlive(ANALYSIS_KEEPALIVE_MS).catch(() => undefined);
       this.analysisRestored.clear();
+      console.log("analysis.container.start", {
+        shot_id: this.shotId,
+        kind: "window",
+        duration_ms: Date.now() - started,
+      });
     }
+  }
+
+  /**
+   * Spec 033: start the analysis container from the ShotDO alarm before the
+   * shot stops. It is a no-op when the container is already warm.
+   */
+  async prewarmAnalysis(): Promise<void> {
+    await this.ensureLoaded();
+    await this.ensureAnalysisOnly();
   }
 
   /** Opens a logical-window session and returns the justified segment selection. */

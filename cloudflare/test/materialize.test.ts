@@ -171,8 +171,8 @@ describe("materialization state machine", () => {
     expect(completed.materialization?.parts[0]?.object_key).toBe("shots/shot-run/part-0.duckdb");
     expect(completed.materialization?.parts[1]?.object_key).toBe("shots/shot-run/part-1.duckdb");
     expect(new Set(compactor.names).size).toBe(2);
-    expect(compactor.names).toContain("materializer-shot-run-0");
-    expect(compactor.names).toContain("materializer-shot-run-1");
+    expect(compactor.names).toContain("materializer-0");
+    expect(compactor.names).toContain("materializer-1");
 
     // Re-running with force replaces the same deterministic part keys.
     const again = await materializeShot({ ingest, compactor }, completed, {

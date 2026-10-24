@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mackee/burstel/internal/otlp"
@@ -50,19 +51,35 @@ type MaterializeRequest struct {
 
 // MaterializeResponse describes one uploaded shot part.
 type MaterializeResponse struct {
-	ShotID          string `json:"shot_id"`
-	PartIndex       int    `json:"part_index"`
-	PartKey         string `json:"part_key"`
-	SizeBytes       int64  `json:"size_bytes"`
-	SHA256          string `json:"sha256"`
-	ObjectCount     int64  `json:"object_count"`
-	RequestCount    int64  `json:"request_count"`
-	RecordCount     int64  `json:"record_count"`
-	SpanCount       int64  `json:"span_count"`
-	LogCount        int64  `json:"log_count"`
-	MetricCount     int64  `json:"metric_count"`
-	FirstReceivedAt int64  `json:"first_received_at"`
-	LastReceivedAt  int64  `json:"last_received_at"`
+	ShotID          string             `json:"shot_id"`
+	PartIndex       int                `json:"part_index"`
+	PartKey         string             `json:"part_key"`
+	SizeBytes       int64              `json:"size_bytes"`
+	SHA256          string             `json:"sha256"`
+	ObjectCount     int64              `json:"object_count"`
+	RequestCount    int64              `json:"request_count"`
+	RecordCount     int64              `json:"record_count"`
+	SpanCount       int64              `json:"span_count"`
+	LogCount        int64              `json:"log_count"`
+	MetricCount     int64              `json:"metric_count"`
+	FirstReceivedAt int64              `json:"first_received_at"`
+	LastReceivedAt  int64              `json:"last_received_at"`
+	Timings         MaterializeTimings `json:"timings"`
+}
+
+// MaterializeTimings is the per-phase latency breakdown of one part build
+// (spec 033 requirement 5). GET/decode are summed over the part's concurrent
+// object fetches; append/index/checkpoint/hash/put are wall-clock phases.
+type MaterializeTimings struct {
+	Objects      int   `json:"objects"`
+	GetMS        int64 `json:"get_ms"`
+	DecodeMS     int64 `json:"decode_ms"`
+	AppendMS     int64 `json:"append_ms"`
+	IndexMS      int64 `json:"index_ms"`
+	CheckpointMS int64 `json:"checkpoint_ms"`
+	HashMS       int64 `json:"hash_ms"`
+	PutMS        int64 `json:"put_ms"`
+	TotalMS      int64 `json:"total_ms"`
 }
 
 var shotIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
@@ -92,7 +109,8 @@ func (s *Service) Materialize(ctx context.Context, req MaterializeRequest) (Mate
 		excluded[key] = struct{}{}
 	}
 
-	records, err := s.fetchMaterializationRecords(ctx, req.Objects, excluded)
+	started := time.Now()
+	records, getMS, decodeMS, err := s.fetchMaterializationRecords(ctx, req.Objects, excluded)
 	if err != nil {
 		return MaterializeResponse{}, err
 	}
@@ -110,7 +128,7 @@ func (s *Service) Materialize(ctx context.Context, req MaterializeRequest) (Mate
 		return MaterializeResponse{}, err
 	}
 	defer cleanup()
-	info, err := BuildPart(ctx, scratch, partKey, "", "", records)
+	info, profile, err := BuildPartProfile(ctx, scratch, partKey, "", "", records)
 	if err != nil {
 		return MaterializeResponse{}, err
 	}
@@ -121,9 +139,23 @@ func (s *Service) Materialize(ctx context.Context, req MaterializeRequest) (Mate
 	if err != nil {
 		return MaterializeResponse{}, err
 	}
+	putStart := time.Now()
 	if err := s.remote.Put(ctx, partKey, data, "application/vnd.duckdb"); err != nil {
 		return MaterializeResponse{}, fmt.Errorf("upload part %s: %w", partKey, err)
 	}
+	timings := MaterializeTimings{
+		Objects:      len(records),
+		GetMS:        getMS,
+		DecodeMS:     decodeMS,
+		AppendMS:     profile.AppendMS,
+		IndexMS:      profile.IndexMS,
+		CheckpointMS: profile.CheckpointMS,
+		HashMS:       profile.HashMS,
+		PutMS:        time.Since(putStart).Milliseconds(),
+		TotalMS:      time.Since(started).Milliseconds(),
+	}
+	fmt.Printf("burstel-materialize: part=%s objects=%d get_ms=%d decode_ms=%d append_ms=%d checkpoint_ms=%d put_ms=%d total_ms=%d\n",
+		partKey, timings.Objects, timings.GetMS, timings.DecodeMS, timings.AppendMS, timings.CheckpointMS, timings.PutMS, timings.TotalMS)
 	return MaterializeResponse{
 		ShotID:          req.ShotID,
 		PartIndex:       req.PartIndex,
@@ -138,6 +170,7 @@ func (s *Service) Materialize(ctx context.Context, req MaterializeRequest) (Mate
 		MetricCount:     info.MetricCount,
 		FirstReceivedAt: info.FirstReceivedAt,
 		LastReceivedAt:  info.LastReceivedAt,
+		Timings:         timings,
 	}, nil
 }
 
@@ -150,10 +183,11 @@ func (s *Service) fetchMaterializationRecords(
 	ctx context.Context,
 	objects []MaterializeObject,
 	excluded map[string]struct{},
-) ([]JournalRecord, error) {
+) ([]JournalRecord, int64, int64, error) {
 	records := make([]JournalRecord, 0, len(objects))
 	var mu sync.Mutex
 	var firstErr error
+	var getMS, decodeMS int64
 	sem := make(chan struct{}, s.materializeConcurrency)
 	var wg sync.WaitGroup
 
@@ -162,7 +196,7 @@ func (s *Service) fetchMaterializationRecords(
 			continue
 		}
 		if !strings.HasPrefix(obj.Key, "journal/") {
-			return nil, badReq(fmt.Sprintf("object %s is outside the journal/ prefix", obj.Key))
+			return nil, 0, 0, badReq(fmt.Sprintf("object %s is outside the journal/ prefix", obj.Key))
 		}
 		obj := obj
 		wg.Add(1)
@@ -170,7 +204,7 @@ func (s *Service) fetchMaterializationRecords(
 		go func() {
 			defer wg.Done()
 			defer func() { <-sem }()
-			rec, err := fetchMaterializationRecord(ctx, s.remote, obj)
+			rec, getDuration, decodeDuration, err := fetchMaterializationRecord(ctx, s.remote, obj)
 			if err != nil {
 				mu.Lock()
 				if firstErr == nil {
@@ -179,6 +213,8 @@ func (s *Service) fetchMaterializationRecords(
 				mu.Unlock()
 				return
 			}
+			atomic.AddInt64(&getMS, getDuration)
+			atomic.AddInt64(&decodeMS, decodeDuration)
 			mu.Lock()
 			records = append(records, rec)
 			mu.Unlock()
@@ -186,40 +222,44 @@ func (s *Service) fetchMaterializationRecords(
 	}
 	wg.Wait()
 	if firstErr != nil {
-		return nil, firstErr
+		return nil, 0, 0, firstErr
 	}
-	return records, nil
+	return records, getMS, decodeMS, nil
 }
 
-func fetchMaterializationRecord(ctx context.Context, store RemoteStore, obj MaterializeObject) (JournalRecord, error) {
+func fetchMaterializationRecord(ctx context.Context, store RemoteStore, obj MaterializeObject) (JournalRecord, int64, int64, error) {
 	signal := otlp.Signal(obj.Signal)
 	if !signal.Valid() {
-		return JournalRecord{}, badReq(fmt.Sprintf("object %s: invalid signal %q", obj.Key, obj.Signal))
+		return JournalRecord{}, 0, 0, badReq(fmt.Sprintf("object %s: invalid signal %q", obj.Key, obj.Signal))
 	}
 	if obj.ReceivedAt <= 0 {
-		return JournalRecord{}, badReq(fmt.Sprintf("object %s: invalid received_at", obj.Key))
+		return JournalRecord{}, 0, 0, badReq(fmt.Sprintf("object %s: invalid received_at", obj.Key))
 	}
+	getStart := time.Now()
 	wire, err := store.Get(ctx, obj.Key)
 	if err != nil {
-		return JournalRecord{}, fmt.Errorf("fetch %s: %w", obj.Key, err)
+		return JournalRecord{}, 0, 0, fmt.Errorf("fetch %s: %w", obj.Key, err)
 	}
+	getMS := time.Since(getStart).Milliseconds()
 	if obj.Size > 0 && int64(len(wire)) != obj.Size {
-		return JournalRecord{}, fmt.Errorf("object %s: size mismatch", obj.Key)
+		return JournalRecord{}, 0, 0, fmt.Errorf("object %s: size mismatch", obj.Key)
 	}
 	if obj.SHA256 != "" && !strings.EqualFold(sha256Hex(wire), obj.SHA256) {
-		return JournalRecord{}, fmt.Errorf("object %s: sha256 mismatch", obj.Key)
+		return JournalRecord{}, 0, 0, fmt.Errorf("object %s: sha256 mismatch", obj.Key)
 	}
+	decodeStart := time.Now()
 	payload := wire
 	if strings.EqualFold(obj.ContentEncoding, "gzip") {
 		payload, err = gunzipBytes(wire)
 		if err != nil {
-			return JournalRecord{}, fmt.Errorf("object %s: %w", obj.Key, err)
+			return JournalRecord{}, 0, 0, fmt.Errorf("object %s: %w", obj.Key, err)
 		}
 	}
 	decoded, err := otlp.Decode(signal, payload)
 	if err != nil {
-		return JournalRecord{}, fmt.Errorf("object %s: decode: %w", obj.Key, err)
+		return JournalRecord{}, 0, 0, fmt.Errorf("object %s: decode: %w", obj.Key, err)
 	}
+	decodeMS := time.Since(decodeStart).Milliseconds()
 	return JournalRecord{
 		Object: JournalObject{
 			Key:             obj.Key,
@@ -237,5 +277,5 @@ func fetchMaterializationRecord(ctx context.Context, store RemoteStore, obj Mate
 		Wire:    wire,
 		Payload: payload,
 		Decoded: decoded,
-	}, nil
+	}, getMS, decodeMS, nil
 }

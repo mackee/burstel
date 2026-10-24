@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { createContainerControl } from "../src/container";
+import { containerEgressFor, createContainerControl } from "../src/container";
 import type { ContainerLike, ContainerPortLike } from "../src/container";
 
 class FakePort implements ContainerPortLike {
@@ -23,10 +23,12 @@ class FakeContainer implements ContainerLike {
   startCalls = 0;
   destroyCalls = 0;
   inactivityTimeout: number | undefined;
+  startOptions: { enableInternet?: boolean; env?: Record<string, string> } | undefined;
   readonly port = new FakePort();
 
-  start(): void {
+  start(options?: { enableInternet?: boolean; env?: Record<string, string> }): void {
     this.startCalls += 1;
+    this.startOptions = options;
     this.running = true;
   }
   async destroy(): Promise<void> {
@@ -50,6 +52,20 @@ describe("container control", () => {
 
     expect(container.startCalls).toBe(1);
     expect(container.inactivityTimeout).toBeUndefined();
+    expect(container.startOptions?.enableInternet).toBe(false);
+  });
+
+  test("the egress flag is per container class", () => {
+    expect(containerEgressFor("CompactorDO")).toBe(true);
+    expect(containerEgressFor("ShotDO")).toBe(false);
+  });
+
+  test("only an explicitly enabled control starts a container with egress", () => {
+    const container = new FakeContainer();
+    const control = createContainerControl(container, { port: 8080, enableInternet: true });
+    control.start({ BURSTEL_INTERNAL_TOKEN: "t" });
+    expect(container.startOptions?.enableInternet).toBe(true);
+    expect(container.startOptions?.env).toEqual({ BURSTEL_INTERNAL_TOKEN: "t" });
   });
 
   test("keepAlive awaits the platform and propagates its rejection", async () => {

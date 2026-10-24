@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -40,6 +42,7 @@ type WindowStoreOptions struct {
 // WindowStore holds the active logical-window sessions.
 type WindowStore struct {
 	dir       string
+	cacheDir  string
 	policy    Policy
 	bounds    WindowBounds
 	ingestLag time.Duration
@@ -49,6 +52,7 @@ type WindowStore struct {
 	now       func() time.Time
 	mu        sync.Mutex
 	sessions  map[string]*WindowSession
+	cacheSize int64
 	closed    bool
 }
 
@@ -72,6 +76,7 @@ func NewWindowStore(dir string, opts WindowStoreOptions) *WindowStore {
 	}
 	return &WindowStore{
 		dir:       dir,
+		cacheDir:  filepath.Join(dir, "_parts"),
 		policy:    policy,
 		bounds:    bounds,
 		ingestLag: opts.IngestLag,
@@ -103,28 +108,87 @@ type WindowSession struct {
 // OpenWindow validates a window and starts a session. catalog is the full set of
 // segment metadata the caller knows about; the store selects candidates itself.
 func (s *WindowStore) OpenWindow(id string, window TimeWindow, catalog []SegmentMeta) (SegmentSelection, error) {
+	selection, _, err := s.OpenWindowWithCache(id, window, catalog)
+	return selection, err
+}
+
+// OpenWindowWithCache also returns the keys whose bytes are already cached in
+// this analysis container (spec 033). The Worker skips their R2 download and
+// segment upload entirely; the session already references the cached files.
+func (s *WindowStore) OpenWindowWithCache(id string, window TimeWindow, catalog []SegmentMeta) (SegmentSelection, []string, error) {
 	if !sessionIDPattern.MatchString(id) {
-		return SegmentSelection{}, policyErr("invalid_session_id", "session id must match [A-Za-z0-9._-]{1,128}")
+		return SegmentSelection{}, nil, policyErr("invalid_session_id", "session id must match [A-Za-z0-9._-]{1,128}")
 	}
 	if err := window.Validate(s.now(), s.bounds); err != nil {
-		return SegmentSelection{}, err
+		return SegmentSelection{}, nil, err
 	}
 	selection := SelectSegments(window, catalog, SelectionOptions{IngestLag: s.ingestLag})
 	dir := filepath.Join(s.dir, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return SegmentSelection{}, fmt.Errorf("analysis: window session dir: %w", err)
+		return SegmentSelection{}, nil, fmt.Errorf("analysis: window session dir: %w", err)
+	}
+	byKey := make(map[string]SegmentMeta, len(catalog))
+	for _, meta := range catalog {
+		byKey[meta.Key] = meta
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return SegmentSelection{}, errors.New("analysis: window store is closed")
+		return SegmentSelection{}, nil, errors.New("analysis: window store is closed")
 	}
 	if prev, ok := s.sessions[id]; ok {
 		_ = prev.scoped.Close()
 		_ = os.RemoveAll(prev.dir)
 	}
-	s.sessions[id] = &WindowSession{ID: id, Window: window, Catalog: catalog, Selection: selection, dir: dir}
-	return selection, nil
+	sess := &WindowSession{ID: id, Window: window, Catalog: catalog, Selection: selection, dir: dir}
+	var cached []string
+	// A previous analysis of the same shot already wrote verified part files
+	// into the container cache: reuse them without another download.
+	for _, selected := range selection.Selected {
+		meta, ok := byKey[selected.Key]
+		if !ok {
+			continue
+		}
+		if path, size, ok := s.cachedSegment(meta.Key, meta.Size, meta.SHA256); ok {
+			sess.segments = append(sess.segments, SegmentRef{
+				Key:      meta.Key,
+				Instance: firstNonEmpty(meta.Instance, meta.InstanceID),
+				Path:     path,
+			})
+			sess.bytes += size
+			cached = append(cached, meta.Key)
+		}
+	}
+	s.sessions[id] = sess
+	return selection, cached, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func (s *WindowStore) cachedSegment(key string, size int64, sha string) (string, int64, bool) {
+	path := filepath.Join(s.cacheDir, hashName(key)+".duckdb")
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return "", 0, false
+	}
+	if size > 0 && info.Size() != size {
+		return "", 0, false
+	}
+	norm := normalizeSHA(sha)
+	if norm != "" {
+		sidecar, err := os.ReadFile(path + ".sha256")
+		if err != nil || strings.TrimSpace(string(sidecar)) != norm {
+			return "", 0, false
+		}
+	}
+	return path, info.Size(), true
 }
 
 // AddSegment writes one verified segment object into the session.
@@ -144,44 +208,73 @@ func (s *WindowStore) AddSegment(ctx context.Context, id string, ref SegmentRef,
 	if sess.bytes+size > s.maxBytes {
 		return policyErr("session_too_large", "window session exceeds the maximum byte budget")
 	}
-	segDir := filepath.Join(sess.dir, "segments")
-	if err := os.MkdirAll(segDir, 0o755); err != nil {
+	normSHA := normalizeSHA(sha)
+	if path, cachedSize, ok := s.cachedSegment(ref.Key, size, normSHA); ok {
+		return s.appendCachedSegment(id, sess, ref, path, cachedSize)
+	}
+	if err := os.MkdirAll(s.cacheDir, 0o755); err != nil {
 		return err
 	}
-	path := filepath.Join(segDir, sanitizeSegmentKey(ref.Key))
-	written, gotSHA, err := writeVerified(path, r, s.maxBytes)
+	path := filepath.Join(s.cacheDir, hashName(ref.Key)+".duckdb")
+	// Write to a unique temp file first: concurrent requests for the same key
+	// (a retried Worker request overlapping the original) must not delete or
+	// truncate each other's bytes.
+	tmp := path + ".tmp-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+	written, gotSHA, err := writeVerified(tmp, r, s.maxBytes)
 	if err != nil {
 		return err
 	}
 	if size > 0 && written != size {
-		_ = os.Remove(path)
+		_ = os.Remove(tmp)
 		return policyErr("size_mismatch", fmt.Sprintf("segment size %d does not match declared %d", written, size))
 	}
-	normSHA := normalizeSHA(sha)
 	if normSHA != "" && gotSHA != normSHA {
-		_ = os.Remove(path)
+		_ = os.Remove(tmp)
 		return policyErr("sha256_mismatch", "segment sha256 does not match the declared checksum")
 	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("analysis: cache segment %s: %w", ref.Key, err)
+	}
+	if err := os.WriteFile(path+".sha256", []byte(gotSHA), 0o600); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("analysis: cache segment checksum %s: %w", ref.Key, err)
+	}
+	return s.appendCachedSegment(id, sess, ref, path, written)
+}
+
+func (s *WindowStore) appendCachedSegment(id string, sess *WindowSession, ref SegmentRef, path string, size int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, ok := s.sessions[id]
 	if !ok || cur != sess {
-		_ = os.Remove(path)
 		return ErrRestoreNotFound
+	}
+	for _, existing := range cur.segments {
+		if existing.Key == ref.Key {
+			return nil
+		}
 	}
 	ref.Path = path
 	cur.segments = append(cur.segments, ref)
-	cur.bytes += written
+	cur.bytes += size
+	s.cacheSize += size
 	return nil
 }
 
 // Commit builds the scoped read-only snapshot for the session.
 func (s *WindowStore) Commit(ctx context.Context, id string) (ScopedCoverage, error) {
+	cov, _, err := s.CommitWithTimings(ctx, id)
+	return cov, err
+}
+
+// CommitWithTimings also returns the attach/materialize/checkpoint phases.
+func (s *WindowStore) CommitWithTimings(ctx context.Context, id string) (ScopedCoverage, ScopedTimings, error) {
 	s.mu.Lock()
 	sess, ok := s.sessions[id]
 	s.mu.Unlock()
 	if !ok {
-		return ScopedCoverage{}, ErrRestoreNotFound
+		return ScopedCoverage{}, ScopedTimings{}, ErrRestoreNotFound
 	}
 	scoped, err := BuildScopedEngine(ctx, sess.Window, sess.segments, ScopedOptions{
 		WorkDir:         sess.dir,
@@ -189,7 +282,7 @@ func (s *WindowStore) Commit(ctx context.Context, id string) (ScopedCoverage, er
 		Open:            s.open,
 	})
 	if err != nil {
-		return ScopedCoverage{}, err
+		return ScopedCoverage{}, ScopedTimings{}, err
 	}
 	provided := map[string]struct{}{}
 	for _, ref := range sess.segments {
@@ -215,7 +308,7 @@ func (s *WindowStore) Commit(ctx context.Context, id string) (ScopedCoverage, er
 	cur, ok := s.sessions[id]
 	if !ok || cur != sess {
 		_ = scoped.Close()
-		return ScopedCoverage{}, ErrRestoreNotFound
+		return ScopedCoverage{}, ScopedTimings{}, ErrRestoreNotFound
 	}
 	if cur.scoped != nil {
 		_ = cur.scoped.Close()
@@ -223,7 +316,7 @@ func (s *WindowStore) Commit(ctx context.Context, id string) (ScopedCoverage, er
 	cur.scoped = scoped
 	cur.coverage = scoped.Coverage
 	cur.ready = true
-	return scoped.Coverage, nil
+	return scoped.Coverage, scoped.Timings, nil
 }
 
 // Scoped returns the committed engine for a session.

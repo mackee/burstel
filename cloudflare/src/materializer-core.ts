@@ -15,6 +15,7 @@ import { json, readJson } from "./http";
 
 export interface MaterializerConfig {
   containerTimeoutMs: number;
+  /** Spec 033: keep a finished pool member warm for the next shot. */
   containerKeepAliveMs: number;
 }
 
@@ -68,6 +69,19 @@ export class MaterializerCore {
         running: this.container.running,
         internal_ready: this.internalReady,
       });
+    }
+    if (path === "/internal/prewarm") {
+      if (request.method !== "POST") return json(405, { error: "method not allowed" });
+      // Started by the MaterializeDO alarm, never by the shot_start request.
+      await this.ensureContainer();
+      return json(200, { holder: this.holder, running: this.container.running, prewarmed: true });
+    }
+    if (path === "/internal/keepalive") {
+      if (request.method !== "POST") return json(405, { error: "method not allowed" });
+      if (this.container.running) {
+        await this.container.keepAlive(this.config.containerKeepAliveMs).catch(() => undefined);
+      }
+      return json(200, { holder: this.holder, running: this.container.running, keepalive_ms: this.config.containerKeepAliveMs });
     }
     if (path === "/internal/materialize") {
       if (request.method !== "POST") return json(405, { error: "method not allowed" });

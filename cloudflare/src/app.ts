@@ -411,9 +411,12 @@ export function materializeOptions(env: AppEnv): {
     MATERIALIZE_MAX_INSTANCES?: string;
     MATERIALIZE_WAIT_MS?: string;
   };
+  const maxInstances = Math.min(8, num(vars.MATERIALIZE_MAX_INSTANCES, 4));
+  // Spec 033: leave one CompactorDO container slot for continuous compaction.
+  const parallelism = Math.min(maxInstances - 1, Math.min(8, num(vars.MATERIALIZE_PARALLELISM, 3)));
   return {
-    parallelism: Math.min(8, num(vars.MATERIALIZE_PARALLELISM, 4)),
-    maxInstances: Math.min(8, num(vars.MATERIALIZE_MAX_INSTANCES, 4)),
+    parallelism: Math.max(1, parallelism),
+    maxInstances,
     waitMs: Math.min(300_000, num(vars.MATERIALIZE_WAIT_MS, 90_000)),
   };
 }

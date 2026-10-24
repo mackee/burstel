@@ -3,7 +3,7 @@ import { describe, expect, test } from "bun:test";
 
 import type { CompactorNamespaceLike, DoStubLike, MaterializerNamespaceLike } from "../src/env";
 import type { MaterializationObject, WindowShotRecord } from "../src/ingest-core";
-import type { MaterializeRunState } from "../src/materialize-driver";
+import type { MaterializePrewarmState, MaterializeRunState } from "../src/materialize-driver";
 import { MaterializeDriver } from "../src/materialize-driver";
 import { ensureMaterialized, isMaterializationLeaseStale } from "../src/materialize";
 import { createTools } from "../src/tools";
@@ -29,10 +29,27 @@ class FakeScheduler {
   }
 }
 
+class MemoryPrewarmStore {
+  state: MaterializePrewarmState | null = null;
+
+  async load(): Promise<MaterializePrewarmState | null> {
+    return this.state ? { ...this.state } : null;
+  }
+
+  async save(state: MaterializePrewarmState | null): Promise<void> {
+    this.state = state ? { ...state } : null;
+  }
+}
+
 class FakeMaterializers implements CompactorNamespaceLike {
   readonly names: string[] = [];
   readonly requests: Array<Record<string, unknown>> = [];
+  readonly prewarms: string[] = [];
+  readonly keepAlives: string[] = [];
   fail = false;
+  capacity = false;
+  /** Optional per-part hold; lets a test observe pool queueing. */
+  gate: ((body: Record<string, unknown>) => Promise<void>) | undefined;
 
   getByName(name: string): DoStubLike {
     return {
@@ -44,11 +61,28 @@ class FakeMaterializers implements CompactorNamespaceLike {
   }
 
   private async handle(request: Request): Promise<Response> {
-    if (new URL(request.url).pathname !== "/internal/materialize") {
+    const path = new URL(request.url).pathname;
+    const name = this.names.at(-1) ?? "";
+    if (path === "/internal/prewarm") {
+      this.prewarms.push(name);
+      return new Response(JSON.stringify({ prewarmed: true }), { status: 200 });
+    }
+    if (path === "/internal/keepalive") {
+      this.keepAlives.push(name);
+      return new Response(JSON.stringify({ keepalive_ms: 600000 }), { status: 200 });
+    }
+    if (path !== "/internal/materialize") {
       return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
     }
     if (this.fail) return new Response(JSON.stringify({ error: "container exploded" }), { status: 500 });
+    if (this.capacity) {
+      return new Response(
+        JSON.stringify({ error: "There is no container instance that can be provided to this Durable Object" }),
+        { status: 503 },
+      );
+    }
     const body = (await request.json()) as Record<string, unknown>;
+    if (this.gate) await this.gate(body);
     this.requests.push(body);
     const index = Number(body.part_index ?? 0);
     const objects = (body.objects ?? []) as MaterializationObject[];
@@ -98,13 +132,16 @@ interface Harness {
   core: ReturnType<typeof makeIngest>["core"];
   ingest: FakeIngestNamespace;
   store: MemoryStore;
+  prewarmStore: MemoryPrewarmStore;
   scheduler: FakeScheduler;
   compactor: FakeMaterializers;
   driver: MaterializeDriver;
   stopped: WindowShotRecord;
 }
 
-async function harness(options: { maxAttempts?: number; parallelism?: number } = {}): Promise<Harness> {
+async function harness(
+  options: { maxAttempts?: number; parallelism?: number; capacityBackoffMs?: number } = {},
+): Promise<Harness> {
   const clock = { now: 1_700_000_100_000 };
   const bucket = new FakeBucket();
   const { core } = makeIngest({ now: () => clock.now, bucket, lateWriteLimitMs: 10_000 });
@@ -114,6 +151,7 @@ async function harness(options: { maxAttempts?: number; parallelism?: number } =
   for (let i = 0; i < 4; i++) await seedJournal(bucket, start + i * 1_000, `o${i}`);
   const stopped = await core.stopWindowShot("shot_alarm_materialize", start + 10_000);
   const store = new MemoryStore();
+  const prewarmStore = new MemoryPrewarmStore();
   const scheduler = new FakeScheduler();
   const compactor = new FakeMaterializers();
   const driver = new MaterializeDriver({
@@ -121,6 +159,7 @@ async function harness(options: { maxAttempts?: number; parallelism?: number } =
     ingest,
     compactor,
     store,
+    prewarmStore,
     scheduler,
     now: () => clock.now,
     config: {
@@ -131,10 +170,12 @@ async function harness(options: { maxAttempts?: number; parallelism?: number } =
       retryDelayMs: 10,
       heartbeatMs: 0,
       lateWriteLimitMs: 10_000,
+      keepAliveMs: 10 * 60 * 1000,
+      capacityBackoffMs: options.capacityBackoffMs ?? 2_000,
     },
     log: () => undefined,
   });
-  return { clock, core, ingest, store, scheduler, compactor, driver, stopped };
+  return { clock, core, ingest, store, prewarmStore, scheduler, compactor, driver, stopped };
 }
 
 describe("alarm-driven materialization", () => {
@@ -154,10 +195,11 @@ describe("alarm-driven materialization", () => {
 
     const run = await h.store.load();
     expect(run?.state).toBe("complete");
-    expect(run?.results.length).toBe(2);
+    expect(run?.results.length).toBe(4);
+    expect(run?.parts_total).toBe(4);
     expect(run?.spans).toBe(8);
-    expect(h.compactor.names).toContain("materializer-shot_alarm_materialize-0");
-    expect(h.compactor.names).toContain("materializer-shot_alarm_materialize-1");
+    expect(h.compactor.names).toContain("materializer-0");
+    expect(h.compactor.names).toContain("materializer-1");
     const record = h.core.getShotRecord("shot_alarm_materialize")!;
     expect(record.materialization?.state).toBe("complete");
     expect(record.coverage?.complete).toBe(true);
@@ -222,7 +264,7 @@ describe("alarm-driven materialization", () => {
     clock.now = scheduler.armed.at(-1)!;
     await driver.alarm();
     expect((await store.load())?.state).toBe("complete");
-    expect(compactor.names.length).toBe(2);
+    expect(compactor.requests.length).toBe(4);
   });
 
   test("retries a stale part lease on the next alarm", async () => {
@@ -236,29 +278,17 @@ describe("alarm-driven materialization", () => {
     run.state = "running";
     run.started_at = h.clock.now;
     run.lease_expires_at = h.clock.now - 1;
-    run.parts_total = 2;
-    run.parts = [
-      {
-        index: 0,
-        state: "running",
-        attempts: 1,
-        lease_owner: "dead-coordinator",
-        lease_expires_at: h.clock.now - 1,
-        started_at: h.clock.now - 5_000,
-        finished_at: null,
-        error: null,
-      },
-      {
-        index: 1,
-        state: "pending",
-        attempts: 0,
-        lease_owner: null,
-        lease_expires_at: null,
-        started_at: null,
-        finished_at: null,
-        error: null,
-      },
-    ];
+    run.parts_total = 4;
+    run.parts = [0, 1, 2, 3].map((index) => ({
+      index,
+      state: index === 0 ? ("running" as const) : ("pending" as const),
+      attempts: index === 0 ? 1 : 0,
+      lease_owner: index === 0 ? "dead-coordinator" : null,
+      lease_expires_at: index === 0 ? h.clock.now - 1 : null,
+      started_at: index === 0 ? h.clock.now - 5_000 : null,
+      finished_at: null,
+      error: null,
+    }));
     await h.store.save(run);
 
     await h.driver.alarm();
@@ -266,7 +296,7 @@ describe("alarm-driven materialization", () => {
     const retried = await h.store.load();
     expect(retried?.state).toBe("complete");
     expect(retried?.parts[0]?.attempts).toBe(2);
-    expect(h.compactor.requests.length).toBe(2);
+    expect(h.compactor.requests.length).toBe(4);
   });
 
   test("ends terminal failed with a reason after the bounded attempts", async () => {
@@ -343,6 +373,74 @@ describe("alarm-driven materialization", () => {
     });
     expect(completed.coverage?.complete).toBe(true);
     expect(completed.coverage?.materialization_state).toBe("complete");
+  });
+});
+
+describe("spec 033 fixed materializer pool", () => {
+  test("assigns parts to fixed pool members and never exceeds parallelism", async () => {
+    const h = await harness({ parallelism: 2 });
+    let active = 0;
+    let maxActive = 0;
+    h.compactor.gate = async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      active -= 1;
+    };
+    await h.driver.schedule(h.stopped);
+    h.clock.now = h.stopped.window!.end_ms + 10_000;
+    await h.driver.alarm();
+
+    const run = await h.store.load();
+    expect(run?.state).toBe("complete");
+    expect(run?.results.length).toBe(4);
+    expect(maxActive).toBeLessThanOrEqual(2);
+    expect(new Set(h.compactor.names)).toEqual(new Set(["materializer-0", "materializer-1"]));
+    expect(run?.parts.every((part) => part.pool_member == null)).toBe(true);
+  });
+
+  test("no-capacity backoff queues the part without consuming an attempt", async () => {
+    const h = await harness({ parallelism: 2, capacityBackoffMs: 2_000 });
+    h.compactor.capacity = true;
+    await h.driver.schedule(h.stopped);
+    h.clock.now = h.stopped.window!.end_ms + 10_000;
+    await h.driver.alarm();
+
+    let run = await h.store.load();
+    expect(run?.state).toBe("scheduled");
+    expect(run?.scheduled_at).toBe(h.clock.now + 2_000);
+    expect(run?.parts.every((part) => part.state === "pending")).toBe(true);
+    expect(run?.parts.every((part) => part.attempts === 0)).toBe(true);
+
+    // Once capacity returns, the same run completes with its first real attempt.
+    h.compactor.capacity = false;
+    h.clock.now = run!.scheduled_at;
+    await h.driver.alarm();
+    run = await h.store.load();
+    expect(run?.state).toBe("complete");
+    expect(run?.parts.every((part) => part.attempts === 1)).toBe(true);
+  });
+
+  test("keeps a finished pool member warm for the next shot", async () => {
+    const h = await harness({ parallelism: 2 });
+    await h.driver.schedule(h.stopped);
+    h.clock.now = h.stopped.window!.end_ms + 10_000;
+    await h.driver.alarm();
+    expect((await h.store.load())?.state).toBe("complete");
+    expect(h.compactor.keepAlives).toContain("materializer-0");
+    expect(h.compactor.keepAlives).toContain("materializer-1");
+  });
+
+  test("prewarm is armed by the request and executed by the alarm", async () => {
+    const h = await harness({ parallelism: 2 });
+    await h.driver.schedulePrewarm();
+    expect(h.scheduler.armed.at(-1)).toBe(h.clock.now);
+    expect(h.prewarmStore.state?.done).toBe(false);
+    expect(h.compactor.prewarms).toEqual([]);
+
+    await h.driver.alarm();
+    expect(h.compactor.prewarms).toEqual(["materializer-0", "materializer-1"]);
+    expect(h.prewarmStore.state?.done).toBe(true);
   });
 });
 

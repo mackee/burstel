@@ -48,6 +48,14 @@ type AnalyzeResult struct {
 	Observed      []string         `json:"observed"`
 	Hypotheses    []string         `json:"hypotheses,omitempty"`
 	Notes         []string         `json:"notes,omitempty"`
+	Timings       *AnalyzeTimings  `json:"timings,omitempty"`
+}
+
+// AnalyzeTimings exposes per-section SQL time (spec 033 requirement 4).
+type AnalyzeTimings struct {
+	RawCountsMS int64            `json:"raw_counts_ms"`
+	SectionsMS  map[string]int64 `json:"sections_ms"`
+	TotalMS     int64            `json:"total_ms"`
 }
 
 // AnalyzeRequest selects which sections to compute.

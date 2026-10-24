@@ -18,12 +18,21 @@ import type {
 import { chunkMaterializationPlan, materializeChunk } from "./materialize-part";
 import type { MaterializeChunk } from "./materialize-part";
 
-export { chunkMaterializationPlan, materializeChunk } from "./materialize-part";
+export { chunkMaterializationPlan, materializeChunk, materializerPoolName } from "./materialize-part";
 export type { MaterializeChunk } from "./materialize-part";
 
-export const MATERIALIZE_PARALLELISM = 4;
+/**
+ * Spec 033: fixed materializer pool size. It must stay at least one instance
+ * below the CompactorDO `max_instances` so continuous compaction always has a
+ * slot (`P <= max_instances - 1`).
+ */
+export const MATERIALIZE_PARALLELISM = 3;
 export const MATERIALIZE_WAIT_MS = 90_000;
 export const MATERIALIZE_MAX_INSTANCES = 4;
+/** How long a pool member keeps its container warm for the next shot. */
+export const MATERIALIZE_KEEPALIVE_MS = 10 * 60 * 1000;
+/** Backoff after "no container instance" before a queued part is retried. */
+export const MATERIALIZE_CAPACITY_BACKOFF_MS = 10_000;
 
 export interface MaterializeOptions {
   parallelism?: number;
@@ -152,6 +161,26 @@ export async function requestMaterialization(
     throw new HttpError(resp.status, message, resp.status >= 500, code);
   }
   return text.trim() === "" ? {} : (JSON.parse(text) as Record<string, unknown>);
+}
+
+/**
+ * Spec 033: ask the coordinator to prewarm its fixed materializer pool. Only a
+ * durable flag is written here; the DO alarm starts the containers.
+ */
+export async function prewarmMaterialization(ctx: MaterializeContext, shotId: string): Promise<void> {
+  if (!ctx.materializer) return;
+  const stub = ctx.materializer.getByName(shotId);
+  const resp = await stub.fetch(
+    new Request(`${DO_ORIGIN}/internal/prewarm`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ shot_id: shotId }),
+    }),
+  );
+  await resp.body?.cancel().catch(() => undefined);
+  if (resp.status < 200 || resp.status >= 300) {
+    throw new HttpError(resp.status, `materializer prewarm failed with status ${resp.status}`, true, "prewarm_failed");
+  }
 }
 
 /** Convenience wrapper used by shot_stop and the explicit materialize action. */

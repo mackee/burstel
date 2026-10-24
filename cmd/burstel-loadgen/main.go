@@ -234,6 +234,8 @@ type stats struct {
 type signalReport struct {
 	Generated   int64   `json:"generated"`
 	Exported    int64   `json:"exported"`
+	Dropped     int64   `json:"dropped"`
+	DropPct     float64 `json:"drop_pct"`
 	ExportCalls int64   `json:"export_calls"`
 	Errors      int64   `json:"exporter_errors"`
 	LastError   string  `json:"last_error,omitempty"`
@@ -247,15 +249,178 @@ func (s *signalStats) report() signalReport {
 	s.mu.Lock()
 	last := s.lastError
 	s.mu.Unlock()
+	generated := atomic.LoadInt64(&s.generated)
+	exported := atomic.LoadInt64(&s.exported)
+	dropped := generated - exported
+	dropPct := 0.0
+	if generated > 0 && dropped > 0 {
+		dropPct = float64(dropped) / float64(generated) * 100
+	}
 	return signalReport{
-		Generated:   atomic.LoadInt64(&s.generated),
-		Exported:    atomic.LoadInt64(&s.exported),
+		Generated:   generated,
+		Exported:    exported,
+		Dropped:     dropped,
+		DropPct:     dropPct,
 		ExportCalls: atomic.LoadInt64(&s.exportCalls),
 		Errors:      atomic.LoadInt64(&s.errors),
 		LastError:   last,
 		P50MS:       p50,
 		P95MS:       p95,
 		P99MS:       p99,
+	}
+}
+
+// counts is a cheap atomic snapshot used by the per-exporter drop sampler.
+func (s *signalStats) counts() (generated, exported int64) {
+	return atomic.LoadInt64(&s.generated), atomic.LoadInt64(&s.exported)
+}
+
+// aggregateReports sums the per-exporter counters and returns one report per
+// exporter so a single host's queue saturation cannot hide in the total.
+func aggregateReports(list []*stats) (map[string]signalReport, []map[string]any) {
+	aggregate := map[string]signalReport{}
+	perExporter := make([]map[string]any, 0, len(list))
+	signals := []string{"traces", "metrics", "logs"}
+	for i, st := range list {
+		reports := map[string]signalReport{
+			"traces":  st.traces.report(),
+			"metrics": st.metrics.report(),
+			"logs":    st.logs.report(),
+		}
+		perExporter = append(perExporter, map[string]any{
+			"exporter": i,
+			"signals":  reports,
+		})
+		for _, name := range signals {
+			cur := reports[name]
+			agg := aggregate[name]
+			agg.Generated += cur.Generated
+			agg.Exported += cur.Exported
+			agg.Dropped += cur.Dropped
+			agg.ExportCalls += cur.ExportCalls
+			agg.Errors += cur.Errors
+			if cur.LastError != "" && agg.LastError == "" {
+				agg.LastError = cur.LastError
+			}
+			if cur.P50MS > agg.P50MS {
+				agg.P50MS = cur.P50MS
+			}
+			if cur.P95MS > agg.P95MS {
+				agg.P95MS = cur.P95MS
+			}
+			if cur.P99MS > agg.P99MS {
+				agg.P99MS = cur.P99MS
+			}
+			aggregate[name] = agg
+		}
+	}
+	for name, agg := range aggregate {
+		if agg.Generated > 0 && agg.Dropped > 0 {
+			agg.DropPct = float64(agg.Dropped) / float64(agg.Generated) * 100
+		}
+		aggregate[name] = agg
+	}
+	return aggregate, perExporter
+}
+
+type dropPoint struct {
+	ElapsedMS int64 `json:"elapsed_ms"`
+	Generated int64 `json:"generated"`
+	Exported  int64 `json:"exported"`
+	Dropped   int64 `json:"dropped"`
+}
+
+type dropSampler struct {
+	exporters []*stats
+	start     time.Time
+	stopCh    chan struct{}
+	doneCh    chan struct{}
+	mu        sync.Mutex
+	samples   [][]map[string]dropPoint
+}
+
+func newDropSampler(exporters []*stats, start time.Time) *dropSampler {
+	return &dropSampler{
+		exporters: exporters,
+		start:     start,
+		stopCh:    make(chan struct{}),
+		doneCh:    make(chan struct{}),
+		samples:   make([][]map[string]dropPoint, len(exporters)),
+	}
+}
+
+func (d *dropSampler) startSampling() {
+	go func() {
+		defer close(d.doneCh)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-d.stopCh:
+				d.sample()
+				return
+			case <-ticker.C:
+				d.sample()
+			}
+		}
+	}()
+}
+
+func (d *dropSampler) stop() {
+	close(d.stopCh)
+	<-d.doneCh
+}
+
+func (d *dropSampler) sample() {
+	point := d.point()
+	d.mu.Lock()
+	for i := range d.samples {
+		d.samples[i] = append(d.samples[i], map[string]dropPoint{
+			"traces":  point[i]["traces"],
+			"metrics": point[i]["metrics"],
+			"logs":    point[i]["logs"],
+		})
+	}
+	d.mu.Unlock()
+}
+
+func (d *dropSampler) point() []map[string]dropPoint {
+	elapsed := time.Since(d.start).Milliseconds()
+	out := make([]map[string]dropPoint, len(d.exporters))
+	for i, st := range d.exporters {
+		signals := make(map[string]dropPoint, 3)
+		for name, s := range map[string]*signalStats{
+			"traces":  &st.traces,
+			"metrics": &st.metrics,
+			"logs":    &st.logs,
+		} {
+			generated, exported := s.counts()
+			dropped := generated - exported
+			if dropped < 0 {
+				dropped = 0
+			}
+			signals[name] = dropPoint{ElapsedMS: elapsed, Generated: generated, Exported: exported, Dropped: dropped}
+		}
+		out[i] = signals
+	}
+	return out
+}
+
+func (d *dropSampler) report() map[string]any {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	perExporter := make([]map[string]any, 0, len(d.exporters))
+	for i, samples := range d.samples {
+		perExporter = append(perExporter, map[string]any{
+			"exporter": i,
+			"samples":  samples,
+		})
+	}
+	return map[string]any{
+		"method":       "inferred_generated_minus_exported",
+		"interval_ms":  1000,
+		"per_exporter": perExporter,
+		"note":         "the stock OTel Go SDK does not expose queue-drop counters; a non-zero dropped value is client-side loss even when exporter_errors is zero",
 	}
 }
 
@@ -394,8 +559,11 @@ func main() {
 		"x-burstel-token": cfg.token,
 		"authorization":   "Bearer " + cfg.token,
 	}
-	st := &stats{}
-	runs, err := buildProviders(ctx, cfg, headers, st)
+	perExporter := make([]*stats, cfg.exporters)
+	for i := range perExporter {
+		perExporter[i] = &stats{}
+	}
+	runs, err := buildProviders(ctx, cfg, headers, perExporter)
 	if err != nil {
 		fatal(err)
 	}
@@ -407,16 +575,19 @@ func main() {
 		cfg.settings.QueueSize, cfg.sources.QueueSize)
 
 	start := time.Now()
+	sampler := newDropSampler(perExporter, start)
+	sampler.startSampling()
 	var wg sync.WaitGroup
 	deadline := start.Add(cfg.duration)
 	for i, run := range runs {
 		wg.Add(1)
 		go func(index int, r *exporterRun) {
 			defer wg.Done()
-			generate(ctx, r, st, cfg, index, deadline)
+			generate(ctx, r, perExporter[index], cfg, index, deadline)
 		}(i, run)
 	}
 	wg.Wait()
+	sampler.stop()
 	generatedElapsed := time.Since(start)
 
 	// B2 (and every run): the stock SDK Shutdown flushes its batch processors
@@ -438,6 +609,7 @@ func main() {
 	}
 	shutdownDuration := time.Since(shutdownStart)
 
+	signals, exporterReports := aggregateReports(perExporter)
 	report := map[string]any{
 		"run_id":                  cfg.runID,
 		"variant":                 cfg.variant,
@@ -453,11 +625,12 @@ func main() {
 		"shutdown_ms":             shutdownDuration.Milliseconds(),
 		"shutdown_deadline":       cfg.shutdownGrace.String(),
 		"shutdown_error":          errString(shutdownErr),
-		"signals": map[string]signalReport{
-			"traces":  st.traces.report(),
-			"metrics": st.metrics.report(),
-			"logs":    st.logs.report(),
-		},
+		"signals":                 signals,
+		"per_exporter_signals":    exporterReports,
+		// The stock OTel SDK does not expose queue-drop counters. The report
+		// therefore infers client-side loss as generated - exported, sampled
+		// every second per exporter (spec 033 requirement 6).
+		"client_drop": sampler.report(),
 	}
 
 	if cfg.shotID != "" && cfg.apiToken != "" {
@@ -564,7 +737,7 @@ func logBatchOptions(settings clientSettings) []sdklog.BatchProcessorOption {
 	}
 }
 
-func buildProviders(ctx context.Context, cfg config, headers map[string]string, st *stats) ([]*exporterRun, error) {
+func buildProviders(ctx context.Context, cfg config, headers map[string]string, perExporter []*stats) ([]*exporterRun, error) {
 	runs := make([]*exporterRun, 0, cfg.exporters)
 	traceURL, err := url.Parse(cfg.endpoint + "/ingest/v1/traces")
 	if err != nil {
@@ -593,7 +766,7 @@ func buildProviders(ctx context.Context, cfg config, headers map[string]string, 
 			// Spec 023 harness rule left these at SDK defaults; spec 027 makes
 			// them explicit flags for the recommended ISUCON settings.
 			sdktrace.WithBatcher(
-				&traceExporter{inner: traceExp, stats: &st.traces},
+				&traceExporter{inner: traceExp, stats: &perExporter[i].traces},
 				traceBatchOptions(cfg.settings)...,
 			),
 			sdktrace.WithResource(res),
@@ -610,7 +783,7 @@ func buildProviders(ctx context.Context, cfg config, headers map[string]string, 
 		}
 		mp := sdkmetric.NewMeterProvider(
 			// Default periodic reader (60 s); Shutdown flushes it.
-			sdkmetric.WithReader(sdkmetric.NewPeriodicReader(&metricExporter{inner: metricExp, stats: &st.metrics})),
+			sdkmetric.WithReader(sdkmetric.NewPeriodicReader(&metricExporter{inner: metricExp, stats: &perExporter[i].metrics})),
 			sdkmetric.WithResource(res),
 		)
 		counter, err := mp.Meter("burstel-loadgen").Int64Counter(
@@ -632,7 +805,7 @@ func buildProviders(ctx context.Context, cfg config, headers map[string]string, 
 		}
 		lp := sdklog.NewLoggerProvider(
 			sdklog.WithProcessor(sdklog.NewBatchProcessor(
-				&logExporter{inner: logExp, stats: &st.logs},
+				&logExporter{inner: logExp, stats: &perExporter[i].logs},
 				logBatchOptions(cfg.settings)...,
 			)),
 			sdklog.WithResource(res),

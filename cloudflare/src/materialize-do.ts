@@ -17,7 +17,7 @@ import { HttpError } from "./errors";
 import { json, readJson } from "./http";
 import type { WindowShotRecord } from "./ingest-core";
 import { MaterializeDriver } from "./materialize-driver";
-import type { MaterializeRunState } from "./materialize-driver";
+import type { MaterializePrewarmState, MaterializeRunState } from "./materialize-driver";
 
 export interface MaterializeEnv {
   INGEST_DO?: unknown;
@@ -29,6 +29,10 @@ export interface MaterializeEnv {
   MATERIALIZE_RETRY_MS?: string;
   MATERIALIZE_HEARTBEAT_MS?: string;
   MATERIALIZE_WAIT_MS?: string;
+  /** Spec 033: pool keepalive and no-capacity backoff. */
+  MATERIALIZE_KEEPALIVE_MS?: string;
+  MATERIALIZE_CAPACITY_BACKOFF_MS?: string;
+  MATERIALIZE_PARTS_PER_MEMBER?: string;
   LATE_WRITE_LIMIT_MS?: string;
   COMPACTION_CONTAINER_TIMEOUT_MS?: string;
   [key: string]: unknown;
@@ -50,16 +54,28 @@ export class MaterializeDO extends DurableObject<MaterializeEnv> {
           await ctx.storage.put("run", run);
         },
       },
+      // Spec 033: shot_start records a prewarm request; only the alarm starts
+      // the pool containers, so a cancelled request cannot lose the work.
+      prewarmStore: {
+        load: async () => (await ctx.storage.get<MaterializePrewarmState>("prewarm")) ?? null,
+        save: async (state) => {
+          if (state === null) await ctx.storage.delete("prewarm");
+          else await ctx.storage.put("prewarm", state);
+        },
+      },
       scheduler: { set: (atMs) => ctx.storage.setAlarm(atMs) },
       now: () => Date.now(),
       config: {
-        parallelism: int(env.MATERIALIZE_PARALLELISM, 4),
+        parallelism: int(env.MATERIALIZE_PARALLELISM, 3),
         maxInstances: int(env.MATERIALIZE_MAX_INSTANCES, 4),
         maxAttempts: int(env.MATERIALIZE_MAX_ATTEMPTS, 3),
         leaseTtlMs: int(env.MATERIALIZE_LEASE_TTL_MS, 120_000),
         retryDelayMs: int(env.MATERIALIZE_RETRY_MS, 5_000),
         heartbeatMs: int(env.MATERIALIZE_HEARTBEAT_MS, 30_000),
         lateWriteLimitMs: int(env.LATE_WRITE_LIMIT_MS, 10_000),
+        keepAliveMs: int(env.MATERIALIZE_KEEPALIVE_MS, 10 * 60 * 1000),
+        capacityBackoffMs: int(env.MATERIALIZE_CAPACITY_BACKOFF_MS, 10_000),
+        partsPerMember: int(env.MATERIALIZE_PARTS_PER_MEMBER, 2),
       },
       log: (message, fields) => console.log(message, fields ?? {}),
     });
@@ -71,6 +87,12 @@ export class MaterializeDO extends DurableObject<MaterializeEnv> {
       if (request.method !== "GET") return json(405, { error: "method not allowed" });
       const run = await this.driver.status();
       return json(200, { shot_id: this.driver.shotId, run });
+    }
+    if (path === "/internal/prewarm") {
+      if (request.method !== "POST") return json(405, { error: "method not allowed" });
+      // Only arms the alarm; the alarm runs `MaterializeDriver.prewarm`.
+      await this.driver.schedulePrewarm();
+      return json(202, { shot_id: this.driver.shotId, prewarm: "scheduled" });
     }
     if (
       path === "/internal/materialize" ||

@@ -42,7 +42,10 @@ export function chunkMaterializationPlan(
       current.objects.length > 0 &&
       partsLeft > 1 &&
       current.bytes + Math.max(0, object.size) > target &&
-      objectsLeft >= partsLeft;
+      // After pushing `current`, one of the remaining target parts is the new
+      // chunk being started now, so only `partsLeft - 1` parts still need a
+      // future object.
+      objectsLeft >= partsLeft - 1;
     if (mustSplit) {
       chunks.push(current);
       current = { index: chunks.length, bytes: 0, objects: [] };
@@ -56,9 +59,19 @@ export function chunkMaterializationPlan(
 }
 
 /**
- * Runs one part on its own materializer Container. The container reads the
- * journal objects and writes `shots/<shot>/part-<i>.duckdb` directly through
- * its bucket-scoped R2 credential, so no object bytes pass through the Worker.
+ * Fixed materializer pool member name (spec 033). The pool is
+ * `materializer-0 .. materializer-(P-1)`: deterministic names are what let a
+ * later shot reuse an already-warm container instead of exhausting the
+ * CompactorDO instance limit with one DO name per shot.
+ */
+export function materializerPoolName(member: number): string {
+  return `materializer-${member}`;
+}
+
+/**
+ * Runs one part on a pool member Container. The container reads the journal
+ * objects and writes `shots/<shot>/part-<i>.duckdb` directly through its
+ * bucket-scoped R2 credential, so no object bytes pass through the Worker.
  */
 export async function materializeChunk(
   compactor: CompactorNamespaceLike,
@@ -66,8 +79,9 @@ export async function materializeChunk(
   chunk: MaterializeChunk,
   partTotal: number,
   excluded: string[],
+  poolMember: number = chunk.index,
 ): Promise<MaterializationPart> {
-  const stub: DoStubLike = compactor.getByName(`materializer-${shotId}-${chunk.index}`);
+  const stub: DoStubLike = compactor.getByName(materializerPoolName(poolMember));
   const resp = await stub.fetch(
     new Request(`${DO_ORIGIN}/internal/materialize`, {
       method: "POST",

@@ -10,9 +10,10 @@ import { DurableObject } from "cloudflare:workers";
 import { createR2Sink } from "./artifacts";
 import type { R2BucketLike } from "./artifacts";
 import { resolveInternalToken } from "./auth";
-import { createContainerControl } from "./container";
+import { containerEgressFor, createContainerControl } from "./container";
 import type { ContainerLike } from "./container";
 import { ShotCore } from "./core";
+import { json } from "./http";
 import type { SqlCursor, SqlValue, SyncSql } from "./store";
 
 export interface Env extends Cloudflare.Env {
@@ -45,7 +46,10 @@ export class ShotDO extends DurableObject<Env> {
     const port = containerPort(env);
     const shotId = ctx.id.name ?? ctx.id.toString();
     const sql = createSqlAdapter(ctx.storage.sql);
-    const container = createContainerControl(requireContainer(ctx), { port });
+    const container = createContainerControl(requireContainer(ctx), {
+      port,
+      enableInternet: containerEgressFor("ShotDO"),
+    });
     const artifacts = createR2Sink(env.BUCKET as unknown as R2BucketLike);
 
     // The container's internal bearer token must be distinct from the admin
@@ -85,10 +89,30 @@ export class ShotDO extends DurableObject<Env> {
   }
 
   override async fetch(request: Request): Promise<Response> {
+    const path = new URL(request.url).pathname;
+    if (path === "/internal/prewarm") {
+      if (request.method !== "POST") return json(405, { error: "method not allowed" });
+      // Spec 033: shot_start only records the request and arms the alarm. The
+      // alarm starts the analysis container, so a cancelled HTTP request can
+      // never leave the prewarm half-done.
+      await this.ctx.storage.put("analysis_prewarm_at", Date.now());
+      await this.ctx.storage.setAlarm(Date.now());
+      return json(202, { shot_id: this.ctx.id.name ?? this.ctx.id.toString(), prewarm: "scheduled" });
+    }
     return this.core.handleInternal(request);
   }
 
   override async alarm(): Promise<void> {
+    const prewarmAt = await this.ctx.storage.get<number>("analysis_prewarm_at");
+    if (typeof prewarmAt === "number") {
+      await this.ctx.storage.delete("analysis_prewarm_at");
+      await this.core.prewarmAnalysis().catch((error) => {
+        console.warn("analysis.container.prewarm.failure", {
+          shot_id: this.ctx.id.name ?? this.ctx.id.toString(),
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
     await this.core.heartbeat();
   }
 }

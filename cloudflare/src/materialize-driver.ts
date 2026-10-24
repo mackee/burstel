@@ -21,13 +21,26 @@ import type {
   MaterializationRecord,
   WindowShotRecord,
 } from "./ingest-core";
-import { chunkMaterializationPlan, materializeChunk } from "./materialize-part";
+import { chunkMaterializationPlan, materializeChunk, materializerPoolName } from "./materialize-part";
 
 export type MaterializeRunStatus = "scheduled" | "running" | "complete" | "failed";
 
 /** One part snapshot persisted in the coordinator DO. */
 export interface MaterializePartRun extends MaterializationPartState {
   index: number;
+  /** Spec 033: fixed pool member (`materializer-<n>`) currently leased. */
+  pool_member?: number | null;
+}
+
+/** Durable prewarm request (spec 033): an alarm owns the actual container start. */
+export interface MaterializePrewarmState {
+  at: number;
+  done: boolean;
+}
+
+export interface MaterializePrewarmStore {
+  load(): Promise<MaterializePrewarmState | null>;
+  save(state: MaterializePrewarmState | null): Promise<void>;
 }
 
 /** Durable run state persisted by the coordinator DO. */
@@ -69,6 +82,16 @@ export interface MaterializeDriverConfig {
   retryDelayMs: number;
   heartbeatMs: number;
   lateWriteLimitMs: number;
+  /** Spec 033: keep a finished pool member warm for the next shot. */
+  keepAliveMs: number;
+  /** Spec 033: backoff after "no container instance", without burning an attempt. */
+  capacityBackoffMs: number;
+  /**
+   * Spec 033: split the plan into more parts than pool members so completed
+   * members can immediately take a queued part. Clamped to 1..8 and the Go
+   * service's 64-part ceiling.
+   */
+  partsPerMember: number;
 }
 
 export interface MaterializeDriverDeps {
@@ -77,6 +100,8 @@ export interface MaterializeDriverDeps {
   compactor?: CompactorNamespaceLike;
   store: MaterializeStore;
   scheduler: MaterializeScheduler;
+  /** Spec 033: durable prewarm flag handled by this DO's alarm. */
+  prewarmStore?: MaterializePrewarmStore;
   config?: Partial<MaterializeDriverConfig>;
   now?: () => number;
   log?: (message: string, fields?: Record<string, unknown>) => void;
@@ -86,23 +111,34 @@ export interface MaterializeDriverDeps {
     chunk: ReturnType<typeof chunkMaterializationPlan>[number],
     partTotal: number,
     excluded: string[],
+    poolMember: number,
   ) => Promise<MaterializationPart>;
+  /** Test seam: keep a pool member warm after a finished part. */
+  keepAlive?: (poolMember: number) => Promise<void>;
+  /** Test seam: start one pool member's container during prewarm. */
+  prewarm?: (poolMember: number) => Promise<void>;
 }
 
 const DEFAULT_CONFIG: MaterializeDriverConfig = {
-  parallelism: 4,
+  // Spec 033: fixed pool sized one below CompactorDO max_instances (4).
+  parallelism: 3,
   maxInstances: 4,
   maxAttempts: 3,
   leaseTtlMs: 120_000,
   retryDelayMs: 5_000,
   heartbeatMs: 30_000,
   lateWriteLimitMs: 10_000,
+  keepAliveMs: 10 * 60 * 1000,
+  capacityBackoffMs: 10_000,
+  partsPerMember: 2,
 };
 
 interface PartOutcome {
   part: MaterializePartRun;
   result?: MaterializationPart;
   error?: string;
+  /** True when the platform had no free container instance. */
+  capacity?: boolean;
   durationMs: number;
   bytes: number;
 }
@@ -113,6 +149,7 @@ export class MaterializeDriver {
   private readonly compactor?: CompactorNamespaceLike;
   private readonly store: MaterializeStore;
   private readonly scheduler: MaterializeScheduler;
+  private readonly prewarmStore?: MaterializePrewarmStore;
   private readonly config: MaterializeDriverConfig;
   private readonly now: () => number;
   private readonly log: (message: string, fields?: Record<string, unknown>) => void;
@@ -122,8 +159,11 @@ export class MaterializeDriver {
         chunk: ReturnType<typeof chunkMaterializationPlan>[number],
         partTotal: number,
         excluded: string[],
+        poolMember: number,
       ) => Promise<MaterializationPart>)
     | undefined;
+  private readonly keepAlive: (poolMember: number) => Promise<void>;
+  private readonly prewarm: (poolMember: number) => Promise<void>;
 
   constructor(deps: MaterializeDriverDeps) {
     this.shotId = deps.shotId;
@@ -131,9 +171,12 @@ export class MaterializeDriver {
     this.compactor = deps.compactor;
     this.store = deps.store;
     this.scheduler = deps.scheduler;
+    this.prewarmStore = deps.prewarmStore;
     this.now = deps.now ?? (() => Date.now());
     this.log = deps.log ?? ((message, fields) => console.log(message, fields ?? {}));
     this.execute = deps.execute;
+    this.keepAlive = deps.keepAlive ?? ((member) => this.poolCall(member, "/internal/keepalive", "POST"));
+    this.prewarm = deps.prewarm ?? ((member) => this.poolCall(member, "/internal/prewarm", "POST"));
     const config = { ...DEFAULT_CONFIG, ...deps.config };
     this.config = {
       parallelism: clampInt(config.parallelism, 1, 8, DEFAULT_CONFIG.parallelism),
@@ -143,7 +186,66 @@ export class MaterializeDriver {
       retryDelayMs: clampInt(config.retryDelayMs, 0, 3_600_000, DEFAULT_CONFIG.retryDelayMs),
       heartbeatMs: clampInt(config.heartbeatMs, 0, 3_600_000, DEFAULT_CONFIG.heartbeatMs),
       lateWriteLimitMs: clampInt(config.lateWriteLimitMs, 0, 3_600_000, DEFAULT_CONFIG.lateWriteLimitMs),
+      keepAliveMs: clampInt(config.keepAliveMs, 1_000, 3_600_000, DEFAULT_CONFIG.keepAliveMs),
+      capacityBackoffMs: clampInt(config.capacityBackoffMs, 1_000, 3_600_000, DEFAULT_CONFIG.capacityBackoffMs),
+      partsPerMember: clampInt(config.partsPerMember, 1, 8, DEFAULT_CONFIG.partsPerMember),
     };
+  }
+
+  /** Persists a prewarm flag; the next alarm (not the request) starts the pool. */
+  async schedulePrewarm(): Promise<void> {
+    if (!this.prewarmStore) return;
+    const at = this.now();
+    await this.prewarmStore.save({ at, done: false });
+    await this.scheduler.set(at);
+    this.log("materialize.pool.prewarm.scheduled", { shot_id: this.shotId, at });
+  }
+
+  /** Runs a due prewarm request. Kept separate so the alarm stays observable. */
+  private async runPrewarm(): Promise<void> {
+    if (!this.prewarmStore) return;
+    const state = await this.prewarmStore.load();
+    if (!state || state.done) return;
+    const now = this.now();
+    if (now < state.at) {
+      await this.scheduler.set(state.at);
+      return;
+    }
+    const started = now;
+    try {
+      for (let member = 0; member < this.parallelism(); member++) {
+        await this.prewarm(member);
+      }
+      state.done = true;
+      await this.prewarmStore.save(state);
+      this.log("materialize.pool.prewarmed", {
+        shot_id: this.shotId,
+        members: this.parallelism(),
+        duration_ms: this.now() - started,
+      });
+    } catch (error) {
+      state.at = this.now() + this.config.capacityBackoffMs;
+      await this.prewarmStore.save(state);
+      await this.scheduler.set(state.at);
+      this.log("materialize.pool.prewarm.retry", {
+        shot_id: this.shotId,
+        at: new Date(state.at).toISOString(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  /** Sends one pool control request (`keepalive`/`prewarm`) to a member. */
+  private async poolCall(member: number, path: string, method: string): Promise<void> {
+    if (!this.compactor) return;
+    const resp = await this.compactor.getByName(materializerPoolName(member)).fetch(
+      new Request(`${DO_ORIGIN}${path}`, { method }),
+    );
+    if (resp.status < 200 || resp.status >= 300) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(`materializer pool ${member} ${path} failed with status ${resp.status}${text ? `: ${text}` : ""}`);
+    }
+    await resp.body?.cancel().catch(() => undefined);
   }
 
   /** Effective parallelism: configured fan-out capped by container instances. */
@@ -231,6 +333,8 @@ export class MaterializeDriver {
 
   /** One alarm tick: plan, fan out, record leases and retry or terminate. */
   async alarm(): Promise<void> {
+    // Spec 033 prewarm: the alarm (not the shot_start request) starts the pool.
+    await this.runPrewarm();
     const run = await this.store.load();
     if (!run) return;
     const now = this.now();
@@ -262,14 +366,19 @@ export class MaterializeDriver {
 
     const stopHeartbeat = this.startHeartbeat(run);
     let terminal: "complete" | "failed" | null = null;
+    let capacityBackoff = false;
     try {
       const plan = await this.plan();
-      const chunks = chunkMaterializationPlan(plan.objects, this.parallelism());
+      // More parts than pool members keeps a freed member busy immediately
+      // (spec 033), and smaller parts also raise R2 GET concurrency.
+      const partCount = Math.min(64, this.parallelism() * this.config.partsPerMember);
+      const chunks = chunkMaterializationPlan(plan.objects, Math.max(1, partCount));
       this.log("materialize.plan", {
         shot_id: run.shot_id,
         objects: plan.objects.length,
         bytes: plan.total_bytes,
         parts: chunks.length,
+        pool: this.parallelism(),
         truncated: plan.truncated,
       });
 
@@ -295,10 +404,21 @@ export class MaterializeDriver {
         terminal = this.releaseExpiredLeases(run, now);
       }
 
+      // Spec 033: fixed pool assignment with queueing. Only free pool members
+      // receive a part; the rest stay `pending` for a later iteration/alarm.
       while (!terminal) {
-        const claimable = run.parts.filter((part) => part.state === "pending").slice(0, this.parallelism());
+        const busy = new Set<number>();
+        for (const part of run.parts) {
+          if (part.state === "running" && typeof part.pool_member === "number") busy.add(part.pool_member);
+        }
+        const free: number[] = [];
+        for (let member = 0; member < this.parallelism(); member++) {
+          if (!busy.has(member)) free.push(member);
+        }
+        const claimable = run.parts.filter((part) => part.state === "pending").slice(0, free.length);
         if (claimable.length === 0) break;
-        for (const part of claimable) {
+        for (let i = 0; i < claimable.length; i++) {
+          const part = claimable[i]!;
           if (part.attempts >= this.config.maxAttempts) {
             part.state = "failed";
             part.error ??= `part gave up after ${part.attempts} attempts`;
@@ -308,6 +428,7 @@ export class MaterializeDriver {
           }
           part.state = "running";
           part.attempts += 1;
+          part.pool_member = free[i]!;
           part.lease_owner = run.run_id;
           part.lease_expires_at = this.now() + this.config.leaseTtlMs;
           part.started_at ??= this.now();
@@ -316,11 +437,32 @@ export class MaterializeDriver {
 
         await this.persist(run);
         const outcomes = await Promise.all(
-          claimable.map((part) => this.runPart(run, part, chunks[part.index], chunks.length, plan.excluded)),
+          claimable.map((part) =>
+            this.runPart(run, part, chunks[part.index], chunks.length, plan.excluded, part.pool_member ?? 0),
+          ),
         );
-        let failed = false;
+        let retry = false;
         for (const outcome of outcomes) {
           const part = outcome.part;
+          if (outcome.capacity) {
+            // No platform capacity is a transient queue condition: refund the
+            // attempt so a busy installation cannot exhaust max_attempts.
+            part.attempts = Math.max(0, part.attempts - 1);
+            part.state = "pending";
+            part.lease_owner = null;
+            part.lease_expires_at = null;
+            part.pool_member = null;
+            part.error = outcome.error ?? "no container instance available";
+            capacityBackoff = true;
+            this.log("materialize.part.capacity_retry", {
+              shot_id: run.shot_id,
+              part: part.index,
+              attempt: part.attempts,
+              error: part.error,
+            });
+            continue;
+          }
+          part.pool_member = null;
           if (outcome.result) {
             part.state = "complete";
             part.finished_at = this.now();
@@ -339,7 +481,7 @@ export class MaterializeDriver {
               run.error = `part ${part.index} failed after ${part.attempts} attempts: ${part.error}`;
             } else {
               part.state = "pending";
-              failed = true;
+              retry = true;
               this.log("materialize.part.retry", {
                 shot_id: run.shot_id,
                 part: part.index,
@@ -352,7 +494,7 @@ export class MaterializeDriver {
         run.results.sort((a, b) => a.index - b.index);
         if (terminal) break;
         await this.persist(run);
-        if (failed) break;
+        if (retry || capacityBackoff) break;
       }
 
       if (!terminal && run.parts.length > 0 && run.parts.every((part) => part.state === "complete")) {
@@ -399,8 +541,11 @@ export class MaterializeDriver {
         parts_total: run.parts_total,
       });
     } else {
+      const delay = capacityBackoff
+        ? this.config.capacityBackoffMs
+        : this.config.retryDelayMs;
       run.state = "scheduled";
-      run.scheduled_at = finishedAt + this.config.retryDelayMs;
+      run.scheduled_at = finishedAt + delay;
       run.lease_expires_at = finishedAt + this.config.leaseTtlMs;
       run.heartbeat_at = finishedAt;
       run.mirrored = false;
@@ -410,6 +555,7 @@ export class MaterializeDriver {
         at: new Date(run.scheduled_at).toISOString(),
         parts_done: run.results.length,
         parts_total: run.parts_total,
+        capacity_backoff: capacityBackoff,
       });
     }
 
@@ -458,6 +604,7 @@ export class MaterializeDriver {
     chunk: ReturnType<typeof chunkMaterializationPlan>[number] | undefined,
     partTotal: number,
     excluded: string[],
+    poolMember: number,
   ): Promise<PartOutcome> {
     const started = this.now();
     if (!chunk) {
@@ -469,34 +616,56 @@ export class MaterializeDriver {
       shot_id: run.shot_id,
       part: part.index,
       attempt: part.attempts,
+      pool_member: poolMember,
       objects: chunk.objects.length,
       bytes: chunk.bytes,
     });
     try {
       const result = this.execute
-        ? await this.execute(run.shot_id, chunk, partTotal, excluded)
-        : await this.defaultExecute(run.shot_id, chunk, partTotal, excluded);
+        ? await this.execute(run.shot_id, chunk, partTotal, excluded, poolMember)
+        : await this.defaultExecute(run.shot_id, chunk, partTotal, excluded, poolMember);
       const durationMs = this.now() - started;
       this.log("materialize.part.finish", {
         shot_id: run.shot_id,
         part: part.index,
+        pool_member: poolMember,
         duration_ms: durationMs,
         spans: result.span_count,
         bytes: result.size_bytes,
       });
+      await this.releasePoolMember(poolMember);
       return { part, result, durationMs, bytes: chunk.bytes };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const durationMs = this.now() - started;
-      this.log("materialize.part.failure", {
+      const capacity = isNoCapacityError(message);
+      this.log(capacity ? "materialize.part.capacity" : "materialize.part.failure", {
         shot_id: run.shot_id,
         part: part.index,
         attempt: part.attempts,
+        pool_member: poolMember,
         duration_ms: durationMs,
         error: message,
       });
+      if (capacity) {
+        // The container was never started, so there is nothing to keep warm.
+        return { part, error: message, capacity: true, durationMs, bytes: chunk.bytes };
+      }
+      await this.releasePoolMember(poolMember);
       return { part, error: message, durationMs, bytes: chunk.bytes };
     }
+  }
+
+  /** Keeps a finished member's container warm for the next shot. */
+  private async releasePoolMember(poolMember: number): Promise<void> {
+    await this.keepAlive(poolMember).catch((error) => {
+      this.log("materialize.pool.keepalive.failure", {
+        shot_id: this.shotId,
+        pool_member: poolMember,
+        keepalive_ms: this.config.keepAliveMs,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    });
   }
 
   private async defaultExecute(
@@ -504,9 +673,10 @@ export class MaterializeDriver {
     chunk: ReturnType<typeof chunkMaterializationPlan>[number],
     partTotal: number,
     excluded: string[],
+    poolMember: number,
   ): Promise<MaterializationPart> {
     if (!this.compactor) throw new Error("materializer container binding is not configured");
-    return materializeChunk(this.compactor, shotId, chunk, partTotal, excluded);
+    return materializeChunk(this.compactor, shotId, chunk, partTotal, excluded, poolMember);
   }
 
   private startHeartbeat(run: MaterializeRunState): () => void {
@@ -640,10 +810,21 @@ function pendingPart(index: number): MaterializePartRun {
     attempts: 0,
     lease_owner: null,
     lease_expires_at: null,
+    pool_member: null,
     started_at: null,
     finished_at: null,
     error: null,
   };
+}
+
+/**
+ * The platform's capacity error ("There is no container instance that can be
+ * provided to this Durable Object"). It is transient and must not count as a
+ * part attempt (spec 033).
+ */
+export function isNoCapacityError(message: string): boolean {
+  const text = message.toLowerCase();
+  return text.includes("no container instance") || text.includes("no available container");
 }
 
 function randomRunId(): string {

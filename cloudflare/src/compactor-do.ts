@@ -17,7 +17,7 @@ import type { R2BucketLike } from "./artifacts";
 import { CompactorCore } from "./compactor-core";
 import type { CompactorConfig } from "./compactor-core";
 import { resolveCompactorContainerEnv } from "./compactor-env";
-import { createContainerControl } from "./container";
+import { containerEgressFor, createContainerControl } from "./container";
 import { MaterializerCore } from "./materializer-core";
 import { containerPort, requireContainer } from "./shot-do";
 
@@ -31,6 +31,8 @@ export interface CompactorEnv extends Cloudflare.Env {
   R2_SECRET_ACCESS_KEY?: string;
   R2_ACCOUNT_ID?: string;
   R2_BUCKET_NAME?: string;
+  /** Spec 033: keep a materializer pool member warm after a part. */
+  MATERIALIZE_KEEPALIVE_MS?: string;
 }
 
 export class CompactorDO extends DurableObject<CompactorEnv> {
@@ -41,7 +43,13 @@ export class CompactorDO extends DurableObject<CompactorEnv> {
     super(ctx, env);
 
     const port = containerPort(env);
-    const container = createContainerControl(requireContainer(ctx), { port });
+    // Spec 033: the materializer performs direct bucket-scoped R2 S3 GET/PUT,
+    // so this class (and only this class) needs container egress. The shot
+    // recorder/analysis container keeps `enableInternet: false`.
+    const container = createContainerControl(requireContainer(ctx), {
+      port,
+      enableInternet: containerEgressFor("CompactorDO"),
+    });
     // Spec 028: the container env must carry the same distinct token that
     // CompactorCore sends as `Authorization: Bearer ...`; otherwise the Go
     // service fails closed and no segment is ever published in secure mode.
@@ -69,6 +77,7 @@ export class CompactorDO extends DurableObject<CompactorEnv> {
       holder: ctx.id.name ?? ctx.id.toString(),
       config: {
         containerTimeoutMs: compactorConfigFromEnv(env).containerTimeoutMs,
+        containerKeepAliveMs: envNumber(env.MATERIALIZE_KEEPALIVE_MS, 10 * 60 * 1000),
       },
       log: (message, fields) => console.log(message, fields ?? {}),
     });
@@ -76,7 +85,11 @@ export class CompactorDO extends DurableObject<CompactorEnv> {
 
   override async fetch(request: Request): Promise<Response> {
     const path = new URL(request.url).pathname;
-    if (path.startsWith("/internal/materialize")) {
+    if (
+      path.startsWith("/internal/materialize") ||
+      path === "/internal/prewarm" ||
+      path === "/internal/keepalive"
+    ) {
       return this.materializer.handleInternal(request);
     }
     return this.core.handleInternal(request);
@@ -85,6 +98,12 @@ export class CompactorDO extends DurableObject<CompactorEnv> {
   override async alarm(): Promise<void> {
     await this.core.alarm();
   }
+}
+
+function envNumber(raw: string | undefined, def: number): number {
+  if (raw === undefined || raw.trim() === "") return def;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : def;
 }
 
 function compactorConfigFromEnv(env: CompactorEnv): Partial<CompactorConfig> {

@@ -170,3 +170,57 @@ compared with the table above without guessing:
 The report also carries generated/exported counts, `exporter_errors`, latency
 percentiles and `shutdown_ms`. A nonzero `generated - exported` is client-side
 loss even when `exporter_errors` is zero.
+
+## 180 s client-drop investigation (spec 033)
+
+Staging measured the following with the stock OTel Go exporters and gzip:
+
+| Run | Client settings | Generated | Exported | Client loss |
+| --- | --- | --- | --- | --- |
+| 60 s | gzip, BSP batch 8192, queue 131072 | — | — | **0.0 %** |
+| 180 s | gzip, BSP batch 8192, queue 131072 | 8,060,850 | 7,267,044 | **≈ 10 %** |
+
+`exporter_errors` stayed **0** and p50 export was **607 ms** in the 180 s run.
+The SDK does not expose a queue-drop counter, so the loss is only visible as
+`generated - exported`. A longer run worsens the queue: at 15k spans/s per
+exporter the serial BatchSpanProcessor drains one export while the producer
+keeps enqueueing; any export slower than the offered rate eventually overflows
+the 131072-entry queue silently.
+
+`burstel-loadgen` now reports the inference directly:
+
+```bash
+burstel-loadgen -endpoint https://<host> -variant b1 -token "$PUSH" \
+  -exporters 3 -spans-per-second 15000 -duration 180s \
+  -compression gzip -batch-size 8192 -queue-size 262144 \
+  -shot-id <shot-id> -api-token "$BURSTEL_API_TOKEN"
+```
+
+The JSON report contains:
+
+* `signals.*.dropped` / `drop_pct` (aggregate), and
+* `per_exporter_signals[*].signals` (one host at a time), and
+* `client_drop.per_exporter[*].samples` — a per-second series of
+  `generated`/`exported`/`dropped` so a growing gap is visible before the run
+  ends. `client_drop.method` is `inferred_generated_minus_exported`; the SDK
+  exposes no queue counter.
+
+### Documented 180 s settings target
+
+For a 180 s run, keep the per-exporter offered rate at or below what one serial
+exporter can drain, instead of only enlarging the queue:
+
+* `OTEL_EXPORTER_OTLP_COMPRESSION=gzip`
+* `OTEL_BSP_MAX_EXPORT_BATCH_SIZE=8192`
+* `OTEL_BSP_MAX_QUEUE_SIZE=262144` (headroom for the bigger batch)
+* **two exporters per host** for a 15k spans/s/host workload (each exporter
+  carries 7.5k spans/s), or equivalently an explicit per-exporter rate limit.
+* `TracerProvider.Shutdown` / `MeterProvider.Shutdown` /
+  `LoggerProvider.Shutdown` timeout **≥ 20 s** (measured flush 6–15 s).
+
+That combination is the target the staging operator must confirm with the
+`client_drop` series above: **0 dropped for the full 180 s**. The previous
+one-exporter-per-host, 131072-queue setting is not sufficient at 180 s even
+though it passed at 60 s. Record the actual `client_settings`,
+`per_exporter_signals` and `client_drop` block with the staging result; do not
+infer delivery from a clean `exporter_errors` field.

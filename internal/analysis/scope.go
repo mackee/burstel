@@ -68,11 +68,23 @@ type ScopedCoverage struct {
 	SelectionJustification string `json:"selection_justification,omitempty"`
 }
 
+// ScopedTimings is the per-phase latency breakdown of a window snapshot build
+// (spec 033). All values are milliseconds.
+type ScopedTimings struct {
+	AttachMS      int64 `json:"attach_ms"`
+	MaterializeMS int64 `json:"materialize_ms"`
+	CheckpointMS  int64 `json:"checkpoint_ms"`
+	OpenMS        int64 `json:"open_ms"`
+	CoverageMS    int64 `json:"coverage_ms"`
+	TotalMS       int64 `json:"total_ms"`
+}
+
 // ScopedEngine is a read-only window snapshot plus its coverage diagnostics.
 type ScopedEngine struct {
 	Engine   *Engine
 	Window   TimeWindow
 	Coverage ScopedCoverage
+	Timings  ScopedTimings
 	dir      string
 }
 
@@ -113,6 +125,8 @@ func ScopedPolicy(base Policy) Policy {
 // BuildScopedEngine materializes a window's rows into an immutable read-only
 // DuckDB snapshot and returns it with coverage diagnostics.
 func BuildScopedEngine(ctx context.Context, window TimeWindow, refs []SegmentRef, opts ScopedOptions) (*ScopedEngine, error) {
+	startedAt := time.Now()
+	var timings ScopedTimings
 	workDir := opts.WorkDir
 	if workDir == "" {
 		workDir = os.TempDir()
@@ -148,38 +162,45 @@ func BuildScopedEngine(ctx context.Context, window TimeWindow, refs []SegmentRef
 		_ = os.RemoveAll(dir)
 	}
 
-	if err := materialize(ctx, db, window, refs, horizon, policy); err != nil {
+	if err := materialize(ctx, db, window, refs, horizon, policy, &timings); err != nil {
 		cleanup()
 		return nil, err
 	}
+	checkpointStart := time.Now()
 	if _, err := db.ExecContext(ctx, "CHECKPOINT"); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("analysis: checkpoint window: %w", err)
 	}
+	timings.CheckpointMS = time.Since(checkpointStart).Milliseconds()
 	if err := db.Close(); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, fmt.Errorf("analysis: close window scratch: %w", err)
 	}
 
+	openStart := time.Now()
 	engine, err := OpenReadOnly(ctx, scratch, opts.Open)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
+	timings.OpenMS = time.Since(openStart).Milliseconds()
 	engine.windowStartNS = window.StartNS()
 	engine.windowEndNS = window.EndNS()
 	engine.scoped = true
 
+	coverageStart := time.Now()
 	cov, err := computeScopedCoverage(ctx, engine, window, refs, policy)
 	if err != nil {
 		_ = engine.Close()
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	return &ScopedEngine{Engine: engine, Window: window, Coverage: cov, dir: dir}, nil
+	timings.CoverageMS = time.Since(coverageStart).Milliseconds()
+	timings.TotalMS = time.Since(startedAt).Milliseconds()
+	return &ScopedEngine{Engine: engine, Window: window, Coverage: cov, Timings: timings, dir: dir}, nil
 }
 
-func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []SegmentRef, horizon time.Duration, policy SpanBoundaryPolicy) error {
+func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []SegmentRef, horizon time.Duration, policy SpanBoundaryPolicy, timings *ScopedTimings) error {
 	if _, err := db.ExecContext(ctx, scopedSchemaDDL); err != nil {
 		return fmt.Errorf("analysis: window schema: %w", err)
 	}
@@ -188,6 +209,7 @@ func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []Segm
 	loMS, hiMS := window.Start.UnixMilli()-lag, window.End.UnixMilli()+lag
 	baseFromNS := startNS - horizon.Nanoseconds()
 
+	attachStart := time.Now()
 	if len(refs) > 0 {
 		for i, ref := range refs {
 			if err := validateSegmentPath(ref.Path); err != nil {
@@ -199,6 +221,15 @@ func materialize(ctx context.Context, db *sql.DB, window TimeWindow, refs []Segm
 			}
 		}
 	}
+	if timings != nil {
+		timings.AttachMS = time.Since(attachStart).Milliseconds()
+	}
+	materializeStart := time.Now()
+	defer func() {
+		if timings != nil {
+			timings.MaterializeMS = time.Since(materializeStart).Milliseconds()
+		}
+	}()
 
 	tableSpecs := []struct {
 		table  string
