@@ -25,6 +25,7 @@ export { ShotDO } from "./shot-do";
 export { IngestDO } from "./control-do";
 export { AuthDO } from "./auth-do";
 export { CompactorDO } from "./compactor-do";
+export { MaterializeDO } from "./materialize-do";
 export type { Env } from "./shot-do";
 
 export default {

@@ -19,6 +19,7 @@
 //   GET    /api/shots                       (admin|member) list, optional ?owner=
 //   GET    /api/shots/{id}                  (admin|member)
 //   POST   /api/shots/{id}/stop             (admin|member)
+//   POST   /api/shots/{id}/materialize      (admin|member) retry/restart durable materialization
 //   POST   /api/shots/{id}/query            (admin|member)
 //   POST   /api/shots/{id}/analyze          (admin|member)
 //   GET    /api/shots/{id}/schema           (admin|member)
@@ -59,12 +60,14 @@ import {
   listInstances,
   listShots,
   listTokens,
+  materializeNow,
   mintToken,
   queryShot,
   revokeInstanceToken,
   revokeToken,
   schemaShot,
   startShot,
+  windowShotInfo,
 } from "./tools";
 import type { ToolContext } from "./tools";
 
@@ -315,6 +318,18 @@ export async function handleRequest(
       return json(200, await dispatchStop(ctx, requireShotId(stopMatch[1]!), endedMs));
     }
 
+    // Spec 032: explicit materialization retry/restart (admin|member).
+    const materializeMatch = /^\/api\/shots\/([^/]+)\/materialize$/.exec(path);
+    if (materializeMatch) {
+      if (request.method !== "POST") throw badRequest("method not allowed");
+      const body = await readJson<{ force?: unknown; wait?: unknown }>(request).catch(() => ({ force: true, wait: false }));
+      const result = await materializeNow(ctx, requireShotId(materializeMatch[1]!), {
+        force: body.force !== false,
+        wait: body.wait === true,
+      });
+      return json(202, windowShotInfo(result, ctx));
+    }
+
     const queryMatch = /^\/api\/shots\/([^/]+)\/query$/.exec(path);
     if (queryMatch) {
       if (request.method !== "POST") throw badRequest("method not allowed");
@@ -366,18 +381,18 @@ function ingestSignal(path: string): Signal | null {
   return match[1] as Signal;
 }
 
-function toolContext(env: AppEnv, url: URL, execution?: { waitUntil(promise: Promise<unknown>): void }): ToolContext {
+function toolContext(env: AppEnv, url: URL, _execution?: { waitUntil(promise: Promise<unknown>): void }): ToolContext {
   return {
     namespace: env.SHOT_DO,
     ingest: env.INGEST_DO,
     auth: env.AUTH_DO,
     compactor: env.COMPACTOR_DO,
+    materializer: env.MATERIALIZE_DO,
     origin: url.origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
     bucket: env.BUCKET,
     tokens: env.INSTANCE_TOKENS,
     materialize: materializeOptions(env),
-    waitUntil: execution ? (promise) => execution.waitUntil(promise) : undefined,
   };
 }
 

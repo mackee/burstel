@@ -116,10 +116,14 @@ describe("window shot registry", () => {
     expect(started.state).toBe("open");
     now += 90_000;
     const stopped = await core.stopWindowShot("shot-open");
-    expect(stopped.state).toBe("ready");
+    // Spec 032: coverage stays incomplete until the durable materialization run
+    // completes; the stop itself is still final and idempotent.
+    expect(stopped.state).toBe("incomplete");
+    expect(stopped.coverage?.complete).toBe(false);
+    expect(stopped.coverage?.materialization_state).toBe("pending");
     expect(stopped.window?.end_ms).toBe(now);
     const again = await core.stopWindowShot("shot-open");
-    expect(again.state).toBe("ready");
+    expect(again.state).toBe("incomplete");
   });
 
   test("lists window shots with their window metadata", async () => {

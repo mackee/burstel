@@ -85,6 +85,35 @@ func TestShotStartRejectsUnknownMode(t *testing.T) {
 	}
 }
 
+func TestShotMaterializeDefaultsAndFlags(t *testing.T) {
+	ts, seen := fakeWorker(t, map[string]any{"shot_id": "AAAAAAAAAAAAAAAA", "kind": "window"})
+	if err := runCLI(t, ts.URL, "shot", "materialize", "AAAAAAAAAAAAAAAA"); err != nil {
+		t.Fatalf("shot materialize: %v", err)
+	}
+	req := (*seen)[0]
+	if req.method != http.MethodPost || req.path != "/api/shots/AAAAAAAAAAAAAAAA/materialize" {
+		t.Fatalf("request = %s %s", req.method, req.path)
+	}
+	if req.body["force"] != true {
+		t.Errorf("default force = %v, want true", req.body["force"])
+	}
+	if _, ok := req.body["wait"]; ok {
+		t.Errorf("default request must not wait, got %v", req.body["wait"])
+	}
+
+	ts2, seen2 := fakeWorker(t, map[string]any{"shot_id": "AAAAAAAAAAAAAAAA"})
+	if err := runCLI(t, ts2.URL, "shot", "materialize", "AAAAAAAAAAAAAAAA", "--no-force", "--wait"); err != nil {
+		t.Fatalf("shot materialize --no-force --wait: %v", err)
+	}
+	req2 := (*seen2)[0]
+	if req2.body["force"] != false {
+		t.Errorf("--no-force body = %v", req2.body["force"])
+	}
+	if req2.body["wait"] != true {
+		t.Errorf("--wait body = %v", req2.body["wait"])
+	}
+}
+
 func TestSuggestBatchSize(t *testing.T) {
 	cases := []struct {
 		name   string

@@ -61,6 +61,7 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
     ingest: env.INGEST_DO,
     auth: env.AUTH_DO,
     compactor: env.COMPACTOR_DO,
+    materializer: env.MATERIALIZE_DO,
     origin,
     publicBaseUrl: env.PUBLIC_BASE_URL,
     bucket: env.BUCKET,
@@ -301,6 +302,27 @@ function buildServer(env: AppEnv, origin: string, principal: AuthPrincipal): Mcp
         const endedMs = ended_at ? Date.parse(ended_at) : undefined;
         if (ended_at && !Number.isFinite(endedMs)) throw badRequest("ended_at must be an ISO-8601 timestamp");
         return ok(await tools.stop(shot_id, endedMs));
+      } catch (error) {
+        return fail(error);
+      }
+    },
+  );
+
+  server.registerTool(
+    "shot_materialize",
+    {
+      title: "Retry or restart shot materialization",
+      description:
+        "Retry a failed window-shot materialization, or force a fresh run, using the durable alarm driver. Returns immediately unless wait=true. admin|member.",
+      inputSchema: {
+        shot_id: z.string().describe("Window shot id"),
+        force: z.boolean().optional().describe("Force a fresh run (default true)"),
+        wait: z.boolean().optional().describe("Wait for the run to reach a terminal state"),
+      },
+    },
+    async ({ shot_id, force, wait }) => {
+      try {
+        return ok(await tools.materialize(shot_id, { force, wait }));
       } catch (error) {
         return fail(error);
       }

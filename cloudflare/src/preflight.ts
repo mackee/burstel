@@ -367,6 +367,12 @@ export function validateWranglerConfig(
     true,
     "AUTH_DO -> AuthDO durable object binding (spec 013, Part B)",
   );
+  add(
+    "do_binding_materializedo",
+    bindings.some((b) => b.name === "MATERIALIZE_DO" && b.class_name === "MaterializeDO"),
+    true,
+    "MATERIALIZE_DO -> MaterializeDO durable object binding (spec 032 alarm driver)",
+  );
 
   const exports = cfg.exports ?? {};
   add(
@@ -393,6 +399,12 @@ export function validateWranglerConfig(
     exports["CompactorDO"]?.type === "durable-object" && exports["CompactorDO"]?.storage === "sqlite",
     true,
     `exports.CompactorDO=${JSON.stringify(exports["CompactorDO"] ?? null)}`,
+  );
+  add(
+    "export_materializedo_sqlite",
+    exports["MaterializeDO"]?.type === "durable-object" && exports["MaterializeDO"]?.storage === "sqlite",
+    true,
+    `exports.MaterializeDO=${JSON.stringify(exports["MaterializeDO"] ?? null)} (spec 032 durable materialization)`,
   );
   const crons = cfg.triggers?.crons;
   add(

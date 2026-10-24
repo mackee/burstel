@@ -23,12 +23,20 @@ import type {
   DoStubLike,
   IngestNamespaceLike,
   KVNamespaceLike,
+  MaterializerNamespaceLike,
   ShotNamespaceLike,
 } from "./env";
-import { badRequest, conflict, HttpError, unknownInstance } from "./errors";
+import { badRequest, conflict, HttpError, notFound, unknownInstance } from "./errors";
 import { INGEST_DO_NAME, isValidInstanceName, normalizeInstanceName } from "./ingest-core";
 import type { CreateWindowShotInput, InstanceMetadata, InstanceTokenIssue, InstanceTokenMetadata, JournalListingStats, MaterializationPart, SegmentManifestRow, StartWindowShotInput, WindowShotRecord } from "./ingest-core";
-import { ensureMaterialized, materializeShot } from "./materialize";
+import {
+  ensureMaterialized,
+  materializeShot,
+  MATERIALIZE_WAIT_MS,
+  requestMaterialization,
+  scheduleMaterialization,
+  waitForMaterialization,
+} from "./materialize";
 import type { MaterializeOptions } from "./materialize";
 import { isShotId, newShotId } from "./ids";
 import { isValidInstanceLabel, normalizeInstances, selectSegments } from "./shot-window";
@@ -56,10 +64,10 @@ export interface ToolContext {
    * tokens.
    */
   tokens?: KVNamespaceLike;
-  /** Spec 031 materialization bounds (parallelism/wait/instance cap). */
+  /** Spec 031/032 materialization bounds (parallelism/wait/instance cap). */
   materialize?: MaterializeOptions;
-  /** Keeps background materialization alive after shot_stop returns. */
-  waitUntil?: (promise: Promise<unknown>) => void;
+  /** Spec 032 Durable Object alarm driver, keyed by shot id. */
+  materializer?: MaterializerNamespaceLike;
 }
 
 export interface FreezeRef {
@@ -104,6 +112,7 @@ export function createTools(ctx: ToolContext) {
     start: (metadata: Record<string, unknown> = {}, owner?: string, opts: { mode?: string; name?: string; instances?: string[] } = {}) =>
       startShot(ctx, metadata, owner, opts),
     stop: (shotId: string, endedAtMs?: number) => dispatchStop(ctx, shotId, endedAtMs),
+    materialize: (shotId: string, opts?: { force?: boolean; wait?: boolean }) => materializeNow(ctx, shotId, opts),
     get: (shotId: string) => dispatchGet(ctx, shotId),
     query: (shotId: string, sql: string, maxRows?: number) => queryShot(ctx, shotId, sql, maxRows),
     analyze: (shotId: string, sections?: string[], topN?: number) => analyzeShot(ctx, shotId, sections, topN),
@@ -270,14 +279,56 @@ export async function dispatchStop(
   const record = await getShotRecord(ctx, shotId);
   if (record && record.kind === "window") {
     const stopped = await stopWindowShot(ctx, shotId, endedAtMs);
-    // Spec 031 D4: shot_stop returns immediately. Materialization runs in the
-    // background; shot_analyze/query/compare lazily waits for it and can start
-    // it itself if this background attempt was lost.
-    const started = materializeShot(ctx, stopped).catch(() => undefined);
-    if (ctx.waitUntil) ctx.waitUntil(started);
+    // Spec 032: shot_stop records the run durably in the coordinator DO and
+    // returns. The DO alarm owns the plan/fan-out/retries, so a Worker request
+    // cancelled right after this response cannot lose materialization (there is
+    // deliberately no `waitUntil` dependency here).
+    if (ctx.materializer) {
+      await scheduleMaterialization(ctx, stopped).catch((error) => {
+        console.log("materialize.schedule.failure", {
+          shot_id: shotId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
     return windowShotInfo(stopped, ctx);
   }
   return stopShot(ctx, shotId);
+}
+
+/**
+ * Explicit materialization action (spec 032): retries a `failed` run and can
+ * force a fresh run. Available to admin and member through REST/MCP/CLI.
+ */
+export async function materializeNow(
+  ctx: ToolContext,
+  shotId: string,
+  opts: { force?: boolean; wait?: boolean } = {},
+): Promise<WindowShotRecord> {
+  requireShotId(shotId);
+  const record = await getShotRecord(ctx, shotId);
+  if (!record) throw notFound("unknown shot");
+  if (record.kind !== "window" || !record.window) throw badRequest("shot is not a window shot");
+  const force = opts.force !== false;
+  if (!ctx.materializer) {
+    if (!ctx.compactor) {
+      throw new HttpError(503, "materialization coordinator is not configured", true, "materializer_unavailable");
+    }
+    return materializeShot(ctx, record, { ...(ctx.materialize ?? {}), force });
+  }
+  await requestMaterialization(ctx, shotId, { force });
+  if (opts.wait !== true) return (await getShotRecord(ctx, shotId)) ?? record;
+  const waited = await waitForMaterialization(ctx, shotId, ctx.materialize?.waitMs ?? MATERIALIZE_WAIT_MS);
+  if (waited.materialization?.state === "failed") {
+    const reason = waited.materialization.error ?? "unknown error";
+    throw new HttpError(
+      409,
+      `materialization for shot ${shotId} failed: ${reason}; retry with \`shot materialize ${shotId}\``,
+      false,
+      "materialization_failed",
+    );
+  }
+  return waited;
 }
 
 /** Serializes a window shot for API/MCP callers (metadata only; no secrets). */
@@ -299,13 +350,41 @@ export function windowShotInfo(record: WindowShotRecord, ctx: ToolContext): Reco
         }
       : undefined,
     query_watermark: record.query_watermark_ms === null ? undefined : new Date(record.query_watermark_ms).toISOString(),
-    coverage: record.coverage ?? undefined,
+    // Spec 032: coverage always discloses the materialization state and can
+    // never claim completeness before the run completed.
+    coverage: record.coverage
+      ? {
+          ...record.coverage,
+          complete: record.coverage.complete === true && record.materialization?.state === "complete",
+          materialization_state: record.materialization?.state ?? record.coverage.materialization_state ?? undefined,
+          materialization_parts_done: record.materialization?.parts_done ?? record.coverage.materialization_parts_done,
+          materialization_parts_total: record.materialization?.parts_total ?? record.coverage.materialization_parts_total,
+          materialization_error: record.materialization?.error ?? record.coverage.materialization_error ?? undefined,
+        }
+      : undefined,
     materialization: record.materialization
       ? {
           state: record.materialization.state,
           parts_done: record.materialization.parts_done,
           parts_total: record.materialization.parts_total,
           spans: record.materialization.spans,
+          attempts: record.materialization.attempts ?? undefined,
+          lease_expires_at:
+            record.materialization.lease_expires_at == null
+              ? undefined
+              : new Date(record.materialization.lease_expires_at).toISOString(),
+          heartbeat_at:
+            record.materialization.heartbeat_at == null
+              ? undefined
+              : new Date(record.materialization.heartbeat_at).toISOString(),
+          part_states: record.materialization.part_states?.map((part) => ({
+            index: part.index,
+            state: part.state,
+            attempts: part.attempts,
+            lease_expires_at:
+              part.lease_expires_at == null ? undefined : new Date(part.lease_expires_at).toISOString(),
+            error: part.error ?? undefined,
+          })),
           started_at:
             record.materialization.started_at === null
               ? undefined
@@ -930,9 +1009,15 @@ async function ensureWindowMaterialized(ctx: ToolContext, record: WindowShotReco
     return await ensureMaterialized(ctx, record, ctx.materialize ?? {});
   } catch (error) {
     // A materialization failure must not make pre-031 backlog analysis
-    // impossible: fall back to the segment path, except for a timeout where the
-    // caller explicitly asked to wait for completion.
-    if (error instanceof HttpError && error.code === "materialization_timeout") throw error;
+    // impossible: fall back to the segment path. A timeout and a terminal
+    // `failed` run are surfaced instead, because the caller explicitly waited
+    // or must see the reason and retry with `shot materialize`.
+    if (
+      error instanceof HttpError &&
+      (error.code === "materialization_timeout" || error.code === "materialization_failed")
+    ) {
+      throw error;
+    }
     return record;
   }
 }

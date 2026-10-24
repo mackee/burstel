@@ -54,6 +54,12 @@
     "MATERIALIZE_MAX_INSTANCES": "4",
     "MATERIALIZE_WAIT_MS": "90000",
     "MATERIALIZE_MAX_OBJECTS": "200000",
+    // Spec 032: the coordinator DO alarm owns the run. Parts have a lease and
+    // a bounded attempt count, so a lost alarm/container cannot wedge `running`.
+    "MATERIALIZE_MAX_ATTEMPTS": "3",
+    "MATERIALIZE_LEASE_TTL_MS": "120000",
+    "MATERIALIZE_RETRY_MS": "5000",
+    "MATERIALIZE_HEARTBEAT_MS": "30000",
     // Spec 031 D1: the bucket whose scoped token is injected into the
     // compactor/materializer container. The credential itself is a Worker secret.
     "R2_BUCKET_NAME": "burstel-shots"
@@ -107,6 +113,11 @@
       {
         "name": "COMPACTOR_DO",
         "class_name": "CompactorDO"
+      },
+      {
+        // Spec 032: per-shot alarm-driven materialization coordinator.
+        "name": "MATERIALIZE_DO",
+        "class_name": "MaterializeDO"
       }
     ]
   },
@@ -125,6 +136,10 @@
       "storage": "sqlite"
     },
     "CompactorDO": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "MaterializeDO": {
       "type": "durable-object",
       "storage": "sqlite"
     }

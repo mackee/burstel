@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import { handleRequest } from "../src/app";
 import type { AppEnv, DoStubLike, ShotNamespaceLike } from "../src/app";
+import type { MaterializerNamespaceLike } from "../src/env";
 import { FakeIngestNamespace, makeCore, makeIngest } from "./fakes";
 import type { TestHarness } from "./fakes";
 
@@ -20,10 +21,27 @@ class FakeNamespace implements ShotNamespaceLike {
   }
 }
 
+class FakeMaterializerNamespace implements MaterializerNamespaceLike {
+  readonly requests: Array<{ name: string; body: Record<string, unknown> }> = [];
+
+  getByName(name: string): DoStubLike {
+    return {
+      fetch: async (request: Request) => {
+        this.requests.push({ name, body: (await request.json()) as Record<string, unknown> });
+        return new Response(JSON.stringify({ shot_id: name, state: "scheduled" }), {
+          status: 202,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    };
+  }
+}
+
 function makeEnv(): AppEnv {
   return {
     SHOT_DO: new FakeNamespace(),
     INGEST_DO: new FakeIngestNamespace(makeIngest().core),
+    MATERIALIZE_DO: new FakeMaterializerNamespace(),
     BURSTEL_API_TOKEN: TOKEN,
     PUBLIC_BASE_URL: "https://burstel.example",
   };
@@ -80,6 +98,33 @@ describe("REST logical windows", () => {
     expect(stopped.status).toBe(200);
     const stoppedBody = (await stopped.json()) as Record<string, unknown>;
     expect(["ready", "incomplete"]).toContain(String(stoppedBody["state"]));
+  });
+
+  test("POST /api/shots/{id}/materialize records a durable retry (admin|member)", async () => {
+    const env = makeEnv();
+    await handleRequest(post("/api/instances", { name: "web-1" }), env);
+    const now = Date.now();
+    const created = await handleRequest(
+      post("/api/shots/window", {
+        started_at: new Date(now - 120_000).toISOString(),
+        ended_at: new Date(now - 60_000).toISOString(),
+        instances: ["web-1"],
+      }),
+      env,
+    );
+    const id = String(((await created.json()) as Record<string, unknown>)["shot_id"]);
+
+    const resp = await handleRequest(post(`/api/shots/${id}/materialize`, { force: true }), env);
+    expect(resp.status).toBe(202);
+    const body = (await resp.json()) as Record<string, unknown>;
+    const coverage = body["coverage"] as Record<string, unknown>;
+    expect(coverage["complete"]).toBe(false);
+    expect(coverage["materialization_state"]).toBe("pending");
+
+    const coordinator = env.MATERIALIZE_DO as unknown as FakeMaterializerNamespace;
+    expect(coordinator.requests.length).toBe(1);
+    expect(coordinator.requests[0]?.name).toBe(id);
+    expect(coordinator.requests[0]?.body["force"]).toBe(true);
   });
 
   test("POST /api/shots defaults to a window shot when mode is omitted", async () => {

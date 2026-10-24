@@ -94,7 +94,25 @@ export interface MaterializationPart {
   last_received_at: number;
 }
 
-/** Durable status of shot-time parallel materialization (spec 031). */
+/**
+ * Durable lease/attempt state for one materialization part (spec 032).
+ *
+ * The alarm driver claims a part by writing `running` plus a `lease_expires_at`
+ * timestamp. A crash or a cancelled alarm leaves the lease behind; the next
+ * alarm retries it after expiry, bounded by `maxAttempts`.
+ */
+export interface MaterializationPartState {
+  index: number;
+  state: "pending" | "running" | "complete" | "failed";
+  attempts: number;
+  lease_owner?: string | null;
+  lease_expires_at?: number | null;
+  started_at?: number | null;
+  finished_at?: number | null;
+  error?: string | null;
+}
+
+/** Durable status of shot-time parallel materialization (spec 031/032). */
 export interface MaterializationRecord {
   state: "pending" | "running" | "complete" | "failed";
   parts_done: number;
@@ -104,6 +122,13 @@ export interface MaterializationRecord {
   finished_at: number | null;
   parts: MaterializationPart[];
   error?: string | null;
+  /** Per-part leases/attempts; exposed so a lazy reader can detect a stale run. */
+  part_states?: MaterializationPartState[];
+  /** Run-level lease, refreshed by the driver heartbeat. */
+  lease_expires_at?: number | null;
+  heartbeat_at?: number | null;
+  /** Number of alarm ticks spent on this run (diagnostics only). */
+  attempts?: number;
 }
 
 /** One journal object included in a materialization plan. */
@@ -161,6 +186,14 @@ export interface WindowCoverage {
   lookback_truncated?: boolean;
   /** Floor (inclusive start) of the last truncated lookback scan. */
   lookback_floor_ms?: number | null;
+  /**
+   * Spec 032: a window is never complete before its materialization run has
+   * completed. These fields make the reason visible to API/MCP callers.
+   */
+  materialization_state?: "pending" | "running" | "complete" | "failed" | null;
+  materialization_parts_done?: number;
+  materialization_parts_total?: number;
+  materialization_error?: string | null;
   complete: boolean;
 }
 
@@ -704,7 +737,11 @@ export class IngestCore {
     const window = externalWindow(input.started_at_ms, input.ended_at_ms, input.instances, input.name);
     const valid = validateWindow(window, this.now(), bounds);
     if (!valid.ok) throw badRequest(`${valid.code}: ${valid.error}`);
-    const coverage = normalizeCoverage(input.coverage, window.instances);
+    // Spec 032: a new window starts with a pending materialization run, so even
+    // an externally supplied "complete" coverage cannot claim completeness
+    // before the parts exist.
+    const pending = pendingMaterialization();
+    const coverage = normalizeCoverage(input.coverage, window.instances, pending);
     const state = coverage.complete ? "ready" : "incomplete";
     this.upsertWindowRow(input.shot_id, input.owner, window, state, coverage, input.metadata);
     // Protect the shot's receive-time range from GC (TTL-bounded).
@@ -761,16 +798,21 @@ export class IngestCore {
     const valid = validateWindow(window, now, bounds);
     if (!valid.ok) throw badRequest(`${valid.code}: ${valid.error}`);
     const prior = row.coverage;
+    const materialization = row.materialization ?? pendingMaterialization();
     const coverage: WindowCoverage =
       prior && prior.missing_segments.length > 0
-        ? prior
-        : {
-            expected_segments: prior?.expected_segments ?? 0,
-            available_segments: prior?.available_segments ?? 0,
-            missing_segments: [],
-            instances: window.instances,
-            complete: true,
-          };
+        ? normalizeCoverage(prior, window.instances, materialization)
+        : normalizeCoverage(
+            {
+              expected_segments: prior?.expected_segments ?? 0,
+              available_segments: prior?.available_segments ?? 0,
+              missing_segments: [],
+              instances: window.instances,
+              complete: true,
+            },
+            window.instances,
+            materialization,
+          );
     const state = coverage.complete ? "ready" : "incomplete";
     this.sql.exec(
       `UPDATE shot_registry SET state = ?, stopped_at = ?, window_json = ?, query_watermark_ms = ?, coverage_json = ?
@@ -791,10 +833,13 @@ export class IngestCore {
   }
 
   /** Records the coverage/completeness computed by an analysis pass. */
-  async setWindowCoverage(shotId: string, coverage: WindowCoverage): Promise<WindowShotRecord> {    await this.ensureLoaded();
+  async setWindowCoverage(shotId: string, coverage: WindowCoverage): Promise<WindowShotRecord> {
+    await this.ensureLoaded();
     const row = this.getShotRecord(shotId);
     if (!row) throw badRequest("unknown window shot");
-    const normalized = normalizeCoverage(coverage, row.window?.instances ?? []);
+    // Spec 032: coverage.complete is false until materialization completes.
+    // The materialization state is always disclosed alongside it.
+    const normalized = normalizeCoverage(coverage, row.window?.instances ?? [], row.materialization);
     const state = normalized.complete ? "ready" : "incomplete";
     this.sql.exec(
       `UPDATE shot_registry SET coverage_json = ?, state = ? WHERE shot_id = ?`,
@@ -871,20 +916,10 @@ export class IngestCore {
 
   /** Initializes `materialization.state = pending` exactly once. */
   private ensureMaterializationPending(shotId: string): void {
-    const pending: MaterializationRecord = {
-      state: "pending",
-      parts_done: 0,
-      parts_total: 0,
-      spans: 0,
-      started_at: null,
-      finished_at: null,
-      parts: [],
-      error: null,
-    };
     this.sql.exec(
       `UPDATE shot_registry SET materialization_json = ?
         WHERE shot_id = ? AND (materialization_json IS NULL OR materialization_json = '')`,
-      JSON.stringify(pending),
+      JSON.stringify(pendingMaterialization()),
       shotId,
     );
   }
@@ -906,10 +941,35 @@ export class IngestCore {
       finished_at: typeof record.finished_at === "number" ? record.finished_at : null,
       parts: Array.isArray(record.parts) ? record.parts : [],
       error: record.error ?? null,
+      part_states: normalizePartStates(record.part_states),
+      lease_expires_at:
+        typeof record.lease_expires_at === "number" && Number.isFinite(record.lease_expires_at)
+          ? record.lease_expires_at
+          : null,
+      heartbeat_at:
+        typeof record.heartbeat_at === "number" && Number.isFinite(record.heartbeat_at)
+          ? record.heartbeat_at
+          : null,
+      attempts: numOr(record.attempts, 0),
     };
     this.sql.exec(
       `UPDATE shot_registry SET materialization_json = ? WHERE shot_id = ?`,
       JSON.stringify(normalized),
+      shotId,
+    );
+    // Spec 032: keep the derived coverage honest. A pending/running/failed run
+    // can never leave a stale `complete: true` behind, and a successful run
+    // lets coverage become complete when no other gap is known.
+    const coverage = row.coverage ?? emptyCoverage(row.window?.instances ?? []);
+    const nextCoverage = normalizeCoverage(
+      { ...coverage, complete: true },
+      row.window?.instances ?? [],
+      normalized,
+    );
+    this.sql.exec(
+      `UPDATE shot_registry SET coverage_json = ?, state = ? WHERE shot_id = ?`,
+      JSON.stringify(nextCoverage),
+      row.state === "open" ? "open" : nextCoverage.complete ? "ready" : "incomplete",
       shotId,
     );
     const updated = this.getShotRecord(shotId);
@@ -1002,7 +1062,7 @@ export class IngestCore {
       window.name ?? null,
       windowToJSON(window),
       JSON.stringify(coverage),
-      null,
+      JSON.stringify(pendingMaterialization()),
     );
     void metadata;
   }
@@ -2465,8 +2525,18 @@ function registeredRow(row: SqlRow): WindowShotRecord {
   };
 }
 
-/** Normalizes a coverage summary; a missing list is never silently complete. */
-export function normalizeCoverage(input: WindowCoverage | undefined, instances: string[]): WindowCoverage {
+/**
+ * Normalizes a coverage summary; a missing list is never silently complete.
+ *
+ * Spec 032 adds the materialization gate: when a materialization record is
+ * supplied (or the input already carries a state), `complete` is forced false
+ * until the run is `complete`, and the state/parts/error are exposed.
+ */
+export function normalizeCoverage(
+  input: WindowCoverage | undefined,
+  instances: string[],
+  materialization?: MaterializationRecord | null,
+): WindowCoverage {
   const missing = Array.isArray(input?.missing_segments) ? input!.missing_segments.map(String) : [];
   const pending = numOr(input?.pending_journal, 0);
   // Spec 025 R3: a window that overlaps a truncated lookback is never complete,
@@ -2476,6 +2546,11 @@ export function normalizeCoverage(input: WindowCoverage | undefined, instances: 
     typeof input?.lookback_floor_ms === "number" && Number.isFinite(input.lookback_floor_ms)
       ? Math.floor(input.lookback_floor_ms)
       : null;
+  const materializationState =
+    materialization !== undefined
+      ? (materialization?.state ?? null)
+      : (input?.materialization_state ?? null);
+  const materializationComplete = materializationState === null || materializationState === "complete";
   const coverage: WindowCoverage = {
     expected_segments: numOr(input?.expected_segments, 0),
     available_segments: numOr(input?.available_segments, 0),
@@ -2486,10 +2561,81 @@ export function normalizeCoverage(input: WindowCoverage | undefined, instances: 
     pending_journal: pending,
     lookback_truncated: lookbackTruncated,
     lookback_floor_ms: floor,
+    materialization_state: materializationState,
+    materialization_parts_done: numOr(
+      materialization !== undefined ? materialization?.parts_done : input?.materialization_parts_done,
+      0,
+    ),
+    materialization_parts_total: numOr(
+      materialization !== undefined ? materialization?.parts_total : input?.materialization_parts_total,
+      0,
+    ),
+    materialization_error:
+      materialization !== undefined ? (materialization?.error ?? null) : (input?.materialization_error ?? null),
     complete:
-      input?.complete === true && missing.length === 0 && pending === 0 && !lookbackTruncated,
+      input?.complete === true &&
+      missing.length === 0 &&
+      pending === 0 &&
+      !lookbackTruncated &&
+      materializationComplete,
   };
   return coverage;
+}
+
+/** Initial `pending` materialization record (spec 032). */
+function pendingMaterialization(): MaterializationRecord {
+  return {
+    state: "pending",
+    parts_done: 0,
+    parts_total: 0,
+    spans: 0,
+    started_at: null,
+    finished_at: null,
+    parts: [],
+    error: null,
+    part_states: [],
+    lease_expires_at: null,
+    heartbeat_at: null,
+    attempts: 0,
+  };
+}
+
+/** Empty, explicitly incomplete coverage for a window with no analysis yet. */
+function emptyCoverage(instances: string[]): WindowCoverage {
+  return {
+    expected_segments: 0,
+    available_segments: 0,
+    missing_segments: [],
+    instances,
+    complete: false,
+  };
+}
+
+function normalizePartStates(raw: unknown): MaterializationPartState[] {
+  if (!Array.isArray(raw)) return [];
+  const out: MaterializationPartState[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const value = item as Record<string, unknown>;
+    const state = String(value.state ?? "pending");
+    if (!["pending", "running", "complete", "failed"].includes(state)) continue;
+    out.push({
+      index: numOr(value.index, out.length),
+      state: state as MaterializationPartState["state"],
+      attempts: numOr(value.attempts, 0),
+      lease_owner: typeof value.lease_owner === "string" ? value.lease_owner : null,
+      lease_expires_at:
+        typeof value.lease_expires_at === "number" && Number.isFinite(value.lease_expires_at)
+          ? value.lease_expires_at
+          : null,
+      started_at:
+        typeof value.started_at === "number" && Number.isFinite(value.started_at) ? value.started_at : null,
+      finished_at:
+        typeof value.finished_at === "number" && Number.isFinite(value.finished_at) ? value.finished_at : null,
+      error: typeof value.error === "string" ? value.error : null,
+    });
+  }
+  return out.sort((a, b) => a.index - b.index);
 }
 
 /** Validates the lookback health carried by a compaction result. */

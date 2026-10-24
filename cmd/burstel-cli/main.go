@@ -31,6 +31,8 @@
 //	shot list [--owner NAME] [--limit N] [--offset N]
 //	shot get <shot-id>
 //	shot stop <shot-id> [--ended-at ISO]
+//	shot materialize <shot-id> [--no-force] [--wait]
+//	                                    retry/restart durable materialization
 //	shot query <shot-id> --sql "SELECT ..." [--max-rows N]
 //	shot analyze <shot-id> [--sections a,b] [--top-n N]
 //	shot schema <shot-id>
@@ -701,7 +703,7 @@ func (c *client) instanceTokenCommand(args []string) error {
 
 func (c *client) shotCommand(args []string) error {
 	if len(args) == 0 {
-		return errors.New("shot: expected start|list|get|stop|query|analyze|schema|compare")
+		return errors.New("shot: expected start|list|get|stop|materialize|query|analyze|schema|compare")
 	}
 	action, rest := args[0], args[1:]
 	switch action {
@@ -857,6 +859,26 @@ func (c *client) shotCommand(args []string) error {
 			body["ended_at"] = ended
 		}
 		return c.postJSON(http.MethodPost, "/api/shots/"+id+"/stop", body)
+	case "materialize":
+		// Spec 032: retry a failed run or request a fresh one. Defaults to
+		// force=true so `shot materialize <id>` is the documented recovery step;
+		// --wait polls until the durable run is terminal.
+		pos, opts, err := parseOpts(rest, map[string]bool{})
+		if err != nil {
+			return err
+		}
+		id, err := oneShotID(pos)
+		if err != nil {
+			return err
+		}
+		body := map[string]any{"force": true}
+		if _, ok := opts["no-force"]; ok {
+			body["force"] = false
+		}
+		if _, ok := opts["wait"]; ok {
+			body["wait"] = true
+		}
+		return c.postJSON(http.MethodPost, "/api/shots/"+id+"/materialize", body)
 	case "query":
 		pos, opts, err := parseOpts(rest, map[string]bool{"sql": true, "max-rows": true})
 		if err != nil {
@@ -981,6 +1003,8 @@ Commands:
   shot list [--owner NAME] [--limit N] [--offset N]
   shot get <shot-id>
   shot stop <shot-id> [--ended-at ISO]
+  shot materialize <shot-id> [--no-force] [--wait]
+                                      retry/restart the durable materialization run
   shot query <shot-id> --sql "SELECT ..." [--max-rows N]
   shot analyze <shot-id> [--sections a,b] [--top-n N]
   shot schema <shot-id>

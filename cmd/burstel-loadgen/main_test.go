@@ -6,55 +6,95 @@ import (
 	"time"
 )
 
-// TestEffectiveClientSettingsDefaults proves the flags default to the stock SDK
-// settings (BSP/log batch 512, queue 2048, no compression).
-func TestEffectiveClientSettingsDefaults(t *testing.T) {
-	got, err := effectiveClientSettings("none", 0, 0)
+func env(values map[string]string) envLookup {
+	return func(key string) (string, bool) {
+		value, ok := values[key]
+		return value, ok
+	}
+}
+
+// TestResolveClientSettingsDefaults proves an entirely unset run uses the stock
+// SDK settings (BSP/log batch 512, queue 2048, no compression).
+func TestResolveClientSettingsDefaults(t *testing.T) {
+	got, sources, err := resolveClientSettings(clientSettingFlags{}, env(nil))
 	if err != nil {
-		t.Fatalf("effectiveClientSettings: %v", err)
+		t.Fatalf("resolveClientSettings: %v", err)
 	}
 	want := clientSettings{Compression: "none", BatchSize: 512, QueueSize: 2048}
 	if got != want {
 		t.Fatalf("settings = %+v, want %+v", got, want)
 	}
-
-	// The empty string is the SDK default as well.
-	got, err = effectiveClientSettings("", 0, 0)
-	if err != nil {
-		t.Fatalf("effectiveClientSettings(empty): %v", err)
-	}
-	if got != want {
-		t.Fatalf("settings = %+v, want %+v", got, want)
+	wantSources := clientSettingsSources{Compression: "default", BatchSize: "default", QueueSize: "default"}
+	if sources != wantSources {
+		t.Fatalf("sources = %+v, want %+v", sources, wantSources)
 	}
 }
 
-func TestEffectiveClientSettingsRecommended(t *testing.T) {
-	got, err := effectiveClientSettings("gzip", 8192, 131072)
+// TestResolveClientSettingsEnvWhenFlagsUnset proves the standard OTEL_* env vars
+// are honoured when the flags are absent (spec 032).
+func TestResolveClientSettingsEnvWhenFlagsUnset(t *testing.T) {
+	got, sources, err := resolveClientSettings(clientSettingFlags{}, env(map[string]string{
+		"OTEL_EXPORTER_OTLP_COMPRESSION": "gzip",
+		"OTEL_BSP_MAX_EXPORT_BATCH_SIZE": "8192",
+		"OTEL_BSP_MAX_QUEUE_SIZE":        "131072",
+	}))
 	if err != nil {
-		t.Fatalf("effectiveClientSettings: %v", err)
+		t.Fatalf("resolveClientSettings: %v", err)
 	}
 	want := clientSettings{Compression: "gzip", BatchSize: 8192, QueueSize: 131072}
 	if got != want {
 		t.Fatalf("settings = %+v, want %+v", got, want)
 	}
+	wantSources := clientSettingsSources{Compression: "env", BatchSize: "env", QueueSize: "env"}
+	if sources != wantSources {
+		t.Fatalf("sources = %+v, want %+v", sources, wantSources)
+	}
 }
 
-func TestEffectiveClientSettingsRejectsBadInput(t *testing.T) {
+// TestResolveClientSettingsFlagWinsOverEnv proves an explicit flag beats the
+// corresponding env var.
+func TestResolveClientSettingsFlagWinsOverEnv(t *testing.T) {
+	got, sources, err := resolveClientSettings(clientSettingFlags{
+		Compression:    "none",
+		BatchSize:      4096,
+		QueueSize:      65536,
+		CompressionSet: true,
+		BatchSizeSet:   true,
+		QueueSizeSet:   true,
+	}, env(map[string]string{
+		"OTEL_EXPORTER_OTLP_COMPRESSION": "gzip",
+		"OTEL_BSP_MAX_EXPORT_BATCH_SIZE": "8192",
+		"OTEL_BSP_MAX_QUEUE_SIZE":        "131072",
+	}))
+	if err != nil {
+		t.Fatalf("resolveClientSettings: %v", err)
+	}
+	want := clientSettings{Compression: "none", BatchSize: 4096, QueueSize: 65536}
+	if got != want {
+		t.Fatalf("settings = %+v, want %+v", got, want)
+	}
+	wantSources := clientSettingsSources{Compression: "flag", BatchSize: "flag", QueueSize: "flag"}
+	if sources != wantSources {
+		t.Fatalf("sources = %+v, want %+v", sources, wantSources)
+	}
+}
+
+func TestResolveClientSettingsRejectsBadInput(t *testing.T) {
 	cases := []struct {
-		name        string
-		compression string
-		batch       int
-		queue       int
-		want        string
+		name  string
+		flags clientSettingFlags
+		env   map[string]string
+		want  string
 	}{
-		{name: "compression", compression: "zstd", want: "-compression must be gzip or none"},
-		{name: "negative batch", compression: "none", batch: -1, want: "-batch-size must be >= 0"},
-		{name: "negative queue", compression: "none", queue: -1, want: "-queue-size must be >= 0"},
-		{name: "batch above queue", compression: "none", batch: 4096, queue: 2048, want: "must not exceed"},
+		{name: "compression", flags: clientSettingFlags{Compression: "zstd", CompressionSet: true}, want: "-compression must be gzip or none"},
+		{name: "negative batch", flags: clientSettingFlags{BatchSize: -1, BatchSizeSet: true}, want: "-batch-size must be >= 0"},
+		{name: "negative queue", flags: clientSettingFlags{QueueSize: -1, QueueSizeSet: true}, want: "-queue-size must be >= 0"},
+		{name: "batch above queue", flags: clientSettingFlags{BatchSize: 4096, BatchSizeSet: true, QueueSize: 2048, QueueSizeSet: true}, want: "must not exceed"},
+		{name: "bad env int", env: map[string]string{"OTEL_BSP_MAX_EXPORT_BATCH_SIZE": "nope"}, want: "OTEL_BSP_MAX_EXPORT_BATCH_SIZE must be a positive integer"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := effectiveClientSettings(tc.compression, tc.batch, tc.queue)
+			_, _, err := resolveClientSettings(tc.flags, env(tc.env))
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("err = %v, want %q", err, tc.want)
 			}
@@ -63,25 +103,35 @@ func TestEffectiveClientSettingsRejectsBadInput(t *testing.T) {
 }
 
 func TestParseFlagsWiresClientSettings(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip")
+	t.Setenv("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "1")
+	t.Setenv("OTEL_BSP_MAX_QUEUE_SIZE", "2")
 	cfg, err := parseFlags([]string{
 		"-token", "test-token",
-		"-compression", "gzip",
+		"-compression", "none",
 		"-batch-size", "8192",
 		"-queue-size", "131072",
 	})
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
 	}
-	if cfg.compression != "gzip" || cfg.batchSize != 8192 || cfg.queueSize != 131072 {
+	if cfg.compression != "none" || cfg.batchSize != 8192 || cfg.queueSize != 131072 {
 		t.Fatalf("raw flags = %q/%d/%d", cfg.compression, cfg.batchSize, cfg.queueSize)
 	}
-	want := clientSettings{Compression: "gzip", BatchSize: 8192, QueueSize: 131072}
+	want := clientSettings{Compression: "none", BatchSize: 8192, QueueSize: 131072}
 	if cfg.settings != want {
 		t.Fatalf("settings = %+v, want %+v", cfg.settings, want)
+	}
+	wantSources := clientSettingsSources{Compression: "flag", BatchSize: "flag", QueueSize: "flag"}
+	if cfg.sources != wantSources {
+		t.Fatalf("sources = %+v, want %+v", cfg.sources, wantSources)
 	}
 }
 
 func TestParseFlagsDefaultsToSDK(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "")
+	t.Setenv("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "")
+	t.Setenv("OTEL_BSP_MAX_QUEUE_SIZE", "")
 	cfg, err := parseFlags([]string{"-token", "test-token"})
 	if err != nil {
 		t.Fatalf("parseFlags: %v", err)
@@ -89,6 +139,28 @@ func TestParseFlagsDefaultsToSDK(t *testing.T) {
 	want := clientSettings{Compression: "none", BatchSize: 512, QueueSize: 2048}
 	if cfg.settings != want {
 		t.Fatalf("settings = %+v, want %+v", cfg.settings, want)
+	}
+	wantSources := clientSettingsSources{Compression: "default", BatchSize: "default", QueueSize: "default"}
+	if cfg.sources != wantSources {
+		t.Fatalf("sources = %+v, want %+v", cfg.sources, wantSources)
+	}
+}
+
+func TestParseFlagsAppliesOTELEnvWhenUnset(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "gzip")
+	t.Setenv("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "8192")
+	t.Setenv("OTEL_BSP_MAX_QUEUE_SIZE", "131072")
+	cfg, err := parseFlags([]string{"-token", "test-token"})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	want := clientSettings{Compression: "gzip", BatchSize: 8192, QueueSize: 131072}
+	if cfg.settings != want {
+		t.Fatalf("settings = %+v, want %+v", cfg.settings, want)
+	}
+	wantSources := clientSettingsSources{Compression: "env", BatchSize: "env", QueueSize: "env"}
+	if cfg.sources != wantSources {
+		t.Fatalf("sources = %+v, want %+v", cfg.sources, wantSources)
 	}
 }
 

@@ -27,6 +27,11 @@ export interface CompactorNamespaceLike {
   getByName(name: string): DoStubLike;
 }
 
+/** Structural subset of `DurableObjectNamespace<MaterializeDO>` (spec 032). */
+export interface MaterializerNamespaceLike {
+  getByName(name: string): DoStubLike;
+}
+
 /**
  * Structural subset of a Workers KV namespace (spec 023, D1).
  *
@@ -69,6 +74,11 @@ export interface AppEnv {
    * `compaction_status`/`compaction_run` tools fail closed.
    */
   COMPACTOR_DO?: CompactorNamespaceLike;
+  /**
+   * Durable materialization coordinator (spec 032), keyed by shot id. Optional
+   * so pure unit tests can exercise the direct/legacy path.
+   */
+  MATERIALIZE_DO?: MaterializerNamespaceLike;
   /**
    * Durable raw-journal bucket for continuous OTLP intake (spec 014). The
    * trusted R2 bucket binding; every acknowledged export is a durable object.

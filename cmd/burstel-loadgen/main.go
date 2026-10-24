@@ -45,6 +45,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,41 +73,104 @@ const (
 )
 
 // clientSettings are the OTel Go SDK export settings this run actually uses.
-// BatchSize/QueueSize are always effective values (SDK defaults are filled in),
-// so the JSON report can be compared with the recommended ISUCON settings
-// without guessing.
+// BatchSize/QueueSize are always effective values (env or SDK defaults are
+// filled in), so the JSON report can be compared with the recommended ISUCON
+// settings without guessing.
 type clientSettings struct {
 	Compression string `json:"compression"`
 	BatchSize   int    `json:"batch_size"`
 	QueueSize   int    `json:"queue_size"`
 }
 
-// effectiveClientSettings resolves the loadgen flags to the values handed to
-// the SDK. Zero batch/queue sizes mean "leave the SDK default".
-func effectiveClientSettings(compression string, batchSize, queueSize int) (clientSettings, error) {
+// clientSettingsSources says where each effective value came from:
+// "flag", "env" (the standard OTEL_* variable) or "default" (SDK default).
+type clientSettingsSources struct {
+	Compression string `json:"compression"`
+	BatchSize   string `json:"batch_size"`
+	QueueSize   string `json:"queue_size"`
+}
+
+// clientSettingFlags records both the flag values and whether each flag was
+// explicitly supplied. Spec 032 requires an unset flag to defer to the standard
+// OTEL_* environment variables, exactly like the stock SDK.
+type clientSettingFlags struct {
+	Compression    string
+	BatchSize      int
+	QueueSize      int
+	CompressionSet bool
+	BatchSizeSet   bool
+	QueueSizeSet   bool
+}
+
+type envLookup func(string) (string, bool)
+
+// resolveClientSettings implements: explicit flag > OTEL_* env > SDK default.
+func resolveClientSettings(flags clientSettingFlags, getenv envLookup) (clientSettings, clientSettingsSources, error) {
+	compression := "none"
+	compressionSource := "default"
+	if flags.CompressionSet && strings.TrimSpace(flags.Compression) != "" {
+		compression = strings.TrimSpace(flags.Compression)
+		compressionSource = "flag"
+	} else if raw, ok := getenv("OTEL_EXPORTER_OTLP_COMPRESSION"); ok && strings.TrimSpace(raw) != "" {
+		compression = strings.TrimSpace(raw)
+		compressionSource = "env"
+	}
 	switch compression {
-	case "", "none":
+	case "none", "":
 		compression = "none"
 	case "gzip":
 	default:
-		return clientSettings{}, fmt.Errorf("-compression must be gzip or none, got %q", compression)
+		return clientSettings{}, clientSettingsSources{}, fmt.Errorf("-compression must be gzip or none, got %q", compression)
 	}
-	if batchSize < 0 {
-		return clientSettings{}, fmt.Errorf("-batch-size must be >= 0, got %d", batchSize)
+
+	if flags.BatchSize < 0 {
+		return clientSettings{}, clientSettingsSources{}, fmt.Errorf("-batch-size must be >= 0, got %d", flags.BatchSize)
 	}
-	if queueSize < 0 {
-		return clientSettings{}, fmt.Errorf("-queue-size must be >= 0, got %d", queueSize)
+	if flags.QueueSize < 0 {
+		return clientSettings{}, clientSettingsSources{}, fmt.Errorf("-queue-size must be >= 0, got %d", flags.QueueSize)
 	}
-	if batchSize == 0 {
-		batchSize = sdktrace.DefaultMaxExportBatchSize
+	batchSize, batchSource, err := resolveIntSetting(
+		flags.BatchSize, flags.BatchSizeSet && flags.BatchSize > 0,
+		getenv, "OTEL_BSP_MAX_EXPORT_BATCH_SIZE", sdktrace.DefaultMaxExportBatchSize,
+	)
+	if err != nil {
+		return clientSettings{}, clientSettingsSources{}, err
 	}
-	if queueSize == 0 {
-		queueSize = sdktrace.DefaultMaxQueueSize
+	queueSize, queueSource, err := resolveIntSetting(
+		flags.QueueSize, flags.QueueSizeSet && flags.QueueSize > 0,
+		getenv, "OTEL_BSP_MAX_QUEUE_SIZE", sdktrace.DefaultMaxQueueSize,
+	)
+	if err != nil {
+		return clientSettings{}, clientSettingsSources{}, err
 	}
 	if batchSize > queueSize {
-		return clientSettings{}, fmt.Errorf("-batch-size (%d) must not exceed -queue-size (%d)", batchSize, queueSize)
+		return clientSettings{}, clientSettingsSources{}, fmt.Errorf("-batch-size (%d) must not exceed -queue-size (%d)", batchSize, queueSize)
 	}
-	return clientSettings{Compression: compression, BatchSize: batchSize, QueueSize: queueSize}, nil
+	return clientSettings{Compression: compression, BatchSize: batchSize, QueueSize: queueSize}, clientSettingsSources{
+		Compression: compressionSource,
+		BatchSize:   batchSource,
+		QueueSize:   queueSource,
+	}, nil
+}
+
+func resolveIntSetting(
+	flagValue int,
+	flagSet bool,
+	getenv envLookup,
+	envName string,
+	fallback int,
+) (int, string, error) {
+	if flagSet {
+		return flagValue, "flag", nil
+	}
+	if raw, ok := getenv(envName); ok && strings.TrimSpace(raw) != "" {
+		parsed, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil || parsed <= 0 {
+			return 0, "", fmt.Errorf("%s must be a positive integer, got %q", envName, raw)
+		}
+		return parsed, "env", nil
+	}
+	return fallback, "default", nil
 }
 
 type latencyBuffer struct {
@@ -309,6 +373,7 @@ type config struct {
 	batchSize     int
 	queueSize     int
 	settings      clientSettings
+	sources       clientSettingsSources
 }
 
 func main() {
@@ -335,9 +400,11 @@ func main() {
 		fatal(err)
 	}
 
-	fmt.Fprintf(os.Stderr, "burstel-loadgen run=%s variant=%s target=%s exporters=%d spans/s/exporter=%d db-spans=%d duration=%s compression=%s batch-size=%d queue-size=%d\n",
+	fmt.Fprintf(os.Stderr, "burstel-loadgen run=%s variant=%s target=%s exporters=%d spans/s/exporter=%d db-spans=%d duration=%s compression=%s(%s) batch-size=%d(%s) queue-size=%d(%s)\n",
 		cfg.runID, cfg.variant, cfg.endpoint, cfg.exporters, cfg.spansPerSec, cfg.dbSpans, cfg.duration,
-		cfg.settings.Compression, cfg.settings.BatchSize, cfg.settings.QueueSize)
+		cfg.settings.Compression, cfg.sources.Compression,
+		cfg.settings.BatchSize, cfg.sources.BatchSize,
+		cfg.settings.QueueSize, cfg.sources.QueueSize)
 
 	start := time.Now()
 	var wg sync.WaitGroup
@@ -372,19 +439,20 @@ func main() {
 	shutdownDuration := time.Since(shutdownStart)
 
 	report := map[string]any{
-		"run_id":            cfg.runID,
-		"variant":           cfg.variant,
-		"target":            cfg.endpoint,
-		"exporters":         cfg.exporters,
-		"spans_per_second":  cfg.spansPerSec,
-		"per_exporter":      true,
-		"db_spans":          cfg.dbSpans,
-		"duration_ms":       cfg.duration.Milliseconds(),
-		"client_settings":   cfg.settings,
-		"generation_ms":     generatedElapsed.Milliseconds(),
-		"shutdown_ms":       shutdownDuration.Milliseconds(),
-		"shutdown_deadline": cfg.shutdownGrace.String(),
-		"shutdown_error":    errString(shutdownErr),
+		"run_id":                  cfg.runID,
+		"variant":                 cfg.variant,
+		"target":                  cfg.endpoint,
+		"exporters":               cfg.exporters,
+		"spans_per_second":        cfg.spansPerSec,
+		"per_exporter":            true,
+		"db_spans":                cfg.dbSpans,
+		"duration_ms":             cfg.duration.Milliseconds(),
+		"client_settings":         cfg.settings,
+		"client_settings_sources": cfg.sources,
+		"generation_ms":           generatedElapsed.Milliseconds(),
+		"shutdown_ms":             shutdownDuration.Milliseconds(),
+		"shutdown_deadline":       cfg.shutdownGrace.String(),
+		"shutdown_error":          errString(shutdownErr),
 		"signals": map[string]signalReport{
 			"traces":  st.traces.report(),
 			"metrics": st.metrics.report(),
@@ -417,12 +485,14 @@ func parseFlags(args []string) (config, error) {
 	fs.StringVar(&cfg.apiToken, "api-token", os.Getenv("BURSTEL_API_TOKEN"), "admin/member token for verification queries")
 	fs.BoolVar(&cfg.emitMetrics, "emit-metrics", true, "emit one OTLP metric point per exporter per second")
 	fs.BoolVar(&cfg.emitLogs, "emit-logs", true, "emit one OTLP log record per exporter per second")
-	fs.StringVar(&cfg.compression, "compression", "none", "OTLP/HTTP payload compression: gzip or none (SDK default: none)")
-	fs.IntVar(&cfg.batchSize, "batch-size", 0, "max export batch size for traces/logs (0 = SDK default 512)")
-	fs.IntVar(&cfg.queueSize, "queue-size", 0, "max queued spans/log records (0 = SDK default 2048)")
+	fs.StringVar(&cfg.compression, "compression", "", "OTLP/HTTP compression: gzip or none (unset = OTEL_EXPORTER_OTLP_COMPRESSION, else none)")
+	fs.IntVar(&cfg.batchSize, "batch-size", 0, "max export batch size (unset/0 = OTEL_BSP_MAX_EXPORT_BATCH_SIZE, else SDK 512)")
+	fs.IntVar(&cfg.queueSize, "queue-size", 0, "max queued spans/log records (unset/0 = OTEL_BSP_MAX_QUEUE_SIZE, else SDK 2048)")
 	if err := fs.Parse(args); err != nil {
 		return cfg, err
 	}
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 	cfg.endpoint = strings.TrimRight(cfg.endpoint, "/")
 	if cfg.apiURL == "" {
 		cfg.apiURL = cfg.endpoint
@@ -437,11 +507,19 @@ func parseFlags(args []string) (config, error) {
 	if cfg.spansPerSec < 1 {
 		cfg.spansPerSec = 1
 	}
-	settings, err := effectiveClientSettings(cfg.compression, cfg.batchSize, cfg.queueSize)
+	settings, sources, err := resolveClientSettings(clientSettingFlags{
+		Compression:    cfg.compression,
+		BatchSize:      cfg.batchSize,
+		QueueSize:      cfg.queueSize,
+		CompressionSet: set["compression"],
+		BatchSizeSet:   set["batch-size"],
+		QueueSizeSet:   set["queue-size"],
+	}, os.LookupEnv)
 	if err != nil {
 		return cfg, err
 	}
 	cfg.settings = settings
+	cfg.sources = sources
 	if cfg.token == "" {
 		return cfg, fmt.Errorf("a push token is required via -token or BURSTEL_PUSH_TOKEN")
 	}
