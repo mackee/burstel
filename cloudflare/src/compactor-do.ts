@@ -82,11 +82,12 @@ function compactorConfigFromEnv(env: CompactorEnv): Partial<CompactorConfig> {
     retentionMs: num(env.COMPACTION_RETENTION_MS, 24 * 60 * 60 * 1000),
     revokedRetentionMs: num(env.COMPACTION_REVOKED_RETENTION_MS, 7 * 24 * 60 * 60 * 1000),
     gcEnabled: bool(env.COMPACTION_GC),
-    batchObjects: num(env.COMPACTION_BATCH_OBJECTS, 2048),
-    batchBytes: num(env.COMPACTION_BATCH_BYTES, 32 * 1024 * 1024),
+    batchObjects: num(env.COMPACTION_BATCH_OBJECTS, 256),
+    batchBytes: num(env.COMPACTION_BATCH_BYTES, 8 * 1024 * 1024),
     maxBatchesPerTick: num(env.COMPACTION_MAX_BATCHES, 4),
     tickBudgetMs: num(env.COMPACTION_TICK_BUDGET_MS, 10 * 60 * 1000),
     scheduleMs: num(env.COMPACTION_SCHEDULE_MS, 120_000),
     leaseTtlMs: num(env.COMPACTION_LEASE_TTL_MS, 15 * 60 * 1000),
+    containerTimeoutMs: num(env.COMPACTION_CONTAINER_TIMEOUT_MS, 60_000),
   };
 }

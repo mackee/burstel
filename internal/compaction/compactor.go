@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -262,15 +261,11 @@ func (c *Compactor) compactWindow(ctx context.Context, instanceID string, objs [
 	sort.Strings(srcKeys)
 	key := segmentKey(instanceID, first, last, srcKeys)
 
-	workDir := c.cfg.WorkDir
-	if workDir == "" {
-		workDir = os.TempDir()
-	}
-	if err := os.MkdirAll(workDir, 0o755); err != nil {
+	tmp, cleanup, err := NewScratchSegment(c.cfg.WorkDir, key)
+	if err != nil {
 		return SegmentManifest{}, false, err
 	}
-	tmp := filepath.Join(workDir, "seg-"+shortHash(key)+".duckdb")
-	defer os.Remove(tmp) //nolint:errcheck
+	defer cleanup()
 	info, err := BuildSegment(ctx, tmp, key, instanceID, records[0].Object.Instance, records)
 	if err != nil {
 		return SegmentManifest{}, false, err
@@ -645,21 +640,21 @@ func (c *Compactor) Repair(ctx context.Context) (RepairReport, error) {
 			continue
 		}
 		sort.Slice(records, func(i, j int) bool { return records[i].Object.Key < records[j].Object.Key })
-		workDir := c.cfg.WorkDir
-		if workDir == "" {
-			workDir = os.TempDir()
+		tmp, cleanup, err := NewScratchSegment(c.cfg.WorkDir, seg.Key)
+		if err != nil {
+			return rep, err
 		}
-		tmp := filepath.Join(workDir, "repair-"+shortHash(seg.Key)+".duckdb")
 		info, err := BuildSegment(ctx, tmp, seg.Key, seg.InstanceID, records[0].Object.Instance, records)
 		if err != nil {
+			cleanup()
 			return rep, err
 		}
 		info.Key = seg.Key
 		stored, _, err := c.ensureObject(ctx, info, seg.InstanceID)
+		cleanup()
 		if err != nil {
 			return rep, err
 		}
-		_ = os.Remove(tmp)
 		rebuilt := seg
 		rebuilt.Size = stored.Size
 		rebuilt.SHA256 = stored.SHA256

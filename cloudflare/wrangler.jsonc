@@ -37,12 +37,17 @@
     // 7 days, excluded from every segment, before deletion.
     "COMPACTION_REVOKED_RETENTION_MS": "604800000",
     "COMPACTION_GC": "0",
-    "COMPACTION_BATCH_OBJECTS": "2048",
-    "COMPACTION_BATCH_BYTES": "33554432",
+    // Spec 029: one build + download must finish comfortably inside the
+    // Worker -> Container request limits. 8 MiB is ~75 x 111 KiB journal
+    // objects; 256 bounds the count for unusually small objects.
+    "COMPACTION_BATCH_OBJECTS": "256",
+    "COMPACTION_BATCH_BYTES": "8388608",
     "COMPACTION_MAX_BATCHES": "4",
     "COMPACTION_TICK_BUDGET_MS": "600000",
     "COMPACTION_SCHEDULE_MS": "120000",
-    "COMPACTION_LEASE_TTL_MS": "900000"
+    "COMPACTION_LEASE_TTL_MS": "900000",
+    // Spec 029: explicit CompactorCore -> container request deadline.
+    "COMPACTION_CONTAINER_TIMEOUT_MS": "60000"
   },
 
   "containers": [

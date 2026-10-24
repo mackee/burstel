@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -152,6 +153,32 @@ CREATE INDEX IF NOT EXISTS idx_seg_spans_service ON spans (service_name);
 CREATE INDEX IF NOT EXISTS idx_seg_logs_trace ON log_records (trace_id);
 CREATE INDEX IF NOT EXISTS idx_seg_metrics_name ON metric_points (metric_name);
 `
+
+// NewScratchSegment creates a private scratch directory for exactly one build
+// and returns the segment path plus its cleanup function.
+//
+// The path must never be deterministic per segment key: BuildSegment removes
+// and recreates its target, and the caller removes it after hashing. Two
+// concurrent builds of the same key (for example a Worker timeout retry that
+// overlaps the original request) would otherwise delete each other's file
+// between CHECKPOINT/close and the SHA-256 read, surfacing as
+// `open /work/seg-<hash>.duckdb: no such file or directory`. A private
+// directory per request makes concurrent same-key builds independent.
+func NewScratchSegment(workDir, key string) (string, func(), error) {
+	if workDir == "" {
+		workDir = os.TempDir()
+	}
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		return "", nil, err
+	}
+	dir, err := os.MkdirTemp(workDir, "seg-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("compaction: create scratch dir: %w", err)
+	}
+	return filepath.Join(dir, shortHash(key)+".duckdb"), func() {
+		_ = os.RemoveAll(dir)
+	}, nil
+}
 
 // BuildSegment writes an immutable DuckDB segment at path containing the raw
 // wire bytes (byte-for-byte), the decompressed payload, and the relational

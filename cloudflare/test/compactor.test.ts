@@ -31,6 +31,7 @@ interface Harness {
   compactor: CompactorCore;
   armed: number[];
   clock: { now: number };
+  logs: Array<{ message: string; fields?: Record<string, unknown> }>;
 }
 
 function makeHarness(options: {
@@ -45,6 +46,7 @@ function makeHarness(options: {
   const ns = new FakeIngestNamespace(ingest);
   const container = new FakeCompactorContainer(options.compactor ?? {});
   const armed: number[] = [];
+  const logs: Array<{ message: string; fields?: Record<string, unknown> }> = [];
   const compactor = new CompactorCore({
     ingest: ns,
     bucket,
@@ -57,8 +59,11 @@ function makeHarness(options: {
         armed.push(at);
       },
     },
+    log: (message, fields) => {
+      logs.push({ message, fields });
+    },
   });
-  return { bucket, ingest, container, compactor, armed, clock };
+  return { bucket, ingest, container, compactor, armed, clock, logs };
 }
 
 let seq = 0;
@@ -146,12 +151,83 @@ describe("compactor coordinator (spec 018)", () => {
     const skipped = await h.compactor.tick();
     expect(skipped.skipped).toBe("lease_held");
     expect(skipped.segments_published).toBe(0);
+    expect(h.container.buildCalls).toBe(0);
 
     // After the lease expires a different holder may take over with a new fence.
     h.clock.now += 120_000;
     const taken = await h.compactor.tick();
     expect(taken.ok).toBe(true);
     expect(taken.segments_published).toBe(1);
+  });
+
+  test("a manual run while a tick is already building is skipped quickly, not overlapped", async () => {
+    const h = makeHarness({ compactor: { buildDelaysMs: [500] } });
+    await seed(h, { instanceId: "inst-a", instance: "inst-a", signal: "traces", receivedAt: h.clock.now - 600_000 });
+
+    // Start the first tick without awaiting it; the second trigger arrives
+    // while the same holder still owns the lease/build.
+    const firstPromise = h.compactor.tick();
+    const second = await h.compactor.tick();
+    expect(second.skipped).toBe("lease_held");
+    expect(second.segments_published).toBe(0);
+    expect(second.duration_ms).toBeLessThan(200);
+
+    const first = await firstPromise;
+    expect(first.ok).toBe(true);
+    expect(first.segments_published).toBe(1);
+    // Exactly one build: the manual run never reached the container.
+    expect(h.container.buildCalls).toBe(1);
+    expect((await h.ingest.listSegments({ limit: 10, offset: 0 })).total).toBe(1);
+
+    const status = await h.ingest.compactionStatus();
+    expect(status.last_skipped_reason).toBe("lease_held");
+  });
+
+  test("a build past the container timeout releases the lease and retries without double-publishing", async () => {
+    const h = makeHarness({
+      compactor: { buildDelaysMs: [300] },
+      config: { containerTimeoutMs: 50 },
+    });
+    await seed(h, { instanceId: "inst-a", instance: "inst-a", signal: "traces", receivedAt: h.clock.now - 600_000 });
+
+    const first = await h.compactor.tick();
+    expect(first.ok).toBe(false);
+    expect(first.segments_published).toBe(0);
+    expect(first.error).toContain("timed out");
+    expect((await h.ingest.listSegments({ limit: 10, offset: 0 })).total).toBe(0);
+    // The timeout path still releases the lease so the next tick can retry.
+    expect((await h.ingest.compactionStatus()).lease).toBeNull();
+
+    const second = await h.compactor.tick();
+    expect(second.ok).toBe(true);
+    expect(second.segments_published).toBe(1);
+
+    // Let the abandoned first container call settle, then drain again: the
+    // deterministic key + unique coverage must keep exactly one segment.
+    await Bun.sleep(350);
+    const third = await h.compactor.tick();
+    expect(third.ok).toBe(true);
+    expect(third.segments_published).toBe(0);
+
+    const segments = await h.ingest.listSegments({ limit: 10, offset: 0 });
+    expect(segments.total).toBe(1);
+    const status = await h.ingest.compactionStatus();
+    expect(status.coverage_rows).toBe(1);
+    expect(status.unprocessed_journal).toBe(0);
+
+    // Spec 029 observability: one failure log with the timeout/error and one
+    // success log with key, object count, bytes and duration.
+    const failure = h.logs.find((entry) => entry.message === "burstel: compaction build failed");
+    expect(failure).toBeDefined();
+    expect(String(failure!.fields?.error)).toContain("timed out");
+    expect(failure!.fields?.timeout_ms).toBe(50);
+    const success = h.logs.find((entry) => entry.message === "burstel: compaction build");
+    expect(success).toBeDefined();
+    expect(String(success!.fields?.segment_key)).toStartWith("segments/");
+    expect(success!.fields?.objects).toBe(1);
+    expect(typeof success!.fields?.bytes).toBe("number");
+    expect(typeof success!.fields?.duration_ms).toBe("number");
+    expect(success!.fields?.timeout_ms).toBe(50);
   });
 
   test("a lease-skipped tick is recorded in status instead of staying stale (R4)", async () => {

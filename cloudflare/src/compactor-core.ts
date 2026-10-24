@@ -81,6 +81,12 @@ export interface CompactorConfig {
   leaseTtlMs: number;
   maxSegmentBytes: number;
   containerKeepAliveMs: number;
+  /**
+   * Explicit bound for one CompactorCore -> Container request (build or
+   * download). A build that exceeds it is abandoned; the fenced lease is
+   * released and the next tick retries the same deterministic segment key.
+   */
+  containerTimeoutMs: number;
 }
 
 export function defaultCompactorConfig(): CompactorConfig {
@@ -91,14 +97,20 @@ export function defaultCompactorConfig(): CompactorConfig {
     retentionMs: 24 * 60 * 60 * 1000,
     revokedRetentionMs: 7 * 24 * 60 * 60 * 1000,
     gcEnabled: false,
-    batchObjects: 2048,
-    batchBytes: 32 * 1024 * 1024,
+    // One build + download must fit comfortably inside the Worker -> Container
+    // request window. Real journal objects are ~111 KiB, so 8 MiB is roughly
+    // 75 objects (plus base64 overhead); 256 is the object-count guard for
+    // unusually small objects. The previous 32 MiB / 2048 settings produced
+    // 228 s builds on staging and hit "Network connection lost".
+    batchObjects: 256,
+    batchBytes: 8 * 1024 * 1024,
     maxBatchesPerTick: 4,
     tickBudgetMs: 10 * 60 * 1000,
     scheduleMs: 120_000,
     leaseTtlMs: 15 * 60 * 1000,
     maxSegmentBytes: 256 * 1024 * 1024,
     containerKeepAliveMs: 10 * 60 * 1000,
+    containerTimeoutMs: 60_000,
   };
 }
 
@@ -205,6 +217,8 @@ export class CompactorCore {
   private lastError: string | null = null;
   private lastReport: TickReport | null = null;
   private schedulerActive = false;
+  /** In-process single-flight guard: one tick per DO instance at a time. */
+  private tickInFlight = false;
 
   constructor(deps: CompactorDeps) {
     this.ingest = deps.ingest;
@@ -221,12 +235,85 @@ export class CompactorCore {
     this.config.lookbackMs = Math.max(this.config.lookbackMs, 2 * this.config.graceMs);
     this.scheduler = deps.scheduler;
     this.log = deps.log ?? (() => undefined);
+    this.log("burstel: compactor configured", {
+      batch_objects: this.config.batchObjects,
+      batch_bytes: this.config.batchBytes,
+      max_batches_per_tick: this.config.maxBatchesPerTick,
+      container_timeout_ms: this.config.containerTimeoutMs,
+      lease_ttl_ms: this.config.leaseTtlMs,
+    });
   }
 
   // ------------------------------------------------------------------ tick
 
-  /** Runs one bounded compaction tick and arms the next one. */
+  /**
+   * Runs one bounded compaction tick and arms the next one.
+   *
+   * A second trigger (manual `/api/compaction/run`, the cron backstop or an
+   * alarm) while this instance is already ticking must not start an
+   * overlapping build for the same partition. The fenced lease stops a
+   * *different* holder, and this in-process single-flight gate stops the same
+   * holder (whose lease renewal would otherwise succeed) before any work.
+   */
   async tick(): Promise<TickReport> {
+    if (this.tickInFlight) {
+      return this.skipOverlappingTick();
+    }
+    this.tickInFlight = true;
+    try {
+      return await this.tickOnce();
+    } finally {
+      this.tickInFlight = false;
+    }
+  }
+
+  /** Reports a fast `lease_held` skip without touching discovery or the container. */
+  private async skipOverlappingTick(): Promise<TickReport> {
+    const start = Date.now();
+    const watermark = this.now() - Math.max(0, this.config.graceMs);
+    const report: TickReport = {
+      ok: true,
+      skipped: "lease_held",
+      batches: 0,
+      segments_published: 0,
+      bytes_published: 0,
+      journal_objects: 0,
+      discovered_objects: 0,
+      excluded_revoked: 0,
+      gc_deleted: 0,
+      gc_protected: 0,
+      revoked_deleted: 0,
+      duration_ms: 0,
+      watermark,
+      lookback_ms: this.config.lookbackMs,
+      lookback_truncated: false,
+      lookback_floor_ms: null,
+      lookback_until_ms: null,
+      lookback_known: false,
+    };
+    this.lastTickAt = this.now();
+    report.duration_ms = Date.now() - start;
+    this.lastReport = report;
+    this.log("burstel: compaction tick skipped", {
+      reason: "lease_held",
+      duration_ms: report.duration_ms,
+    });
+    // Leave the status trace even though we never reached the lease RPC.
+    await this.ingestCall("/internal/compaction/result", "POST", {
+      holder: this.holder,
+      fencing: this.lastFencing,
+      ok: true,
+      skipped: "lease_held",
+      segments_published: 0,
+      bytes_published: 0,
+      excluded_revoked: 0,
+      error: null,
+      lookback: null,
+    }).catch(() => undefined);
+    return report;
+  }
+
+  private async tickOnce(): Promise<TickReport> {
     const start = Date.now();
     const watermark = this.now() - Math.max(0, this.config.graceMs);
     const report: TickReport = {
@@ -635,8 +722,31 @@ export class CompactorCore {
       });
     }
 
-    const built = await this.buildSegment(batch, objects);
-    await this.assertTrustedBuild(batch, built, expectedKeys);
+    const sourceBytes = objects.reduce((n, obj) => n + Number(obj.size ?? 0), 0);
+    const buildStartedAt = Date.now();
+    let built: BuildResponse;
+    try {
+      built = await this.buildSegment(batch, objects);
+      await this.assertTrustedBuild(batch, built, expectedKeys);
+    } catch (error) {
+      this.log("burstel: compaction build failed", {
+        segment_scope: batch.scope_id,
+        objects: objects.length,
+        bytes: sourceBytes,
+        duration_ms: Date.now() - buildStartedAt,
+        timeout_ms: this.config.containerTimeoutMs,
+        error: errorMessage(error),
+      });
+      throw error;
+    }
+    this.log("burstel: compaction build", {
+      segment_key: built.segment_key,
+      objects: objects.length,
+      bytes: sourceBytes,
+      segment_bytes: built.size_bytes,
+      duration_ms: Date.now() - buildStartedAt,
+      timeout_ms: this.config.containerTimeoutMs,
+    });
     // Preserve each object's real instance in the coverage atoms so GC/pins
     // remain instance-scoped even though the segment scope is cross-instance.
     const objectByKey = new Map(batch.objects.map((o) => [o.key, o]));
@@ -748,7 +858,7 @@ export class CompactorCore {
     batch: CompactionBatch,
     objects: Array<Record<string, unknown>>,
   ): Promise<BuildResponse> {
-    const resp = await this.container.request("/v1/segments", {
+    const resp = await this.containerRequest("/v1/segments", {
       method: "POST",
       headers: this.containerHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ instance_id: batch.scope_id, instance: "", objects }),
@@ -757,7 +867,7 @@ export class CompactorCore {
   }
 
   private async segmentStream(token: string): Promise<ReadableStream<Uint8Array>> {
-    const resp = await this.container.request(`/v1/segments/${encodeURIComponent(token)}`, {
+    const resp = await this.containerRequest(`/v1/segments/${encodeURIComponent(token)}`, {
       headers: this.containerHeaders(),
     });
     if (resp.status < 200 || resp.status >= 300 || !resp.body) {
@@ -767,9 +877,44 @@ export class CompactorCore {
   }
 
   private async discardSegment(token: string): Promise<void> {
-    await this.container
-      .request(`/v1/segments/${encodeURIComponent(token)}`, { method: "DELETE", headers: this.containerHeaders() })
-      .catch(() => undefined);
+    await this.containerRequest(`/v1/segments/${encodeURIComponent(token)}`, {
+      method: "DELETE",
+      headers: this.containerHeaders(),
+    }).catch(() => undefined);
+  }
+
+  /**
+   * Wraps a Container request with the explicit {@link
+   * CompactorConfig.containerTimeoutMs} bound. The abort signal cancels the
+   * real fetch; Promise.race still enforces the deadline for transports (and
+   * test fakes) that ignore signals. A timed-out build is never published, so
+   * the deterministic segment key makes the retry idempotent.
+   */
+  private async containerRequest(path: string, init: RequestInit = {}): Promise<Response> {
+    const timeoutMs = Math.max(1, this.config.containerTimeoutMs);
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(
+          new HttpError(
+            504,
+            `compactor container request ${path} timed out after ${timeoutMs}ms`,
+            true,
+            "container_timeout",
+          ),
+        );
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([
+        this.container.request(path, { ...init, signal: controller.signal }),
+        deadline,
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   // -------------------------------------------------------------------- gc
@@ -879,6 +1024,10 @@ export class CompactorCore {
         revoked_retention_ms: this.config.revokedRetentionMs,
         gc_enabled: this.config.gcEnabled,
         schedule_ms: this.config.scheduleMs,
+        batch_objects: this.config.batchObjects,
+        batch_bytes: this.config.batchBytes,
+        max_batches_per_tick: this.config.maxBatchesPerTick,
+        container_timeout_ms: this.config.containerTimeoutMs,
       },
     };
   }

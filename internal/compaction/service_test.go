@@ -9,6 +9,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -122,6 +124,82 @@ func TestServiceBuildDownloadAndVerify(t *testing.T) {
 	defer aresp.Body.Close()
 	if aresp.StatusCode != http.StatusNotFound {
 		t.Fatalf("second download status = %d, want 404", aresp.StatusCode)
+	}
+}
+
+func TestServiceConcurrentSameKeyBuildsDoNotDeleteEachOther(t *testing.T) {
+	dir := t.TempDir()
+	svc := NewService(ServiceConfig{InternalToken: "secret", WorkDir: dir})
+
+	traces := spanBatch("race", 5, 1_700_000_000_000_000_000)
+	req := BuildRequest{
+		InstanceID: "inst-race",
+		Instance:   "web-race",
+		Objects: []BuildObject{
+			serviceObject(t, "journal/inst-race/traces/1700000000000-race.bin", "traces", 1_700_000_000_000, traces),
+		},
+	}
+
+	const builds = 4
+	type outcome struct {
+		resp BuildResponse
+		err  error
+	}
+	start := make(chan struct{})
+	results := make(chan outcome, builds)
+	var wg sync.WaitGroup
+	for i := 0; i < builds; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			resp, err := svc.Build(context.Background(), req)
+			results <- outcome{resp: resp, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+
+	tokens := map[string]bool{}
+	var wantKey string
+	for out := range results {
+		if out.err != nil {
+			t.Fatalf("concurrent same-key build failed: %v", out.err)
+		}
+		if out.resp.SegmentKey == "" || out.resp.DownloadToken == "" {
+			t.Fatalf("incomplete build response: %+v", out.resp)
+		}
+		// The key is deterministic over the source keys; the DuckDB bytes are
+		// not necessarily byte-identical between independent builds, so only
+		// the identity of the segment is asserted here.
+		if wantKey == "" {
+			wantKey = out.resp.SegmentKey
+		} else if out.resp.SegmentKey != wantKey {
+			t.Fatalf("same-key builds disagree: key %q/%q", out.resp.SegmentKey, wantKey)
+		}
+		if len(out.resp.SHA256) != 64 {
+			t.Fatalf("invalid segment sha %q", out.resp.SHA256)
+		}
+		if out.resp.SpanCount != 5 {
+			t.Fatalf("span count = %d", out.resp.SpanCount)
+		}
+		if tokens[out.resp.DownloadToken] {
+			t.Fatalf("duplicate download token %q", out.resp.DownloadToken)
+		}
+		tokens[out.resp.DownloadToken] = true
+	}
+
+	// Every per-build scratch directory is cleaned up after the segment bytes
+	// are read, leaving no shared/abandoned seg-* file behind.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "seg-") {
+			t.Fatalf("scratch directory left behind: %s", entry.Name())
+		}
 	}
 }
 

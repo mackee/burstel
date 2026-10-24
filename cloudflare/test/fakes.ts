@@ -382,6 +382,11 @@ export interface FakeCompactorOptions {
   lieAboutSha?: boolean;
   /** Claim coverage for journal keys outside the requested batch. */
   extraCoverage?: boolean;
+  /**
+   * Per-build delay in ms, indexed by 0-based build call. Lets a test hold one
+   * build past the coordinator's container timeout and then succeed on retry.
+   */
+  buildDelaysMs?: number[];
 }
 
 /**
@@ -433,6 +438,8 @@ export class FakeCompactorContainer implements ContainerControl {
     const method = init?.method ?? "GET";
     if (path === "/v1/segments" && method === "POST") {
       this.buildCalls += 1;
+      const delay = this.options.buildDelaysMs?.[this.buildCalls - 1] ?? 0;
+      if (delay > 0) await sleep(delay);
       if (this.options.failBuild) {
         return new Response(JSON.stringify({ error: "build failed", code: "build_failed" }), { status: 500 });
       }

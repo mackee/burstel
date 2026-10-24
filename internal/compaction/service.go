@@ -12,7 +12,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,10 +44,16 @@ type ServiceConfig struct {
 }
 
 // DefaultServiceConfig returns conservative operational bounds.
+//
+// One Worker -> Container build must finish comfortably inside the Cloudflare
+// request limits. Real journal objects are ~111 KiB, so 8 MiB admits roughly
+// 75 objects (~9 MB of base64 JSON); 256 is an upper object-count guard for
+// small objects. The coordinator config (cloudflare/src/compactor-core.ts)
+// uses the same 8 MiB / 256 limits and its own 60 s container timeout.
 func DefaultServiceConfig() ServiceConfig {
 	return ServiceConfig{
-		MaxBatchObjects: 4096,
-		MaxBatchBytes:   64 << 20,
+		MaxBatchObjects: 256,
+		MaxBatchBytes:   8 << 20,
 		MaxSegmentBytes: 256 << 20,
 		SegmentTTL:      5 * time.Minute,
 	}
@@ -124,10 +129,10 @@ type Service struct {
 // NewService builds a compactor service.
 func NewService(cfg ServiceConfig) *Service {
 	if cfg.MaxBatchObjects <= 0 {
-		cfg.MaxBatchObjects = 4096
+		cfg.MaxBatchObjects = 256
 	}
 	if cfg.MaxBatchBytes <= 0 {
-		cfg.MaxBatchBytes = 64 << 20
+		cfg.MaxBatchBytes = 8 << 20
 	}
 	if cfg.MaxSegmentBytes <= 0 {
 		cfg.MaxSegmentBytes = 256 << 20
@@ -302,15 +307,11 @@ func (s *Service) Build(ctx context.Context, req BuildRequest) (BuildResponse, e
 	sort.Strings(srcKeys)
 	key := SegmentKey(req.InstanceID, first, last, srcKeys)
 
-	workDir := s.cfg.WorkDir
-	if workDir == "" {
-		workDir = os.TempDir()
-	}
-	if err := os.MkdirAll(workDir, 0o755); err != nil {
+	tmp, cleanup, err := NewScratchSegment(s.cfg.WorkDir, key)
+	if err != nil {
 		return BuildResponse{}, err
 	}
-	tmp := filepath.Join(workDir, "seg-"+shortHash(key)+".duckdb")
-	defer os.Remove(tmp) //nolint:errcheck
+	defer cleanup()
 	info, err := BuildSegment(ctx, tmp, key, req.InstanceID, req.Instance, records)
 	if err != nil {
 		return BuildResponse{}, err
