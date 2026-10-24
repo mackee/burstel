@@ -3,7 +3,7 @@ BUN ?= bun
 IMAGE ?= burstel:deploy
 IMAGE_COMPACTOR ?= burstel-compactor:deploy
 
-.PHONY: build test vet fmt tidy run burstel-cli docker docker-compactor clean cf-typecheck cf-test cf-preflight cf-preflight-config cf-smoke cf-multishot-smoke cf-secret-put container-smoke compactor-smoke trial trial-smoke
+.PHONY: build test vet fmt tidy run burstel-cli docker docker-compactor clean cf-typecheck cf-test cf-preflight cf-preflight-config cf-smoke cf-multishot-smoke cf-secret-put container-smoke compactor-smoke trial trial-smoke check-public
 
 build:
 	$(GO) build -o bin/burstel ./cmd/burstel
@@ -80,6 +80,10 @@ trial:
 
 trial-smoke:
 	scripts/local-trial.sh --smoke
+
+# Spec 030: fail if tracked files contain deployment/operator identifiers.
+check-public:
+	scripts/check-public.sh
 
 clean:
 	rm -rf bin

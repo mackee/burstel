@@ -5,6 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -150,5 +152,74 @@ func TestCollectDoctor(t *testing.T) {
 	}
 	if report.SuggestedBatchSize != 8192 {
 		t.Errorf("suggested batch = %d, want 8192", report.SuggestedBatchSize)
+	}
+}
+
+// TestResolveBaseURLOrder covers spec 030: an explicit flag wins over the
+// environment, the environment wins over the config file, and no built-in
+// production default exists.
+func TestResolveBaseURLOrder(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("BURSTEL_BASE_URL", "")
+	cfgDir := filepath.Join(home, ".config", "burstel")
+	if err := os.MkdirAll(cfgDir, 0o700); err != nil {
+		t.Fatalf("mkdir config dir: %v", err)
+	}
+	cfgPath := filepath.Join(cfgDir, "config")
+	if err := os.WriteFile(cfgPath, []byte("# burstel-cli settings\nbase_url=https://config.example.workers.dev/\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	got, err := resolveBaseURL("https://flag.example.workers.dev/")
+	if err != nil {
+		t.Fatalf("flag: %v", err)
+	}
+	if got != "https://flag.example.workers.dev" {
+		t.Errorf("flag base = %q", got)
+	}
+
+	t.Setenv("BURSTEL_BASE_URL", "https://env.example.workers.dev/")
+	got, err = resolveBaseURL("")
+	if err != nil {
+		t.Fatalf("env: %v", err)
+	}
+	if got != "https://env.example.workers.dev" {
+		t.Errorf("env base = %q", got)
+	}
+
+	t.Setenv("BURSTEL_BASE_URL", "")
+	got, err = resolveBaseURL("")
+	if err != nil {
+		t.Fatalf("config: %v", err)
+	}
+	if got != "https://config.example.workers.dev" {
+		t.Errorf("config base = %q", got)
+	}
+
+	if err := os.Remove(cfgPath); err != nil {
+		t.Fatalf("remove config: %v", err)
+	}
+	_, err = resolveBaseURL("")
+	if err == nil {
+		t.Fatal("expected an error when no base URL is configured")
+	}
+	for _, want := range []string{"--base-url", "BURSTEL_BASE_URL", "base_url="} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// TestNewClientRequiresBaseURL asserts the CLI fails closed instead of falling
+// back to an operator's production URL.
+func TestNewClientRequiresBaseURL(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("BURSTEL_BASE_URL", "")
+	if _, err := newClient("", "test-token", ""); err == nil {
+		t.Fatal("newClient with no base URL must fail")
 	}
 }

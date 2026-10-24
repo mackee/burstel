@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 
 import {
+  bucketNameFromConfig,
   finalize,
   loadWranglerConfig,
   parseJsonc,
@@ -145,11 +146,16 @@ describe("wrangler configuration validation", () => {
     expect(report.failed_required).toContain("do_binding_authdo");
   });
 
-  test("requires the BUCKET -> burstel-shots R2 binding", () => {
+  test("requires a BUCKET r2_buckets entry with a bucket_name", () => {
     const cfg = loadWranglerConfig(REAL_CONFIG);
+    // The configured name is the source of truth (spec 030): renaming it is
+    // valid, but dropping the binding or the name is not.
     cfg.r2_buckets![0]!.bucket_name = "some-other-bucket";
-    const report = finalize(validateWranglerConfig(cfg));
-    expect(report.failed_required).toContain("r2_bucket_binding");
+    expect(finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true })).failed_required).toEqual([]);
+    cfg.r2_buckets = [];
+    expect(
+      finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true })).failed_required,
+    ).toContain("r2_bucket_binding");
   });
 
   test("rejects BURSTEL_DEV_INSECURE_AUTH and plaintext tokens in vars", () => {
@@ -225,8 +231,24 @@ describe("wrangler whoami / secret / r2 parsing", () => {
 
   test("r2 bucket list presence is required and never created", () => {
     const names = parseR2BucketList(JSON.stringify([{ name: "burstel-shots" }, { name: "other" }]));
-    expect(finalize(validateR2Buckets(names)).ok).toBe(true);
-    expect(finalize(validateR2Buckets([])).failed_required).toEqual(["r2_bucket_exists"]);
+    expect(finalize(validateR2Buckets(names, "burstel-shots")).ok).toBe(true);
+    expect(finalize(validateR2Buckets([], "burstel-shots")).failed_required).toEqual(["r2_bucket_exists"]);
+    // No hardcoded default: without a configured bucket the check fails closed.
+    expect(finalize(validateR2Buckets(names)).failed_required).toEqual(["r2_bucket_exists"]);
+  });
+
+  test("the expected bucket is read from the wrangler config", () => {
+    const cfg = loadWranglerConfig(REAL_CONFIG);
+    expect(bucketNameFromConfig(cfg)).toBe(cfg.r2_buckets?.find((b) => b.binding === "BUCKET")?.bucket_name);
+    // Renaming the bucket in config must not require a validator change.
+    cfg.r2_buckets = [{ binding: "BUCKET", bucket_name: "example-shots" }];
+    expect(bucketNameFromConfig(cfg)).toBe("example-shots");
+    expect(finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true })).ok).toBe(true);
+    expect(parseR2BucketList(JSON.stringify([{ name: "example-shots" }]))).toContain("example-shots");
+    // An explicit expectation still acts as a pin.
+    expect(
+      finalize(validateWranglerConfig(cfg, { allowPlaceholderKv: true, expectedBucket: "other" })).failed_required,
+    ).toEqual(["r2_bucket_binding"]);
   });
 });
 

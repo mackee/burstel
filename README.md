@@ -163,7 +163,9 @@ shot の開始/停止、24 時間有効な push 専用 ingest トークンの発
 `burstel-cli` で行う。
 
 ```bash
-export BURSTEL_BASE_URL=https://burstel.<account>.workers.dev
+export BURSTEL_BASE_URL=https://burstel.example.workers.dev
+# base URL: --base-url > $BURSTEL_BASE_URL > ~/.config/burstel/config の base_url=
+#   (ビルトインの既定値は無い。未設定なら明示的なエラーで停止する)
 # 管理者トークン: --token > $BURSTEL_API_TOKEN > --token-file
 #   > ./.secrets/BURSTEL_API_TOKEN > ~/.config/burstel/token の順で解決
 mkdir -p ~/.config/burstel && printf '%s' "<admin token>" > ~/.config/burstel/token
@@ -342,8 +344,8 @@ export OTEL_BLRP_MAX_QUEUE_SIZE=131072
 24 時間有効な push 専用の **instance** トークンを渡す。admin/member トークンは
 `/ingest` では拒否される。
 
-推奨値の理由 (spec 026 の staging 実測、client は build-host、`workers.dev` は
-colo SIN から配信、RTT 約 66 ms):
+推奨値の理由 (spec 026 の staging 実測、client は日本国内の Linux host・上り約
+22 MB/s、`workers.dev` は colo SIN から配信、RTT 約 66 ms):
 
 - SDK 既定 (BSP batch 512・非圧縮) は 1 export に **約 330–430 ms** かかり、
   逐次 exporter 1 本では **約 1.2k spans/s** が上限。それを超えた分は SDK 内部で

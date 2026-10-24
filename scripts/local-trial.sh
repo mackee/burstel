@@ -56,7 +56,7 @@ rm -rf "$BIN" "$DATA" "$LOGS" "$OUT"
 mkdir -p "$BIN" "$DATA" "$LOGS" "$OUT"
 
 # ---------------------------------------------------------------------------
-# Toolchain detection (BuildHost has Go+CGO in the Nix store, not on PATH).
+# Toolchain detection (Go+CGO may live in a local store rather than on PATH).
 # ---------------------------------------------------------------------------
 find_tool() {
   local name="$1" fallback_glob="$2"

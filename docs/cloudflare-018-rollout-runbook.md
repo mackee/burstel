@@ -8,7 +8,7 @@ secrets, creates buckets, changes billing or touches production.** The actual
 rollout is a separate, explicitly authorized job that owns Docker and the
 Cloudflare account credentials.
 
-> The build-host sandbox has no Docker daemon and no Cloudflare credentials, so
+> The coding sandbox has no Docker daemon and no Cloudflare credentials, so
 > the image build and live Container scheduling below were **not** executed
 > here. They are the required continuation steps.
 

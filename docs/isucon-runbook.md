@@ -7,9 +7,9 @@ deploy or mutate any Cloudflare resource; deployment stays in
 [`cloudflare-deploy.md`](./cloudflare-deploy.md).
 
 The measured numbers below come from the real Cloudflare staging benchmark in
-spec 026 (`026-staging-benchmark-result.md`; client on build-host,
-`workers.dev` served from colo SIN, ~66 ms RTT). Spec 026 lives in the itako
-project, not in this source tree.
+spec 026 (`026-staging-benchmark-result.md`; client on a Linux host in Japan
+with a ~22 MB/s uplink, `workers.dev` served from colo SIN, ~66 ms RTT). Spec
+026 lives in the itako project, not in this source tree.
 
 ## Sending telemetry
 

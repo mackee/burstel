@@ -3,10 +3,11 @@
 # dev-toolchain.sh - prepare a cgo-capable Go toolchain for sandboxed agents.
 #
 # The burstel module uses github.com/duckdb/duckdb-go/v2, which is cgo and
-# links a prebuilt static libduckdb. On build-host-1 `go` and `gcc` are not on
-# the default PATH, but both are available through Nix. This script realizes
-# them (network/binary-cache access is required on a cold store), writes a
-# mode-600 environment file under the gitignored .scratch/, and prints it.
+# links a prebuilt static libduckdb. A coding sandbox may not put `go` or `gcc`
+# on the default PATH; this script discovers them at runtime from PATH, a Nix
+# store glob, or `nix build` (network/binary-cache access is required only for
+# the cold-store `nix build` path). It writes a mode-600 environment file under
+# the gitignored .scratch/ and prints it.
 #
 # Usage:
 #   source <(scripts/dev-toolchain.sh)   # export PATH/CC/CXX for this shell
@@ -25,6 +26,18 @@ chmod 700 "$SCRATCH"
 
 need() { command -v "$1" >/dev/null 2>&1; }
 
+# newest_store_bin prints the newest match for a Nix store binary glob, ordered
+# by the version suffix of the store directory name (e.g. ...-go-1.26.8).
+newest_store_bin() {
+  local pattern="$1" p name version
+  # shellcheck disable=SC2086
+  for p in $(ls -d $pattern 2>/dev/null); do
+    name="$(basename "$(dirname "$(dirname "$p")")")"
+    version="${name##*-}"
+    printf '%s\t%s\n' "$version" "$p"
+  done | sort -V | tail -n 1 | cut -f2-
+}
+
 GO_BIN=""
 GCC_BIN=""
 
@@ -33,6 +46,14 @@ if need go; then
 fi
 if need gcc; then
   GCC_BIN="$(command -v gcc)"
+fi
+
+# A pre-populated Nix store is common in sandboxes: reuse it without `nix`.
+if [ -z "$GO_BIN" ]; then
+  GO_BIN="$(newest_store_bin '/nix/store/*go-1*/bin/go')"
+fi
+if [ -z "$GCC_BIN" ]; then
+  GCC_BIN="$(newest_store_bin '/nix/store/*gcc-wrapper*/bin/gcc')"
 fi
 
 if [ -z "$GO_BIN" ] || [ -z "$GCC_BIN" ]; then
@@ -64,6 +85,13 @@ fi
 GO_DIR="$(dirname "$GO_BIN")"
 GCC_DIR="$(dirname "$GCC_BIN")"
 GXX_BIN="$GCC_DIR/g++"
+if [ ! -x "$GXX_BIN" ]; then
+  GXX_BIN="$(command -v g++ 2>/dev/null || true)"
+fi
+if [ -z "$GXX_BIN" ]; then
+  echo "dev-toolchain: could not resolve g++ next to $GCC_BIN" >&2
+  exit 1
+fi
 
 umask 077
 cat >"$ENV_FILE" <<EOF

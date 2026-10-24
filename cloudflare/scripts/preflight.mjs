@@ -10,9 +10,11 @@
 //                 [--r2 <file>] [--docker-cli 1] [--docker-daemon 1]
 //                 [--docker-buildx 1] [--docker-platform-linux-amd64 1]
 //                 [--max-instances 10] [--config-only] [--allow-placeholder-kv]
+//                 [--print-bucket]   print r2_buckets[BUCKET].bucket_name and exit
 import { readFileSync } from "node:fs";
 
 import {
+  bucketNameFromConfig,
   finalize,
   loadWranglerConfig,
   parseR2BucketList,
@@ -61,10 +63,24 @@ if (!configPath || configPath === true) {
   process.exit(2);
 }
 const config = loadWranglerConfig(readFileSync(configPath, "utf8"));
+// The expected bucket always comes from the parsed wrangler config, never a
+// hardcoded repository default (spec 030).
+const expectedBucket = bucketNameFromConfig(config);
+
+if (flag("print-bucket")) {
+  if (expectedBucket === undefined) {
+    console.error("preflight: wrangler config has no r2_buckets[BUCKET].bucket_name");
+    process.exit(2);
+  }
+  process.stdout.write(`${expectedBucket}\n`);
+  process.exit(0);
+}
+
 const maxInstances = Number(arg("max-instances", "10"));
 checks.push(
   ...validateWranglerConfig(config, {
     maxInstances,
+    expectedBucket,
     allowPlaceholderKv: flag("allow-placeholder-kv"),
   }),
 );
@@ -100,7 +116,7 @@ if (secretsRaw !== undefined) {
 const r2Raw = readMaybe(arg("r2"));
 if (r2Raw !== undefined) {
   try {
-    checks.push(...validateR2Buckets(parseR2BucketList(r2Raw)));
+    checks.push(...validateR2Buckets(parseR2BucketList(r2Raw), expectedBucket));
   } catch (error) {
     checks.push({ name: "r2_list_parse", ok: false, required: true, detail: `r2 list parse failed: ${String(error)}` });
   }

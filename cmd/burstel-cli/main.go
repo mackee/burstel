@@ -43,6 +43,10 @@
 //	BURSTEL_BASE_URL   base URL of the deployed Worker
 //	BURSTEL_API_TOKEN  admin token (prefer --token-file or the env over argv)
 //
+// The base URL is resolved in order: --base-url, $BURSTEL_BASE_URL, then a
+// `base_url=` line in ~/.config/burstel/config. There is no built-in default,
+// so an unconfigured CLI fails with a clear message.
+//
 // The admin token is resolved in order: --token, $BURSTEL_API_TOKEN,
 // --token-file, ./.secrets/BURSTEL_API_TOKEN, then ~/.config/burstel/token.
 package main
@@ -64,8 +68,6 @@ import (
 	"strings"
 	"time"
 )
-
-const defaultBaseURL = "https://burstel.example.workers.dev"
 
 const defaultTokenFile = ".secrets/BURSTEL_API_TOKEN"
 
@@ -204,18 +206,65 @@ type client struct {
 	http  *http.Client
 }
 
-func resolveBaseURL(base string) string {
+// resolveBaseURL picks the Worker base URL from the explicit flag, the
+// environment, or the optional config file. There is deliberately no built-in
+// production default: callers must name the deployment they are talking to.
+func resolveBaseURL(base string) (string, error) {
 	if base == "" {
 		base = os.Getenv("BURSTEL_BASE_URL")
 	}
 	if base == "" {
-		base = defaultBaseURL
+		base = baseURLFromConfig()
 	}
-	return strings.TrimRight(base, "/")
+	if base == "" {
+		return "", fmt.Errorf(
+			"no base URL: pass --base-url, set $BURSTEL_BASE_URL, or add base_url= to %s",
+			configFilePath(),
+		)
+	}
+	return strings.TrimRight(base, "/"), nil
+}
+
+// configFilePath is ~/.config/burstel/config (respecting XDG_CONFIG_HOME).
+func configFilePath() string {
+	dir, err := os.UserConfigDir()
+	if err != nil || dir == "" {
+		home, herr := os.UserHomeDir()
+		if herr != nil {
+			return "~/.config/burstel/config"
+		}
+		dir = filepath.Join(home, ".config")
+	}
+	return filepath.Join(dir, "burstel", "config")
+}
+
+// baseURLFromConfig reads the optional `base_url=` line from the config file.
+// A missing or unreadable file simply yields "".
+func baseURLFromConfig() string {
+	path := configFilePath()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok || strings.TrimSpace(key) != "base_url" {
+			continue
+		}
+		return strings.TrimSpace(value)
+	}
+	return ""
 }
 
 func newClient(base, token, tokenFile string) (*client, error) {
-	base = resolveBaseURL(base)
+	base, err := resolveBaseURL(base)
+	if err != nil {
+		return nil, err
+	}
 
 	if token == "" {
 		token = os.Getenv("BURSTEL_API_TOKEN")
@@ -270,7 +319,11 @@ func runDoctor(base string, args []string) error {
 	if len(fs.Args()) != 0 {
 		return fmt.Errorf("doctor: unexpected argument %q", fs.Args()[0])
 	}
-	report, err := collectDoctor(resolveBaseURL(base), *target, *samples, *p50Override)
+	resolved, err := resolveBaseURL(base)
+	if err != nil {
+		return err
+	}
+	report, err := collectDoctor(resolved, *target, *samples, *p50Override)
 	if err != nil {
 		return err
 	}
@@ -901,7 +954,7 @@ Usage:
   burstel-cli [--base-url URL] [--token TOKEN | --token-file PATH] <command> [args]
 
 Global flags (may appear anywhere):
-  --base-url URL     base URL (default $BURSTEL_BASE_URL, else `+defaultBaseURL+`)
+  --base-url URL     base URL (default $BURSTEL_BASE_URL, else base_url= in ~/.config/burstel/config; no built-in default)
   --token TOKEN      admin token (default $BURSTEL_API_TOKEN)
   --token-file PATH  read the admin token from PATH (default .secrets/BURSTEL_API_TOKEN, else ~/.config/burstel/token)
 

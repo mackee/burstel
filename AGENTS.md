@@ -11,20 +11,14 @@ Guidance for coding agents working on **burstel** through itako.
 - Push only through the itako `git_push` capability `git:push:burstel`.
 - Never run a raw `git push` (no `git push`, `gh`, API calls, or credential setup).
 - Do not modify specs unless explicitly asked.
+- Do not deploy or mutate Cloudflare resources from an implementation job.
 
-## Toolchain on build-host-1 (verified again for Phase 24)
+## Toolchain
 
-`go`, `gcc`, and `docker` are **not** on the default `PATH`. A cgo-capable Go
-toolchain is available in the Nix store; there is no root and no Docker.
-
-| Tool | Location / version |
-| --- | --- |
-| go | `/nix/store/<hash>-go-1.25.5/bin/go` (the module may fetch its own patch toolchain) |
-| gcc/g++ | `/nix/store/<hash>-gcc-wrapper-16.2.0/bin/` |
-| docker | absent (cannot run the Docker build here) |
-
-The store hashes change when the sandbox is rebuilt. Use the repo script
-instead of copying a stale hash:
+`go`, `gcc`, and `docker` are not guaranteed to be on the default `PATH` in a
+coding sandbox. The project uses `github.com/duckdb/duckdb-go/v2`, which is
+**cgo** and links a prebuilt static `libduckdb`, so `CGO_ENABLED=1` and a C
+compiler are mandatory. Use the repository script instead of hard-coding paths:
 
 ```bash
 # Writes .scratch/toolchain.env (gitignored) and prints the exports.
@@ -35,28 +29,18 @@ scripts/dev-toolchain.sh --write
 source <(scripts/dev-toolchain.sh)
 ```
 
-On a cold store the script realizes `nixpkgs#{go,gcc}` from
-`cache.nixos.org`; on a warm store it reuses the paths. It never commits a
-binary: everything lives under the gitignored `.scratch/`. The Phase 24 manual
-equivalent (adjust hashes with `ls /nix/store/*go-1*/bin/go` and
-`ls /nix/store/*gcc-wrapper*/bin/gcc`) was:
+`scripts/dev-toolchain.sh` discovers `go` and `gcc` at runtime from `PATH`,
+from a Nix store glob, or by realizing `nixpkgs#{go,gcc}` with `nix build` when
+Nix is available. It never commits a binary: everything lives under the
+gitignored `.scratch/`.
 
-```bash
-export PATH=/nix/store/<hash>-go-1.25.5/bin:/nix/store/<hash>-gcc-wrapper-16.2.0/bin:$PATH
-export CC=/nix/store/<hash>-gcc-wrapper-16.2.0/bin/gcc
-export CXX=/nix/store/<hash>-gcc-wrapper-16.2.0/bin/g++
-export CGO_ENABLED=1
-```
-
-- The project uses `github.com/duckdb/duckdb-go/v2`, which is **cgo** and links a
-  prebuilt static `libduckdb`. `CGO_ENABLED=1` and a C compiler are mandatory.
-- Do not `cd` outside the workspace: the sandbox denies `cd`/`workdir` into
+- Do not `cd` outside the workspace: the sandbox may deny `cd`/`workdir` into
   `/tmp` (use absolute paths for scratch files, or `go -C <dir>`).
 - DuckDB is a single writer. Keep `database/sql` pinned to one connection and
   serialize writes. Standalone shots bound the WAL at 256 MiB by default and
   checkpoint from a background guard (`BURSTEL_WAL_CHECKPOINT_BYTES`); the
   ingest path never runs CHECKPOINT itself.
-- Bun is on `PATH` (`bun --version` = 1.4.2). Install Worker dependencies with
+- Bun is on `PATH` in the standard sandbox. Install Worker dependencies with
   `bun install --frozen-lockfile` inside `cloudflare/` before typecheck/tests or
   `wrangler deploy --dry-run`.
 
@@ -78,10 +62,10 @@ bun test
 bun run deploy:dry-run       # wrangler deploy --dry-run --containers-rollout=none
 ```
 
-
 ### Environment limits
 
-- No Docker/Podman: the Dockerfile can be linted by inspection only. Report the
-  missing toolchain as the blocker rather than claiming the image built.
+- Docker/Podman may be unavailable: the Dockerfile can be linted by inspection
+  only in that case. Report the missing toolchain as the blocker rather than
+  claiming the image built.
 - No third-party network calls are required for tests (module downloads and
   Docker base image pulls excepted).

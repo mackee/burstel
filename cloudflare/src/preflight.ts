@@ -217,12 +217,26 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+/**
+ * The R2 bucket the Worker is configured to use, taken from the parsed
+ * Wrangler config (`r2_buckets[BUCKET].bucket_name`). There is no hardcoded
+ * bucket name in the validator: the config is the source of truth and the
+ * deployment preflight only verifies that the named bucket exists.
+ */
+export function bucketNameFromConfig(cfg: WranglerConfig): string | undefined {
+  const binding = (cfg.r2_buckets ?? []).find((b) => b.binding === "BUCKET");
+  const name = binding?.bucket_name;
+  if (typeof name !== "string" || name.trim() === "") return undefined;
+  return name.trim();
+}
+
 export function validateWranglerConfig(
   cfg: WranglerConfig,
   opts: WranglerValidationOptions = {},
 ): Check[] {
   const maxInstances = opts.maxInstances ?? 10;
-  const expectedBucket = opts.expectedBucket ?? "burstel-shots";
+  const configuredBucket = bucketNameFromConfig(cfg);
+  const expectedBucket = opts.expectedBucket;
   const expectedWorkerName = opts.expectedWorkerName ?? "burstel";
   const expectedImage = opts.expectedImage ?? "../Dockerfile";
   const expectedContext = opts.expectedImageBuildContext ?? "..";
@@ -388,12 +402,14 @@ export function validateWranglerConfig(
     `triggers.crons=${JSON.stringify(crons ?? null)} (the compaction backstop trigger)`,
   );
 
-  const r2 = cfg.r2_buckets ?? [];
   add(
     "r2_bucket_binding",
-    r2.some((b) => b.binding === "BUCKET" && b.bucket_name === expectedBucket),
+    configuredBucket !== undefined &&
+      (expectedBucket === undefined || configuredBucket === expectedBucket),
     true,
-    `BUCKET -> ${expectedBucket}`,
+    expectedBucket === undefined
+      ? `r2_buckets[BUCKET].bucket_name=${configuredBucket ?? "<unset>"} (taken from wrangler config)`
+      : `BUCKET -> ${configuredBucket ?? "<unset>"} (want ${expectedBucket})`,
   );
 
   const kv = cfg.kv_namespaces ?? [];
@@ -547,15 +563,26 @@ export function parseR2BucketList(text: string): string[] {
   return names.sort();
 }
 
-export function validateR2Buckets(names: string[], expected = "burstel-shots"): Check[] {
+export function validateR2Buckets(names: string[], expected?: string): Check[] {
+  const want = (expected ?? "").trim();
+  if (want === "") {
+    return [
+      {
+        name: "r2_bucket_exists",
+        ok: false,
+        required: true,
+        detail: "wrangler config has no r2_buckets[BUCKET].bucket_name; cannot verify the bucket",
+      },
+    ];
+  }
   return [
     {
       name: "r2_bucket_exists",
-      ok: names.includes(expected),
+      ok: names.includes(want),
       required: true,
-      detail: names.includes(expected)
-        ? `bucket ${expected} already exists (reused, never overwritten)`
-        : `bucket ${expected} does not exist; create it in an authorized step (never auto-created)`,
+      detail: names.includes(want)
+        ? `bucket ${want} already exists (reused, never overwritten)`
+        : `bucket ${want} does not exist; create it in an authorized step (never auto-created)`,
     },
   ];
 }

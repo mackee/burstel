@@ -12,16 +12,13 @@ unit test.
 
 ## Commands / how to reproduce
 
-Host toolchain was located through the BuildHost Nix store (see `AGENTS.md`);
-`scripts/local-trial.sh` detects `go`/`gcc` on `PATH` first and falls back to the
-store paths.
+Host toolchain discovery is delegated to `scripts/dev-toolchain.sh`, which
+finds `go`/`gcc` on `PATH`, in a local Nix store, or through `nix build`;
+`scripts/local-trial.sh` uses the same lookup.
 
 ```bash
 # from the repository root
-export PATH=/nix/store/<hash>-go-1.25.5/bin:/nix/store/<hash>-gcc-wrapper-15.2.0/bin:$PATH
-export CC=/nix/store/<hash>-gcc-wrapper-15.2.0/bin/gcc
-export CXX=/nix/store/<hash>-gcc-wrapper-15.2.0/bin/g++
-export CGO_ENABLED=1
+source <(scripts/dev-toolchain.sh)
 
 # fast smoke (~30 s wall, 10 s + 20 s shots)
 scripts/local-trial.sh --smoke

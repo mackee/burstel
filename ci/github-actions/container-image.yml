@@ -9,7 +9,7 @@
 # which copies this file to `.github/workflows/container-image.yml`. Once
 # installed, GitHub Actions runs it on the matching push/PR paths.
 #
-# The build-host sandbox has no Docker daemon, so this workflow is the
+# Some coding sandboxes have no Docker daemon, so this workflow is the
 # reproducible way to prove the existing multistage Debian/cgo Dockerfile
 # actually builds and runs: it builds the image with buildx (real cgo DuckDB
 # linking) on a standard Ubuntu Docker runner and then exercises it with

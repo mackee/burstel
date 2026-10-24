@@ -109,6 +109,9 @@ fi
 wrangler secret list --name burstel --format json >"$TMP/secrets.json" 2>/dev/null || true
 
 # --------------------------------------------------- R2 bucket existence
+# The expected bucket is read from the parsed wrangler config, so the gate
+# stays host-neutral and follows configuration changes (spec 030).
+EXPECTED_BUCKET="$(bun "$CF/scripts/preflight.mjs" --config "$CONFIG" --print-bucket 2>/dev/null || true)"
 if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "$ACCOUNT_ID" ]; then
   if curl -fsS --max-time 20 \
       -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
@@ -120,8 +123,8 @@ if [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "$ACCOUNT_ID" ]; then
     echo '[]' >"$TMP/r2.json"
   fi
 elif command -v wrangler >/dev/null 2>&1 || [ -f "$CF/node_modules/wrangler/bin/wrangler.js" ]; then
-  if wrangler r2 bucket list >"$TMP/r2.raw" 2>/dev/null && grep -q 'burstel-shots' "$TMP/r2.raw"; then
-    echo '[{"name":"burstel-shots"}]' >"$TMP/r2.json"
+  if [ -n "$EXPECTED_BUCKET" ] && wrangler r2 bucket list >"$TMP/r2.raw" 2>/dev/null && grep -qF -- "$EXPECTED_BUCKET" "$TMP/r2.raw"; then
+    printf '[{"name":"%s"}]\n' "$EXPECTED_BUCKET" >"$TMP/r2.json"
   else
     echo '[]' >"$TMP/r2.json"
   fi
