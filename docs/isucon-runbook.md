@@ -191,7 +191,7 @@ the 131072-entry queue silently.
 
 ```bash
 burstel-loadgen -endpoint https://<host> -variant b1 -token "$PUSH" \
-  -exporters 3 -spans-per-second 15000 -duration 180s \
+  -exporters 6 -spans-per-second 7500 -duration 180s \
   -compression gzip -batch-size 8192 -queue-size 262144 \
   -shot-id <shot-id> -api-token "$BURSTEL_API_TOKEN"
 ```
