@@ -14,6 +14,8 @@
 //
 //	version
 //	health
+//	doctor [--target-spans-per-second N] [--samples N] [--p50-export D]
+//	                                    public RTT/colo probe + batch-size advice
 //	instance create <name>              create/upsert a named logical instance
 //	instance list                       list instances (metadata only)
 //	instance token issue <name> [--rotate] [--overlap-seconds N] [--out FILE]
@@ -49,12 +51,15 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -88,6 +93,10 @@ func run(args []string) error {
 	if rest[0] == "version" || rest[0] == "--version" {
 		fmt.Println("burstel-cli " + version)
 		return nil
+	}
+	// doctor only uses public endpoints, so it must not require an admin token.
+	if rest[0] == "doctor" {
+		return runDoctor(base, rest[1:])
 	}
 
 	client, err := newClient(base, token, tokenFile)
@@ -195,14 +204,18 @@ type client struct {
 	http  *http.Client
 }
 
-func newClient(base, token, tokenFile string) (*client, error) {
+func resolveBaseURL(base string) string {
 	if base == "" {
 		base = os.Getenv("BURSTEL_BASE_URL")
 	}
 	if base == "" {
 		base = defaultBaseURL
 	}
-	base = strings.TrimRight(base, "/")
+	return strings.TrimRight(base, "/")
+}
+
+func newClient(base, token, tokenFile string) (*client, error) {
+	base = resolveBaseURL(base)
 
 	if token == "" {
 		token = os.Getenv("BURSTEL_API_TOKEN")
@@ -229,6 +242,161 @@ func newClient(base, token, tokenFile string) (*client, error) {
 		return nil, fmt.Errorf("no admin token: set --token, $BURSTEL_API_TOKEN or --token-file")
 	}
 	return &client{base: base, token: token, http: &http.Client{Timeout: 120 * time.Second}}, nil
+}
+
+// doctorReport is the machine-readable output of `burstel-cli doctor`.
+type doctorReport struct {
+	BaseURL              string  `json:"base_url"`
+	HealthzSamples       int     `json:"healthz_samples"`
+	HealthzRTTMS         float64 `json:"healthz_rtt_ms_p50"`
+	HealthzP95MS         float64 `json:"healthz_rtt_ms_p95"`
+	ServingColo          string  `json:"serving_colo"`
+	TargetSpansPerSecond int     `json:"target_spans_per_s"`
+	P50ExportMS          float64 `json:"p50_export_ms_used"`
+	SuggestedBatchSize   int     `json:"suggested_batch_size"`
+}
+
+// runDoctor measures the public /healthz RTT and serving colo, then suggests a
+// BSP export batch size from the target span rate. It never sends a token.
+func runDoctor(base string, args []string) error {
+	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	target := fs.Int("target-spans-per-second", 15_000, "expected total spans/s across all exporters")
+	samples := fs.Int("samples", 10, "number of sequential /healthz probes")
+	p50Override := fs.Duration("p50-export", 0, "use this p50 export time instead of the measured /healthz RTT (e.g. 330ms)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if len(fs.Args()) != 0 {
+		return fmt.Errorf("doctor: unexpected argument %q", fs.Args()[0])
+	}
+	report, err := collectDoctor(resolveBaseURL(base), *target, *samples, *p50Override)
+	if err != nil {
+		return err
+	}
+	return printJSON(report)
+}
+
+func collectDoctor(base string, target, samples int, p50Override time.Duration) (doctorReport, error) {
+	if target < 1 {
+		return doctorReport{}, errors.New("doctor: --target-spans-per-second must be >= 1")
+	}
+	if samples < 1 {
+		return doctorReport{}, errors.New("doctor: --samples must be >= 1")
+	}
+	latencies, err := measureHealthz(base, samples)
+	if err != nil {
+		return doctorReport{}, err
+	}
+	p50 := percentileDuration(latencies, 0.50)
+	p95 := percentileDuration(latencies, 0.95)
+	exportP50 := p50
+	if p50Override > 0 {
+		exportP50 = p50Override
+	}
+	return doctorReport{
+		BaseURL:              base,
+		HealthzSamples:       len(latencies),
+		HealthzRTTMS:         durationMS(p50),
+		HealthzP95MS:         durationMS(p95),
+		ServingColo:          fetchColo(base),
+		TargetSpansPerSecond: target,
+		P50ExportMS:          durationMS(exportP50),
+		SuggestedBatchSize:   suggestBatchSize(target, exportP50),
+	}, nil
+}
+
+func measureHealthz(base string, samples int) ([]time.Duration, error) {
+	httpClient := &http.Client{Timeout: 10 * time.Second}
+	latencies := make([]time.Duration, 0, samples)
+	for i := 0; i < samples; i++ {
+		start := time.Now()
+		req, err := http.NewRequest(http.MethodGet, base+"/healthz", nil)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("doctor: GET /healthz: %w", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("doctor: GET /healthz returned HTTP %d", resp.StatusCode)
+		}
+		latencies = append(latencies, time.Since(start))
+	}
+	return latencies, nil
+}
+
+// fetchColo reads Cloudflare's /cdn-cgi/trace. It is best effort: a non-zoned
+// host (standalone burstel, a custom proxy) simply reports "unknown".
+func fetchColo(base string) string {
+	httpClient := &http.Client{Timeout: 5 * time.Second}
+	resp, err := httpClient.Get(base + "/cdn-cgi/trace")
+	if err != nil {
+		return "unknown"
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return "unknown"
+	}
+	if colo := parseColo(string(body)); colo != "" {
+		return colo
+	}
+	return "unknown"
+}
+
+func parseColo(trace string) string {
+	for _, line := range strings.Split(trace, "\n") {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(line), "colo="); ok {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+// suggestBatchSize implements the spec-027 recommendation:
+// ceil(target_spans_per_s * p50_export_s), rounded up to a power of two,
+// clamped to [512, 16384].
+func suggestBatchSize(targetSpansPerSecond int, p50Export time.Duration) int {
+	const (
+		minBatch = 512
+		maxBatch = 16384
+	)
+	if targetSpansPerSecond < 1 || p50Export <= 0 {
+		return minBatch
+	}
+	raw := float64(targetSpansPerSecond) * p50Export.Seconds()
+	size := minBatch
+	for float64(size) < raw && size < maxBatch {
+		size <<= 1
+	}
+	if size > maxBatch {
+		size = maxBatch
+	}
+	return size
+}
+
+func percentileDuration(values []time.Duration, p float64) time.Duration {
+	if len(values) == 0 {
+		return 0
+	}
+	sorted := append([]time.Duration(nil), values...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	idx := int(math.Ceil(float64(len(sorted))*p)) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return sorted[idx]
+}
+
+func durationMS(d time.Duration) float64 {
+	return math.Round(float64(d.Microseconds())/1000.0*1000) / 1000
 }
 
 // defaultTokenPaths returns the token files tried when no explicit token is
@@ -740,6 +908,9 @@ Global flags (may appear anywhere):
 Commands:
   version
   health
+  doctor [--target-spans-per-second N] [--samples N] [--p50-export D]
+                                      measure public /healthz RTT + serving colo,
+                                      suggest a BSP batch size (no token needed)
   instance create <name>              create/upsert a named logical instance
   instance list                       list instances (metadata only)
   instance token issue <name> [--rotate] [--overlap-seconds N] [--out FILE]

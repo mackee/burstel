@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // recordedRequest is one request the fake Worker received.
@@ -79,5 +80,75 @@ func TestShotStartRejectsUnknownMode(t *testing.T) {
 	err := runCLI(t, ts.URL, "shot", "start", "--mode", "video")
 	if err == nil || !strings.Contains(err.Error(), "--mode must be window or recording") {
 		t.Fatalf("err = %v, want a --mode validation error", err)
+	}
+}
+
+func TestSuggestBatchSize(t *testing.T) {
+	cases := []struct {
+		name   string
+		target int
+		p50    time.Duration
+		want   int
+	}{
+		// 15000 * 0.330 = 4950 -> next power of two.
+		{name: "measured staging p50", target: 15000, p50: 330 * time.Millisecond, want: 8192},
+		{name: "fast link", target: 15000, p50: 100 * time.Millisecond, want: 2048},
+		{name: "already power of two", target: 8192, p50: 125 * time.Millisecond, want: 1024},
+		{name: "small clamps to 512", target: 1, p50: time.Millisecond, want: 512},
+		{name: "large clamps to 16384", target: 15000, p50: 2 * time.Second, want: 16384},
+		{name: "no target", target: 0, p50: time.Second, want: 512},
+		{name: "no latency", target: 15000, p50: 0, want: 512},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := suggestBatchSize(tc.target, tc.p50); got != tc.want {
+				t.Fatalf("suggestBatchSize(%d, %s) = %d, want %d", tc.target, tc.p50, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseColo(t *testing.T) {
+	trace := "fl=123\nh=burstel.example\ncolo=SIN\nloc=JP\n"
+	if got := parseColo(trace); got != "SIN" {
+		t.Fatalf("parseColo = %q, want SIN", got)
+	}
+	if got := parseColo("loc=JP\n"); got != "" {
+		t.Fatalf("parseColo without colo = %q, want empty", got)
+	}
+}
+
+func TestCollectDoctor(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/healthz":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		case "/cdn-cgi/trace":
+			_, _ = w.Write([]byte("colo=NRT\nloc=JP\n"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer ts.Close()
+
+	report, err := collectDoctor(ts.URL, 15000, 3, 330*time.Millisecond)
+	if err != nil {
+		t.Fatalf("collectDoctor: %v", err)
+	}
+	if report.HealthzSamples != 3 {
+		t.Errorf("samples = %d, want 3", report.HealthzSamples)
+	}
+	if report.HealthzRTTMS <= 0 {
+		t.Errorf("healthz p50 = %f, want > 0", report.HealthzRTTMS)
+	}
+	if report.ServingColo != "NRT" {
+		t.Errorf("colo = %q, want NRT", report.ServingColo)
+	}
+	if report.P50ExportMS != 330 {
+		t.Errorf("p50 export = %f, want 330", report.P50ExportMS)
+	}
+	if report.SuggestedBatchSize != 8192 {
+		t.Errorf("suggested batch = %d, want 8192", report.SuggestedBatchSize)
 	}
 }

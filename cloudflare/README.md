@@ -178,6 +178,52 @@ curl -fsS -X POST https://<host>/api/instances/web-1/tokens \
   `MAX_CONCURRENT_RECORDING` rule; shots record concurrently, bounded only by the
   explicit backend container `max_instances` control.
 
+## Sending telemetry (ISUCON recommended settings, spec 027)
+
+The exporter configuration is intentionally small and shot-independent:
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://<host>/ingest
+export OTEL_EXPORTER_OTLP_HEADERS="X-Burstel-Token=<instance token>"
+
+# Recommended for a 1-3 minute ISUCON benchmark:
+export OTEL_EXPORTER_OTLP_COMPRESSION=gzip
+export OTEL_BSP_MAX_EXPORT_BATCH_SIZE=8192
+export OTEL_BSP_MAX_QUEUE_SIZE=131072
+# If logs are exported by the OTel Go SDK:
+export OTEL_BLRP_MAX_EXPORT_BATCH_SIZE=8192
+export OTEL_BLRP_MAX_QUEUE_SIZE=131072
+```
+
+`/ingest` is the stable base URL; the SDK appends `/v1/traces`,
+`/v1/metrics` and `/v1/logs`. `X-Burstel-Token` must be the named instance's
+24h push-only token (admin/member tokens are rejected on `/ingest`).
+
+Why: the stock SDK uses a serial BatchSpanProcessor with batch 512 and no
+compression. Spec 026 measured **~330–430 ms per export** against real staging
+(colo SIN, ~66 ms RTT), capping one exporter at roughly **1.2k spans/s**. The
+excess is dropped **client-side and silently** (`exporter_errors` stays 0).
+Gzip alone only moved p50 from **377 ms to 330 ms**. Gzip + batch 8192 + queue
+131072 measured **0.0 % drop at 3 exporters × 15k spans/s (B1)**; the B0
+topology still dropped **14 %**. Batch/queue apply to traces/logs; metrics use
+the periodic reader and have no equivalent batch/queue knob.
+
+Flush at bench end by calling `TracerProvider.Shutdown`, `MeterProvider.Shutdown`
+and `LoggerProvider.Shutdown` with a timeout of **at least 20 s**. Large-batch
+staging shutdowns took **6–15 s**; a shorter timeout loses the shot tail.
+Compile-time instrumentation must flush on process exit too.
+
+`workers.dev` may serve from a non-local colo (Japan → SIN in the staging run).
+Prefer a custom domain on a Cloudflare zone you control, and check the observed
+colo with `curl https://<host>/cdn-cgi/trace | grep '^colo='`. No specific colo
+is guaranteed.
+
+Operational details, the pre-shot checklist, `burstel-cli doctor`, and the
+measured loadgen settings are in
+[`../docs/isucon-runbook.md`](../docs/isucon-runbook.md). The loadgen flags are
+`-compression gzip|none`, `-batch-size` and `-queue-size`; the effective values
+appear in the JSON report as `client_settings` (defaults = SDK 512/2048/none).
 
 ## Shared multi-user access (spec 013, Part B)
 

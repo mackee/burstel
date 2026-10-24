@@ -222,6 +222,10 @@ deploy host and are not executed by the offline test suites (`bash -n` is).
    automatically; it expires exactly 24h after issuance. Ingestion is continuous
    and independent of shots, so reconfigure only once per day.
 
+For the recommended ISUCON client settings (gzip, large BSP batch/queue, the
+≥20 s shutdown budget, silent-drop behaviour and the colo/routing caveat), see
+[`isucon-runbook.md`](./isucon-runbook.md).
+
 ## 7. Rollback
 
 ```bash

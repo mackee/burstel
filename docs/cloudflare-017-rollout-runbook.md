@@ -89,7 +89,8 @@ the new credential when the new Worker goes live.
    export OTEL_EXPORTER_OTLP_HEADERS="X-Burstel-Token=<instance token>"
    ```
    Never paste the token into argv, a commit, or an upload; it expires exactly
-   24h after issue.
+   24h after issue. For benchmark-host tuning (gzip, BSP batch/queue, shutdown
+   and colo routing), see [`isucon-runbook.md`](./isucon-runbook.md).
 
 > **Zero-downtime requirement?** A collector cannot present a new credential it
 > has not been given. If a hard cutover is unacceptable, ship the **scoped

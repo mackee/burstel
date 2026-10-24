@@ -2,11 +2,13 @@
 // against burstel's ingest endpoint and reports throughput, loss and export
 // latency percentiles (spec 023 benchmark harness).
 //
-// It is deliberately built on the stock SDK: default BatchSpanProcessor /
-// BatchProcessor settings and the official OTLP/HTTP exporters, so the numbers
-// reflect what a real Go service would experience. The same binary targets both
-// the pre-023 baseline (`/ingest` with the ledger) and the DO-free endpoint:
-// only `-endpoint` (and optionally `-variant`) changes.
+// It is built on the stock SDK with the official OTLP/HTTP exporters, so the
+// numbers reflect what a real Go service would experience. By default it uses
+// the SDK's BatchSpanProcessor / BatchProcessor settings; spec 027 adds
+// `-compression`, `-batch-size` and `-queue-size` so the recommended ISUCON
+// settings can be measured too. The effective values are always reported.
+// The same binary targets both the pre-023 baseline (`/ingest` with the ledger)
+// and the DO-free endpoint: only `-endpoint` (and optionally `-variant`) changes.
 //
 // Examples:
 //
@@ -68,6 +70,44 @@ const (
 	// A fixed tick keeps the generator independent of scheduling jitter.
 	tickInterval = 10 * time.Millisecond
 )
+
+// clientSettings are the OTel Go SDK export settings this run actually uses.
+// BatchSize/QueueSize are always effective values (SDK defaults are filled in),
+// so the JSON report can be compared with the recommended ISUCON settings
+// without guessing.
+type clientSettings struct {
+	Compression string `json:"compression"`
+	BatchSize   int    `json:"batch_size"`
+	QueueSize   int    `json:"queue_size"`
+}
+
+// effectiveClientSettings resolves the loadgen flags to the values handed to
+// the SDK. Zero batch/queue sizes mean "leave the SDK default".
+func effectiveClientSettings(compression string, batchSize, queueSize int) (clientSettings, error) {
+	switch compression {
+	case "", "none":
+		compression = "none"
+	case "gzip":
+	default:
+		return clientSettings{}, fmt.Errorf("-compression must be gzip or none, got %q", compression)
+	}
+	if batchSize < 0 {
+		return clientSettings{}, fmt.Errorf("-batch-size must be >= 0, got %d", batchSize)
+	}
+	if queueSize < 0 {
+		return clientSettings{}, fmt.Errorf("-queue-size must be >= 0, got %d", queueSize)
+	}
+	if batchSize == 0 {
+		batchSize = sdktrace.DefaultMaxExportBatchSize
+	}
+	if queueSize == 0 {
+		queueSize = sdktrace.DefaultMaxQueueSize
+	}
+	if batchSize > queueSize {
+		return clientSettings{}, fmt.Errorf("-batch-size (%d) must not exceed -queue-size (%d)", batchSize, queueSize)
+	}
+	return clientSettings{Compression: compression, BatchSize: batchSize, QueueSize: queueSize}, nil
+}
 
 type latencyBuffer struct {
 	mu        sync.Mutex
@@ -265,10 +305,20 @@ type config struct {
 	apiToken      string
 	emitMetrics   bool
 	emitLogs      bool
+	compression   string
+	batchSize     int
+	queueSize     int
+	settings      clientSettings
 }
 
 func main() {
-	cfg := parseFlags()
+	cfg, err := parseFlags(os.Args[1:])
+	if err == flag.ErrHelp {
+		return
+	}
+	if err != nil {
+		fatal(err)
+	}
 	if cfg.runID == "" {
 		cfg.runID = "loadgen-" + time.Now().UTC().Format("20060102T150405Z") + "-" + randomHex(4)
 	}
@@ -285,8 +335,9 @@ func main() {
 		fatal(err)
 	}
 
-	fmt.Fprintf(os.Stderr, "burstel-loadgen run=%s variant=%s target=%s exporters=%d spans/s/exporter=%d db-spans=%d duration=%s\n",
-		cfg.runID, cfg.variant, cfg.endpoint, cfg.exporters, cfg.spansPerSec, cfg.dbSpans, cfg.duration)
+	fmt.Fprintf(os.Stderr, "burstel-loadgen run=%s variant=%s target=%s exporters=%d spans/s/exporter=%d db-spans=%d duration=%s compression=%s batch-size=%d queue-size=%d\n",
+		cfg.runID, cfg.variant, cfg.endpoint, cfg.exporters, cfg.spansPerSec, cfg.dbSpans, cfg.duration,
+		cfg.settings.Compression, cfg.settings.BatchSize, cfg.settings.QueueSize)
 
 	start := time.Now()
 	var wg sync.WaitGroup
@@ -329,6 +380,7 @@ func main() {
 		"per_exporter":      true,
 		"db_spans":          cfg.dbSpans,
 		"duration_ms":       cfg.duration.Milliseconds(),
+		"client_settings":   cfg.settings,
 		"generation_ms":     generatedElapsed.Milliseconds(),
 		"shutdown_ms":       shutdownDuration.Milliseconds(),
 		"shutdown_deadline": cfg.shutdownGrace.String(),
@@ -347,23 +399,30 @@ func main() {
 	fmt.Println(string(out))
 }
 
-func parseFlags() config {
+func parseFlags(args []string) (config, error) {
 	var cfg config
-	flag.StringVar(&cfg.endpoint, "endpoint", "http://127.0.0.1:8787", "burstel base URL (targets both the pre-023 baseline and the new /ingest)")
-	flag.StringVar(&cfg.variant, "variant", "b1", "run label: b0 (baseline), b1 (new), b2 (burst)")
-	flag.StringVar(&cfg.token, "token", os.Getenv("BURSTEL_PUSH_TOKEN"), "push-only instance token (prefer BURSTEL_PUSH_TOKEN)")
-	flag.StringVar(&cfg.runID, "run-id", "", "run id embedded in every signal (default: generated)")
-	flag.IntVar(&cfg.exporters, "exporters", 1, "number of simulated hosts/exporters")
-	flag.IntVar(&cfg.spansPerSec, "spans-per-second", 15_000, "total spans/s per exporter (root + DB children)")
-	flag.DurationVar(&cfg.duration, "duration", 60*time.Second, "load duration before Shutdown")
-	flag.IntVar(&cfg.dbSpans, "db-spans", 5, "DB child spans per HTTP root span (ISUCON-like shape)")
-	flag.DurationVar(&cfg.shutdownGrace, "shutdown-grace", 60*time.Second, "outer bound for the SDK Shutdown flush")
-	flag.StringVar(&cfg.shotID, "shot-id", "", "optional window shot id for stored-vs-generated verification")
-	flag.StringVar(&cfg.apiURL, "api-url", "", "control-plane base URL for verification (default: -endpoint)")
-	flag.StringVar(&cfg.apiToken, "api-token", os.Getenv("BURSTEL_API_TOKEN"), "admin/member token for verification queries")
-	flag.BoolVar(&cfg.emitMetrics, "emit-metrics", true, "emit one OTLP metric point per exporter per second")
-	flag.BoolVar(&cfg.emitLogs, "emit-logs", true, "emit one OTLP log record per exporter per second")
-	flag.Parse()
+	fs := flag.NewFlagSet("burstel-loadgen", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	fs.StringVar(&cfg.endpoint, "endpoint", "http://127.0.0.1:8787", "burstel base URL (targets both the pre-023 baseline and the new /ingest)")
+	fs.StringVar(&cfg.variant, "variant", "b1", "run label: b0 (baseline), b1 (new), b2 (burst)")
+	fs.StringVar(&cfg.token, "token", os.Getenv("BURSTEL_PUSH_TOKEN"), "push-only instance token (prefer BURSTEL_PUSH_TOKEN)")
+	fs.StringVar(&cfg.runID, "run-id", "", "run id embedded in every signal (default: generated)")
+	fs.IntVar(&cfg.exporters, "exporters", 1, "number of simulated hosts/exporters")
+	fs.IntVar(&cfg.spansPerSec, "spans-per-second", 15_000, "total spans/s per exporter (root + DB children)")
+	fs.DurationVar(&cfg.duration, "duration", 60*time.Second, "load duration before Shutdown")
+	fs.IntVar(&cfg.dbSpans, "db-spans", 5, "DB child spans per HTTP root span (ISUCON-like shape)")
+	fs.DurationVar(&cfg.shutdownGrace, "shutdown-grace", 60*time.Second, "outer bound for the SDK Shutdown flush")
+	fs.StringVar(&cfg.shotID, "shot-id", "", "optional window shot id for stored-vs-generated verification")
+	fs.StringVar(&cfg.apiURL, "api-url", "", "control-plane base URL for verification (default: -endpoint)")
+	fs.StringVar(&cfg.apiToken, "api-token", os.Getenv("BURSTEL_API_TOKEN"), "admin/member token for verification queries")
+	fs.BoolVar(&cfg.emitMetrics, "emit-metrics", true, "emit one OTLP metric point per exporter per second")
+	fs.BoolVar(&cfg.emitLogs, "emit-logs", true, "emit one OTLP log record per exporter per second")
+	fs.StringVar(&cfg.compression, "compression", "none", "OTLP/HTTP payload compression: gzip or none (SDK default: none)")
+	fs.IntVar(&cfg.batchSize, "batch-size", 0, "max export batch size for traces/logs (0 = SDK default 512)")
+	fs.IntVar(&cfg.queueSize, "queue-size", 0, "max queued spans/log records (0 = SDK default 2048)")
+	if err := fs.Parse(args); err != nil {
+		return cfg, err
+	}
 	cfg.endpoint = strings.TrimRight(cfg.endpoint, "/")
 	if cfg.apiURL == "" {
 		cfg.apiURL = cfg.endpoint
@@ -378,10 +437,53 @@ func parseFlags() config {
 	if cfg.spansPerSec < 1 {
 		cfg.spansPerSec = 1
 	}
-	if cfg.token == "" {
-		fatal(fmt.Errorf("a push token is required via -token or BURSTEL_PUSH_TOKEN"))
+	settings, err := effectiveClientSettings(cfg.compression, cfg.batchSize, cfg.queueSize)
+	if err != nil {
+		return cfg, err
 	}
-	return cfg
+	cfg.settings = settings
+	if cfg.token == "" {
+		return cfg, fmt.Errorf("a push token is required via -token or BURSTEL_PUSH_TOKEN")
+	}
+	return cfg, nil
+}
+
+func traceHTTPOptions(settings clientSettings) []otlptracehttp.Option {
+	opts := []otlptracehttp.Option{otlptracehttp.WithCompression(otlptracehttp.NoCompression)}
+	if settings.Compression == "gzip" {
+		opts = []otlptracehttp.Option{otlptracehttp.WithCompression(otlptracehttp.GzipCompression)}
+	}
+	return opts
+}
+
+func metricHTTPOptions(settings clientSettings) []otlpmetrichttp.Option {
+	opts := []otlpmetrichttp.Option{otlpmetrichttp.WithCompression(otlpmetrichttp.NoCompression)}
+	if settings.Compression == "gzip" {
+		opts = []otlpmetrichttp.Option{otlpmetrichttp.WithCompression(otlpmetrichttp.GzipCompression)}
+	}
+	return opts
+}
+
+func logHTTPOptions(settings clientSettings) []otlploghttp.Option {
+	opts := []otlploghttp.Option{otlploghttp.WithCompression(otlploghttp.NoCompression)}
+	if settings.Compression == "gzip" {
+		opts = []otlploghttp.Option{otlploghttp.WithCompression(otlploghttp.GzipCompression)}
+	}
+	return opts
+}
+
+func traceBatchOptions(settings clientSettings) []sdktrace.BatchSpanProcessorOption {
+	return []sdktrace.BatchSpanProcessorOption{
+		sdktrace.WithMaxExportBatchSize(settings.BatchSize),
+		sdktrace.WithMaxQueueSize(settings.QueueSize),
+	}
+}
+
+func logBatchOptions(settings clientSettings) []sdklog.BatchProcessorOption {
+	return []sdklog.BatchProcessorOption{
+		sdklog.WithExportMaxBatchSize(settings.BatchSize),
+		sdklog.WithMaxQueueSize(settings.QueueSize),
+	}
 }
 
 func buildProviders(ctx context.Context, cfg config, headers map[string]string, st *stats) ([]*exporterRun, error) {
@@ -400,23 +502,31 @@ func buildProviders(ctx context.Context, cfg config, headers map[string]string, 
 			attribute.Int("burstel.exporter.index", i),
 		)
 
-		traceExp, err := otlptracehttp.New(ctx,
+		traceOpts := []otlptracehttp.Option{
 			otlptracehttp.WithEndpointURL(traceURL.String()),
 			otlptracehttp.WithHeaders(headers),
-		)
+		}
+		traceOpts = append(traceOpts, traceHTTPOptions(cfg.settings)...)
+		traceExp, err := otlptracehttp.New(ctx, traceOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("trace exporter %d: %w", i, err)
 		}
 		tp := sdktrace.NewTracerProvider(
-			// Default BatchSpanProcessor configuration (spec 023 harness rule).
-			sdktrace.WithBatcher(&traceExporter{inner: traceExp, stats: &st.traces}),
+			// Spec 023 harness rule left these at SDK defaults; spec 027 makes
+			// them explicit flags for the recommended ISUCON settings.
+			sdktrace.WithBatcher(
+				&traceExporter{inner: traceExp, stats: &st.traces},
+				traceBatchOptions(cfg.settings)...,
+			),
 			sdktrace.WithResource(res),
 		)
 
-		metricExp, err := otlpmetrichttp.New(ctx,
+		metricOpts := []otlpmetrichttp.Option{
 			otlpmetrichttp.WithEndpointURL(metricURL.String()),
 			otlpmetrichttp.WithHeaders(headers),
-		)
+		}
+		metricOpts = append(metricOpts, metricHTTPOptions(cfg.settings)...)
+		metricExp, err := otlpmetrichttp.New(ctx, metricOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("metric exporter %d: %w", i, err)
 		}
@@ -433,15 +543,20 @@ func buildProviders(ctx context.Context, cfg config, headers map[string]string, 
 			return nil, fmt.Errorf("metric instrument %d: %w", i, err)
 		}
 
-		logExp, err := otlploghttp.New(ctx,
+		logOpts := []otlploghttp.Option{
 			otlploghttp.WithEndpointURL(logURL.String()),
 			otlploghttp.WithHeaders(headers),
-		)
+		}
+		logOpts = append(logOpts, logHTTPOptions(cfg.settings)...)
+		logExp, err := otlploghttp.New(ctx, logOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("log exporter %d: %w", i, err)
 		}
 		lp := sdklog.NewLoggerProvider(
-			sdklog.WithProcessor(sdklog.NewBatchProcessor(&logExporter{inner: logExp, stats: &st.logs})),
+			sdklog.WithProcessor(sdklog.NewBatchProcessor(
+				&logExporter{inner: logExp, stats: &st.logs},
+				logBatchOptions(cfg.settings)...,
+			)),
 			sdklog.WithResource(res),
 		)
 

@@ -319,6 +319,56 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
 Burstel はパス別エンドポイント(`/v1/traces` など)を提供するため、
 OTel SDK の標準 HTTP exporter がそのまま利用できる。
 
+### Sending telemetry (ISUCON 推奨設定)
+
+Cloudflare 版で 1〜3 分の benchmark を流すときは、exporter を次のように設定する
+(詳細・実測値・チェックリストは
+[`docs/isucon-runbook.md`](./docs/isucon-runbook.md)):
+
+```bash
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_EXPORTER_OTLP_ENDPOINT=https://<host>/ingest
+export OTEL_EXPORTER_OTLP_HEADERS="X-Burstel-Token=<instance token>"
+
+export OTEL_EXPORTER_OTLP_COMPRESSION=gzip
+export OTEL_BSP_MAX_EXPORT_BATCH_SIZE=8192
+export OTEL_BSP_MAX_QUEUE_SIZE=131072
+# logs も OTel Go SDK で送る場合
+export OTEL_BLRP_MAX_EXPORT_BATCH_SIZE=8192
+export OTEL_BLRP_MAX_QUEUE_SIZE=131072
+```
+
+`/ingest` に `/v1/{traces,metrics,logs}` が付き、`X-Burstel-Token` には
+24 時間有効な push 専用の **instance** トークンを渡す。admin/member トークンは
+`/ingest` では拒否される。
+
+推奨値の理由 (spec 026 の staging 実測、client は build-host、`workers.dev` は
+colo SIN から配信、RTT 約 66 ms):
+
+- SDK 既定 (BSP batch 512・非圧縮) は 1 export に **約 330–430 ms** かかり、
+  逐次 exporter 1 本では **約 1.2k spans/s** が上限。それを超えた分は SDK 内部で
+  **静かに drop** され、`exporter_errors` は 0 のままになる。
+- gzip だけでは p50 export が 377 → 330 ms に縮む程度で、queue 詰まりは解消しない。
+- gzip + batch 8192 + queue 131072 で **3 exporters × 15k spans/s (B1) の drop 0.0 %**
+  を実測。ただし B0 topology では同じ設定でも **14 %** drop する。
+- batch/queue は traces と logs に効く (`OTEL_BSP_*` / `OTEL_BLRP_*`)。metrics の
+  periodic reader には同等の batch/queue 設定はない。
+
+batch を大きくすると終了時の flush に時間がかかる (staging で **6–15 s** 実測)。
+benchmark 終了時は `TracerProvider.Shutdown` / `MeterProvider.Shutdown` /
+`LoggerProvider.Shutdown` を **20 s 以上の timeout** で必ず呼ぶ。compile-time
+instrumentation を使う場合は、プロセス終了時にも flush されることを確認する。
+
+`workers.dev` は anycast で、benchmark host の近くの colo に必ずしも配信されない
+(staging では日本から SIN 配信)。運用では Cloudflare zone 上の custom domain を
+使い、`curl https://<host>/cdn-cgi/trace | grep '^colo='` で実際の colo を確認する。
+特定 colo は保証されない。
+
+`burstel-cli doctor` は token 無しで `/healthz` の RTT と colo を測り、目標 span rate
+から推奨 batch size を出す。`burstel-loadgen` は
+`-compression gzip|none` / `-batch-size` / `-queue-size` を受け付け、実効設定を
+JSON の `client_settings` に出力する。
+
 ### Standalone field trial (Phase 4)
 
 実 OTel Go SDK で traces / metrics / 相関 logs を OTLP/HTTP で送る
